@@ -13,10 +13,11 @@
 //! consumes each L1 window it records an [`L1ResumeCheckpoint`](crate::resume), once the window's
 //! blocks are durable, so a later restart resumes from the last checkpoint instead of Nitro
 //! genesis. On a resume whose checkpoint predates the durable tip (persistence outran the last
-//! written checkpoint), the first re-derived blocks reproduce ones already on disk; they are
-//! numbered absolutely from `start_l2_block` and dropped up to `db_tip_l2`, so the driver only ever
-//! sees `db_tip_l2 + 1` onward. The very first sync of a genesis snapshot has no checkpoint yet, so
-//! the caller supplies the genesis start point.
+//! written checkpoint), the first re-derived blocks reproduce ones already on disk. They are
+//! numbered absolutely from `start_l2_block` and forwarded to the driver so its durable message
+//! journal can verify the overlap rather than assuming database presence implies L1 agreement. The
+//! very first sync of a genesis snapshot has no checkpoint yet, so the caller supplies the genesis
+//! start point.
 //!
 //! ## ArbOS version across upgrades
 //!
@@ -30,6 +31,10 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -187,9 +192,8 @@ pub struct L1SyncConfig {
     /// …` so already-present blocks can be recognized and skipped. For a genesis start this is the
     /// Nitro genesis block; for a checkpoint resume it is the checkpoint's `l2_block`.
     pub start_l2_block: u64,
-    /// Current durable L2 tip. Re-derived blocks with number `<= db_tip_l2` are already in the DB,
-    /// so they are dropped rather than re-sent to the driver (which would produce them again). The
-    /// first message sent is always block `db_tip_l2 + 1`.
+    /// Current durable L2 tip captured for progress/restart bookkeeping. Re-derived messages at or
+    /// below it are still forwarded so the engine journal can verify persisted feed history.
     pub db_tip_l2: u64,
     /// The L2 block number of Nitro genesis (Arbitrum One: 22207817; a fresh chain: 0). Feed/derived
     /// messages are numbered by *message index* (`block - genesis_block`), which is what the driver's
@@ -198,6 +202,9 @@ pub struct L1SyncConfig {
     pub genesis_block: u64,
     /// Where to persist the [`L1ResumeCheckpoint`] as sync advances (`None` disables checkpointing).
     pub checkpoint_path: Option<PathBuf>,
+    /// Highest L2 block whose L1 authority the engine has fsynced to its message journal.
+    /// Checkpoints may never advance beyond this frontier even when the feed persisted farther.
+    pub l1_verified_tip: Arc<AtomicU64>,
     /// L1 blocks per `derive_range` call (bounds `getLogs` range per request).
     pub batch_window: u64,
     /// Backward-scan window for delayed-message coverage.
@@ -228,6 +235,7 @@ impl L1SyncConfig {
             db_tip_l2: 0,
             genesis_block: 0,
             checkpoint_path: None,
+            l1_verified_tip: Arc::new(AtomicU64::new(0)),
             batch_window: 1_000,
             delayed_window: DEFAULT_DELAYED_WINDOW,
             confirmations: 8,
@@ -259,8 +267,8 @@ fn progress(cfg: &L1SyncConfig, persisted_l2: u64) -> SyncProgress {
 
 /// Build the next attempt from the newest checkpoint that is safe for the current durable DB tip.
 ///
-/// Re-derivation between that checkpoint and `persisted_l2` is harmless: `run_l1_sync` numbers the
-/// messages absolutely and drops everything through `db_tip_l2`.
+/// Re-derivation between that checkpoint and `persisted_l2` is required: `run_l1_sync` numbers the
+/// messages absolutely and the driver compares them with its persisted message journal.
 fn resume_config(base: &L1SyncConfig, persisted_l2: u64) -> L1SyncConfig {
     let mut next = base.clone();
     next.db_tip_l2 = persisted_l2;
@@ -460,9 +468,8 @@ where
     let mut safe_head: u64 = 0;
 
     // Absolute L2 numbering + resume bookkeeping. `next_l2` is the block number the next derived
-    // message produces; blocks `<= db_tip_l2` are already persisted and get dropped.
+    // message produces. Persisted overlap is deliberately forwarded for journal verification.
     let mut next_l2 = cfg.start_l2_block + 1;
-    let db_tip_l2 = cfg.db_tip_l2;
     let genesis_block = cfg.genesis_block;
     // Window boundaries awaiting durability before they can be appended to the resume log.
     // Ascending in both `l1_block` and `l2_block`; drained front-to-back as `persisted_tip` rises.
@@ -637,35 +644,17 @@ where
             );
         }
 
-        // Number each derived message and either send it or, when it reproduces a block already on
-        // disk (a resume that started before the DB tip), drop it. `next_l2` counts ABSOLUTE L2
-        // blocks (advancing for dropped blocks too: they are real blocks in the chain) so it lines
-        // up with `db_tip_l2`. The `sequence_number` handed to the driver, however, must be the
-        // MESSAGE INDEX (`block - genesis_block`), which is what its sequence-reconciliation expects
-        // (`block = sequence_number + genesis_block`); absolute block numbers only match the index
-        // when genesis is block 0. Sending absolute numbers on a chain with a non-zero genesis (e.g.
-        // Arbitrum One at 22207817) makes every message land far above the driver's `next_seq`, so it
-        // buffers/drops them all and never applies any block.
-        let mut skipped = 0u64;
+        // Number and forward every derived message, including persisted overlap. `next_l2` counts
+        // ABSOLUTE L2 blocks. The `sequence_number` handed to the driver is the MESSAGE INDEX
+        // (`block - genesis_block`), which is what its reconciliation journal keys by.
         for mut msg in derived.messages {
             let bn = next_l2;
             next_l2 += 1;
-            if bn <= db_tip_l2 {
-                skipped += 1;
-                continue;
-            }
             msg.sequence_number = bn - genesis_block;
             if feed_tx.send(msg).await.is_err() {
                 tracing::warn!(target: "arb-reth::l1-sync", "feed channel closed; stopping L1 sync");
                 return Ok(());
             }
-        }
-        if skipped > 0 {
-            tracing::debug!(
-                target: "arb-reth::l1-sync",
-                from, to, skipped, resumed_at = db_tip_l2 + 1,
-                "dropped already-persisted blocks on resume",
-            );
         }
 
         delayed = derived.next_delayed_count;
@@ -685,6 +674,7 @@ where
                 &mut resume_log,
                 &mut pending_ckpt,
                 persisted_tip(),
+                cfg.l1_verified_tip.load(Ordering::Acquire),
             );
         }
     }
@@ -704,10 +694,15 @@ fn maybe_write_checkpoint(
     log: &mut L1ResumeLog,
     pending: &mut VecDeque<L1ResumeCheckpoint>,
     persisted: u64,
+    l1_verified: u64,
 ) {
     let Some(path) = path else { return };
+    let checkpointable = persisted.min(l1_verified);
     let mut newest: Option<L1ResumeCheckpoint> = None;
-    while pending.front().is_some_and(|cp| cp.l2_block <= persisted) {
+    while pending
+        .front()
+        .is_some_and(|cp| cp.l2_block <= checkpointable)
+    {
         let cp = pending.pop_front().unwrap();
         log.record(cp);
         newest = Some(cp);
@@ -888,23 +883,25 @@ mod tests {
             .collect();
 
         // Nothing persisted past block 5 → no boundary is safe to append yet.
-        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 5);
+        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 5, 5);
         assert_eq!(L1ResumeLog::load(&path), None);
         assert_eq!(pending.len(), 3, "no boundary consumed");
 
-        // Durable tip at 20 → boundaries 10 and 20 are safe; both logged, 30 stays queued.
-        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 20);
+        // Persistence at 20 cannot release block 20 while L1 verification is only at 10.
+        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 20, 10);
         let loaded = L1ResumeLog::load(&path).expect("log written");
-        assert_eq!(
-            loaded.resume_for(u64::MAX),
-            Some(cp(200, 20)),
-            "newest logged is 20"
-        );
+        assert_eq!(loaded.resume_for(u64::MAX), Some(cp(100, 10)));
+        assert_eq!(pending.len(), 2, "unverified boundaries stay queued");
+
+        // Once verification reaches 20, its boundary becomes checkpointable; 30 stays queued.
+        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 20, 20);
+        let loaded = L1ResumeLog::load(&path).expect("log rewritten");
+        assert_eq!(loaded.resume_for(u64::MAX), Some(cp(200, 20)));
         assert_eq!(loaded.checkpoints, vec![cp(100, 10), cp(200, 20)]);
         assert_eq!(pending, [cp(300, 30)].into_iter().collect::<VecDeque<_>>());
 
         // Durable tip past 30 → final boundary flushes.
-        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 99);
+        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 99, 99);
         assert_eq!(
             L1ResumeLog::load(&path).unwrap().resume_for(u64::MAX),
             Some(cp(300, 30))
@@ -924,7 +921,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 10);
+        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 10, 10);
         let loaded = L1ResumeLog::load(&path).expect("log written");
         assert_eq!(
             loaded.checkpoints,
@@ -982,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_uses_durable_checkpoint_and_skips_delivered_prefix() {
+    fn restart_uses_durable_checkpoint_and_redelivers_prefix_for_verification() {
         let dir = reth_db::test_utils::tempdir_path();
         let path = L1ResumeLog::path_in(&dir);
         let checkpoint = L1ResumeCheckpoint {
@@ -1005,13 +1002,10 @@ mod tests {
         assert_eq!(restarted.start_l2_block, 11);
         assert_eq!(restarted.db_tip_l2, 12);
 
-        // The first re-derived block is 12 and is dropped; only 13 is new. This is the same
-        // absolute-number gate used by the delivery loop and proves the restart cannot redeliver
-        // the already durable prefix.
-        let delivered: Vec<u64> = (restarted.start_l2_block + 1..=13)
-            .filter(|bn| *bn > restarted.db_tip_l2)
-            .collect();
-        assert_eq!(delivered, vec![13]);
+        // Block 12 is deliberately re-delivered so the engine can compare it with its durable
+        // journal before accepting block 13 as new history.
+        let delivered: Vec<u64> = (restarted.start_l2_block + 1..=13).collect();
+        assert_eq!(delivered, vec![12, 13]);
     }
 
     #[tokio::test]

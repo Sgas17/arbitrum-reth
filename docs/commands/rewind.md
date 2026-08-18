@@ -1,6 +1,6 @@
 # `arb-reth rewind`
 
-`rewind` removes blocks above a chosen L2 height and truncates the L1 resume log to a compatible boundary. Stop the node before running it.
+`rewind` removes blocks above a chosen L2 height and truncates the message journal and L1 resume log to the same canonical identity. Stop the node before running it.
 
 For a confirmed first divergent block `N`, keep `N - 1`:
 
@@ -11,7 +11,9 @@ arb-reth rewind \
   --diverged-at N
 ```
 
-Use `--to <block>` when the desired surviving tip is already known. Run `--dry-run` first to inspect the target without writing.
+Use `--to <block>` when the desired surviving tip is already known. Run `--dry-run` first to validate the target and inspect the changeset range without writing.
+
+Recovery commits the database unwind first, then truncates `arb-message-journal.ndjson` and `arb-l1-resume.json`, validates the final database tip, and clears `arb-message-divergence.json` last. If the command is interrupted after the database commit, rerun it with the same target; an equal current tip is accepted so sidecar recovery can finish. A legacy datadir without a message journal is also accepted.
 
 The boot information must match the datadir:
 

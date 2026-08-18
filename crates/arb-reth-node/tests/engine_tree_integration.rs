@@ -93,11 +93,7 @@ mod tests {
         factory
     }
 
-    async fn drive_replay_native(
-        factory: TestFactory,
-        chain_id: u64,
-        tuning: ArbEngineTuning,
-    ) {
+    async fn drive_replay_native(factory: TestFactory, chain_id: u64, tuning: ArbEngineTuning) {
         const TARGET: u64 = 17;
         const FEED: &str = include_str!("../tests/fixtures/testnode_feed_seq0_17.ndjson");
         const BLOCKS: &str = include_str!("../tests/fixtures/testnode_blocks_0_17.json");
@@ -112,6 +108,7 @@ mod tests {
             drop(provider);
             header
         };
+        let restart_factory = factory.clone();
         let provider = BlockchainProvider::new(factory.clone()).expect("BlockchainProvider::new");
         let canonical = provider.canonical_in_memory_state();
         let mut driver = ArbEngineDriver::<TestNodeTypes>::spawn(
@@ -125,6 +122,8 @@ mod tests {
             Runtime::test(),
             tuning,
             None,
+            false,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
             None,
         )
         .expect("spawn native payload driver");
@@ -165,5 +164,36 @@ mod tests {
         assert_eq!(canonicalized, (1..=TARGET).collect::<Vec<_>>());
 
         driver.shutdown().await;
+        driver
+            .flush_durable_message_journal()
+            .expect("flush message journal through durable tip");
+        drop(driver);
+
+        let restart_tip = restart_factory
+            .provider()
+            .expect("restart provider")
+            .sealed_header(TARGET)
+            .expect("read restart tip")
+            .expect("persisted restart tip");
+        let restart_provider =
+            BlockchainProvider::new(restart_factory.clone()).expect("restart BlockchainProvider");
+        let restart_canonical = restart_provider.canonical_in_memory_state();
+        let restart_driver = ArbEngineDriver::<TestNodeTypes>::spawn(
+            restart_factory,
+            restart_provider,
+            ArbEvmConfig::new(chain_id),
+            chain_id,
+            restart_tip,
+            0,
+            restart_canonical,
+            Runtime::test(),
+            ArbEngineTuning::reth_defaults(),
+            None,
+            false,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
+        )
+        .expect("journal watermark must match restart tip");
+        restart_driver.shutdown().await;
     }
 }

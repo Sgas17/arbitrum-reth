@@ -16,7 +16,7 @@ use crate::metrics::FeedLatencyTracker;
 use alloy_consensus::Header;
 use arbitrum_alloy_consensus::reth::ArbPrimitives;
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
-use eyre::eyre;
+use eyre::{WrapErr as _, eyre};
 use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
 use reth_evm::ConfigureEvm;
@@ -93,6 +93,10 @@ pub struct ArbLauncher {
     /// an archive node. A configured mode is applied to both the provider factory and the
     /// engine-tree persistence pruner so static-file writes follow the same segment policy.
     pub prune_config: Option<reth_config::PruneConfig>,
+    /// One-shot operator acknowledgement that a pre-journal durable tip is a trusted anchor.
+    pub init_message_journal_at_tip: bool,
+    /// Highest block whose L1 authority is durable in the message journal.
+    pub l1_verified_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Live-feed and replay messages. These may be ahead of the local canonical cursor when the
     /// relay's bounded backlog begins after the database tip.
     pub feed_messages: tokio::sync::mpsc::Receiver<ArbEngineInput>,
@@ -233,6 +237,8 @@ impl ArbLauncher {
             genesis_block,
             tuning,
             prune_config,
+            init_message_journal_at_tip,
+            l1_verified_tip,
             feed_messages,
             l1_messages,
             feed_latency,
@@ -367,6 +373,8 @@ impl ArbLauncher {
             task_executor.clone(),
             tuning,
             prune_config.map(reth_prune::PrunerBuilder::new),
+            init_message_journal_at_tip,
+            l1_verified_tip,
             tx_log_stream,
         )?;
 
@@ -374,7 +382,11 @@ impl ArbLauncher {
         let mut feed_messages = feed_messages;
         let mut l1_messages = l1_messages;
 
-        task_executor.spawn_critical_task("arb-engine-driver", async move {
+        task_executor.spawn_critical_with_graceful_shutdown_signal(
+            "arb-engine-driver",
+            |shutdown| async move {
+            let mut shutdown = Box::pin(shutdown);
+            let mut shutdown_guard = None;
             let res: eyre::Result<()> = async {
                 // Bench accounting: separate time spent WAITING for the next derived feed
                 // message (L1-fetch-bound) from time spent in advance() (compute/persist-bound).
@@ -388,16 +400,19 @@ impl ArbLauncher {
                 let mut l1_open = true;
                 loop {
                     let __r = std::time::Instant::now();
-                    let Some(first) = recv_next_message(
-                        &mut feed_messages,
-                        &mut l1_messages,
-                        &mut feed_open,
-                        &mut l1_open,
-                    )
-                    .await
-                    else {
-                        break;
+                    let next = tokio::select! {
+                        guard = &mut shutdown => {
+                            shutdown_guard = Some(guard);
+                            None
+                        }
+                        next = recv_next_message(
+                            &mut feed_messages,
+                            &mut l1_messages,
+                            &mut feed_open,
+                            &mut l1_open,
+                        ) => next,
                     };
+                    let Some(first) = next else { break };
                     bench_recv_us += __r.elapsed().as_micros();
 
                     // A batch is a deterministic proof that another message is ready. It replaces
@@ -439,7 +454,7 @@ impl ArbLauncher {
                                 .record_driver_dequeue(input.sequence_number(), driver_dequeued_at);
                         }
                         let __w = std::time::Instant::now();
-                        driver
+                        if let Err(error) = driver
                             .advance_with_applied_overlap(
                                 &input,
                                 index + 1 < batch_len,
@@ -449,7 +464,20 @@ impl ArbLauncher {
                                     }
                                 },
                             )
-                            .await?;
+                            .await
+                        {
+                            tracing::error!(
+                                target: "arb-reth::engine",
+                                %error,
+                                "engine driver stopped while applying message",
+                            );
+                            if arb_reth_engine::is_message_divergence(&error) {
+                                driver
+                                    .write_divergence_marker(&input, &format!("{error:#}"))
+                                    .wrap_err("failed to persist divergence marker before shutdown")?;
+                            }
+                            return Err(error);
+                        }
                         bench_work_us += __w.elapsed().as_micros();
                         bench_n += 1;
                         if bench_n.is_multiple_of(1000) {
@@ -481,7 +509,21 @@ impl ArbLauncher {
             // driver errors. Dropping the guard requests termination, but awaiting shutdown here
             // also settles persistence before the node reports its terminal result.
             driver.shutdown().await;
+            let journal_result = driver.flush_durable_message_journal();
+            let res = match (res, journal_result) {
+                (Ok(()), journal_result) => journal_result,
+                (Err(driver_error), Ok(())) => Err(driver_error),
+                (Err(driver_error), Err(journal_error)) => {
+                    tracing::error!(
+                        target: "arb-reth::journal",
+                        %journal_error,
+                        "failed to flush message journal after driver failure",
+                    );
+                    Err(driver_error)
+                }
+            };
             let _ = exit_tx.send(res); // ignore error if receiver was dropped
+            drop(shutdown_guard);
         });
 
         // Serve RPC through reth's canonical `RpcAddOns::launch_add_ons` (full fleet + ws +
@@ -645,6 +687,7 @@ mod tests {
         l1_after_head: Option<(u64, BroadcastFeedMessage)>,
         expected_error: Option<&str>,
     ) {
+        let expects_l1_verification = l1_after_head.is_some() && expected_error.is_none();
         let task_executor = Runtime::test();
         let chain_id = 412346u64;
         let init = ArbosInitConfig {
@@ -681,12 +724,15 @@ mod tests {
             });
         let data_dir =
             maybe_path.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
+        let l1_verified_tip = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let launcher = ArbLauncher {
             ctx: LaunchContext::new(task_executor, data_dir),
             chain_id,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
+            init_message_journal_at_tip: false,
+            l1_verified_tip: l1_verified_tip.clone(),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,
@@ -697,6 +743,17 @@ mod tests {
             .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
             .await
             .expect("launch must succeed");
+        let marker_path = {
+            use reth_storage_api::StoragePath;
+            handle
+                .provider
+                .database_provider_ro()
+                .expect("open provider for marker path")
+                .storage_path()
+                .parent()
+                .expect("database path has parent")
+                .join("arb-message-divergence.json")
+        };
         if let Some((head, message)) = l1_after_head {
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
@@ -726,6 +783,15 @@ mod tests {
             }
             None => result.expect("matching L1 copy must be accepted"),
         }
+        assert_eq!(
+            l1_verified_tip.load(std::sync::atomic::Ordering::Acquire),
+            u64::from(expects_l1_verification),
+        );
+        assert_eq!(
+            marker_path.exists(),
+            expected_error.is_some(),
+            "only deterministic message failures create the startup-blocking marker",
+        );
     }
 
     /// `ArbLauncher` boots over reth's `LaunchContext` with full pruning, then persists two
@@ -807,6 +873,8 @@ mod tests {
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: Some(prune_config),
+            init_message_journal_at_tip: false,
+            l1_verified_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,
@@ -918,6 +986,8 @@ mod tests {
                 share_sparse_trie_with_payload_builder: false,
             },
             prune_config: None,
+            init_message_journal_at_tip: false,
+            l1_verified_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,

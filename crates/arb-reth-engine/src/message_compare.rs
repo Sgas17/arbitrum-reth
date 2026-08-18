@@ -13,7 +13,7 @@ use eyre::{WrapErr as _, eyre};
 const FINGERPRINT_DOMAIN: &[u8] = b"arb-reth-message-fingerprint-v1";
 
 /// Optional batch-posting metadata excluded from the core digest.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ArbMessageEnrichment {
     /// Legacy calldata gas cost carried by pre-ArbOS-50 batch posting reports.
     pub legacy_batch_gas_cost: Option<u64>,
@@ -22,7 +22,7 @@ pub struct ArbMessageEnrichment {
 }
 
 /// Stable identity of one ordered Arbitrum message.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ArbMessageFingerprint {
     /// Hash of all consensus fields other than optional batch-cost enrichment.
     pub core: B256,

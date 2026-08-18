@@ -24,6 +24,7 @@ use std::{
     fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
 };
 
 use crate::feed;
@@ -49,7 +50,7 @@ use reth_node_core::{
     dirs::{DataDirPath, MaybePlatformPath},
 };
 use reth_provider::{BlockNumReader, HeaderProvider};
-use reth_tracing::tracing::info;
+use reth_tracing::tracing::{info, warn};
 
 /// `arb-reth`: standalone no-engine Arbitrum (ArbOS-on-reth) node.
 #[derive(Debug, Parser)]
@@ -271,6 +272,12 @@ pub struct NodeArgs {
     #[arg(long = "snapshot-head", value_name = "PATH")]
     snapshot_head: Option<PathBuf>,
 
+    /// One-shot migration for a database created before message journaling: trust the current
+    /// validated tip as the journal anchor. Startup fails if the journal already exists, forcing
+    /// this flag to be removed after one successful use.
+    #[arg(long = "init-message-journal-at-tip")]
+    init_message_journal_at_tip: bool,
+
     /// History-pruning / full-node configuration: reth's standard `--full` and granular
     /// `--prune.*` flags (e.g. `--prune.account-history.distance <BLOCKS>`,
     /// `--prune.storage-history.distance <BLOCKS>`, `--prune.receipts.distance <BLOCKS>`,
@@ -429,6 +436,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let feed_sources = feed::expand_feed_sources(&args.feed_urls, args.feed_connections)?;
     if args.no_l1_derive && feed_sources.is_empty() {
         return Err(eyre::eyre!("--no-l1-derive requires at least one --feed-url"));
+    }
+    if args.no_l1_derive {
+        warn!(target: "arb-reth", "L1 derivation disabled; feed-only message journal history cannot be compacted");
     }
     let mev_tx_log_ipc = args
         .mev_tx_log_ipc
@@ -602,6 +612,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let feed_latency = (!feed_sources.is_empty()).then(FeedLatencyTracker::new);
 
     let rpc_addr = args.http.then(|| (args.http_addr, args.http_port).into());
+    let l1_verified_tip = Arc::new(AtomicU64::new(0));
 
     let launcher = ArbLauncher {
         ctx: LaunchContext::new(task_executor.clone(), data_dir),
@@ -617,6 +628,8 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             share_sparse_trie_with_payload_builder: args.share_sparse_trie_with_payload_builder,
         },
         prune_config,
+        init_message_journal_at_tip: args.init_message_journal_at_tip,
+        l1_verified_tip: l1_verified_tip.clone(),
         feed_messages: feed_rx,
         l1_messages: l1_rx,
         feed_latency: feed_latency.clone(),
@@ -735,8 +748,8 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 
         // The current durable L2 tip (`last_block_number` = the persisted DB head, not the
         // in-memory canonical head). The driver already boots its production tip from this block
-        // (via reth's `lookup_head`), so L1 derivation must resume so that its first NEW block is
-        // `db_tip + 1`. Every block at or below `db_tip` that gets re-derived is dropped downstream.
+        // (via reth's `lookup_head`). Re-derived blocks at or below `db_tip` are forwarded to the
+        // driver for comparison with the durable message journal before new history is accepted.
         let db_tip = handle.provider.last_block_number()?;
 
         // The rollup addresses and genesis anchors, resolved as one set (Arbitrum One by default,
@@ -755,7 +768,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 
         // Resolve the L1 derivation resume point: (start_block, start_delayed, start_l2_block).
         // `start_l2_block` is the L2 block the start point sits *after*; derived blocks are numbered
-        // from it so already-present ones can be dropped. Precedence: an explicit --l1-start-block
+        // from it so already-present ones can be verified. Precedence: an explicit --l1-start-block
         // override, else the persisted checkpoint, else the genesis-snapshot bootstrap.
         let (start_block, start_delayed, start_l2_block) = if let Some(b) = args.l1_start_block {
             // Manual override: the operator asserts `b` is the batch boundary the tip was built
@@ -799,14 +812,14 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             // genesis. For a fresh genesis DB this is the normal bootstrap (nothing is skipped). For
             // a DB that advanced past genesis but has no checkpoint (a rewound DB, or one synced by
             // a build predating the resume log) the L1-sync runtime re-derives from genesis and
-            // DROPS every block <= db_tip (derivation only, no re-execution), producing just the new
-            // tail. Slower to start than a checkpoint resume, but always correct and self-healing;
+            // verifies every durable overlap before producing the new tail. Slower to start than a
+            // checkpoint resume, but always correct and self-healing;
             // the first window past db_tip writes a fresh checkpoint so later restarts are fast.
             if db_tip != l2_genesis_block {
                 info!(
                     target: "arb-reth", db_tip,
                     genesis = l2_genesis_block,
-                    "no resume checkpoint; re-deriving from genesis and skipping already-present blocks",
+                    "no resume checkpoint; re-deriving from genesis and verifying already-present blocks",
                 );
             }
             // Resolve batch 0's delivery block on-chain (anchored at the SequencerInbox deploy
@@ -847,8 +860,10 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             sync_cfg.batch_window = n;
             sync_cfg.delayed_window = n;
         }
+        l1_verified_tip.fetch_max(start_l2_block, Ordering::Release);
         sync_cfg.start_l2_block = start_l2_block;
         sync_cfg.db_tip_l2 = db_tip;
+        sync_cfg.l1_verified_tip = l1_verified_tip.clone();
         // Messages are numbered by message index (block - genesis_block) for the driver's
         // sequence-reconciliation; without this a non-zero genesis (Arbitrum One) mis-numbers every
         // derived block and the driver applies none.

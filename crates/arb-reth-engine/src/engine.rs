@@ -32,6 +32,8 @@ use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::{WrapErr as _, eyre};
 use metrics::{Counter, Histogram};
 use std::{
+    error::Error,
+    fmt,
     sync::{
         OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -77,6 +79,7 @@ use reth_trie::{
 };
 use revm::context_interface::ContextTr as _;
 
+use crate::message_journal::{MessageJournal, MessageJournalAnchor, MessageJournalEntry};
 use crate::native_payload::ArbPayloadJobGenerator;
 use crate::{
     ArbEngineInput, ArbEngineInputSource, ArbMessageFingerprint, ArbPayloadAttributes,
@@ -87,12 +90,62 @@ use crate::{
 const MAX_PENDING_MESSAGES: usize = 50_000;
 const MAX_RECENT_MESSAGE_IDENTITIES: usize = 100_000;
 
+/// Deterministic message-identity failure that requires operator recovery before restart.
+#[derive(Debug)]
+pub struct ArbMessageDivergence(String);
+
+impl fmt::Display for ArbMessageDivergence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for ArbMessageDivergence {}
+
+fn divergence(message: impl Into<String>) -> eyre::Report {
+    eyre::Report::new(ArbMessageDivergence(message.into()))
+}
+
+/// Returns true when an engine failure proves a deterministic feed/L1 identity disagreement.
+pub fn is_message_divergence(error: &eyre::Report) -> bool {
+    error.downcast_ref::<ArbMessageDivergence>().is_some()
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AppliedMessageIdentity {
     fingerprint: ArbMessageFingerprint,
     source: ArbEngineInputSource,
+    block_number: u64,
     block_hash: B256,
     parent_hash: B256,
+    delayed_messages_read: u64,
+}
+
+impl From<MessageJournalEntry> for AppliedMessageIdentity {
+    fn from(entry: MessageJournalEntry) -> Self {
+        Self {
+            fingerprint: entry.fingerprint,
+            source: entry.source,
+            block_number: entry.block_number,
+            block_hash: entry.block_hash,
+            parent_hash: entry.parent_hash,
+            delayed_messages_read: entry.delayed_messages_read,
+        }
+    }
+}
+
+impl AppliedMessageIdentity {
+    fn journal_entry(self, sequence: u64) -> MessageJournalEntry {
+        MessageJournalEntry {
+            sequence,
+            block_number: self.block_number,
+            block_hash: self.block_hash,
+            parent_hash: self.parent_hash,
+            delayed_messages_read: self.delayed_messages_read,
+            fingerprint: self.fingerprint,
+            source: self.source,
+        }
+    }
 }
 
 fn validate_batch_report_metadata(
@@ -102,9 +155,9 @@ fn validate_batch_report_metadata(
 ) -> eyre::Result<()> {
     let incoming = &input.message().message_with_meta_data.l1_incoming_message;
     if arbos_version >= 50 && incoming.header.kind == 13 && incoming.batch_data_stats.is_none() {
-        return Err(eyre!(
+        return Err(divergence(format!(
             "batch posting report at sequence {sequence} is missing BatchDataStats required by ArbOS {arbos_version}"
-        ));
+        )));
     }
     Ok(())
 }
@@ -115,21 +168,21 @@ fn merge_same_sequence_inputs(
 ) -> eyre::Result<ArbEngineInput> {
     let sequence = existing.sequence_number();
     if incoming.sequence_number() != sequence {
-        return Err(eyre!(
+        return Err(divergence(format!(
             "cannot reconcile different sequences {sequence} and {}",
             incoming.sequence_number()
-        ));
+        )));
     }
     let existing_fingerprint = fingerprint_message(existing.message())?;
     let incoming_fingerprint = fingerprint_message(incoming.message())?;
     if !existing_fingerprint.semantically_matches(incoming_fingerprint) {
-        return Err(eyre!(
+        return Err(divergence(format!(
             "feed/L1 message disagreement at sequence {sequence}: existing source {:?} core {:#x}, incoming source {:?} core {:#x}",
             existing.source(),
             existing_fingerprint.core,
             incoming.source(),
             incoming_fingerprint.core,
-        ));
+        )));
     }
 
     match (existing.source(), incoming.source()) {
@@ -137,9 +190,9 @@ fn merge_same_sequence_inputs(
         (ArbEngineInputSource::L1, _) => Ok(existing.clone()),
         (ArbEngineInputSource::Feed, ArbEngineInputSource::Feed) => {
             match (existing.claimed_block_hash(), incoming.claimed_block_hash()) {
-                (Some(first), Some(second)) if first != second => Err(eyre!(
+                (Some(first), Some(second)) if first != second => Err(divergence(format!(
                     "sequencer feed supplied conflicting block hashes at sequence {sequence}: {first:#x} and {second:#x}"
-                )),
+                ))),
                 (None, Some(_)) => Ok(incoming.clone()),
                 _ => Ok(existing.clone()),
             }
@@ -1226,18 +1279,82 @@ where
     /// next message index to apply; a feed/derived message with `sequence_number` maps to L2 block
     /// `sequence_number + genesis_block`. Messages below `next_seq` are already-applied duplicates
     /// (dropped); the one equal to it is applied; ones above it are feed-ahead and buffered in
-    /// `pending` until derivation closes the gap. Feed/L1 copies applied during this process are
-    /// compared by normalized message identity; the next slice extends that invariant across
-    /// restarts with a durable journal.
+    /// `pending` until derivation closes the gap. Feed/L1 copies are compared by normalized message
+    /// identity across both the current process and restarts through the durable journal.
     next_seq: u64,
     /// Feed-ahead reorder buffer, retaining source authority and rejecting conflicting copies.
     pending: BTreeMap<u64, ArbEngineInput>,
-    /// First sequence applied by this driver process. Older persisted history requires the durable
-    /// message journal added by the next slice; within this process every applied sequence must be
-    /// represented in `recent_messages` or reconciliation fails closed.
-    tracking_start_seq: u64,
     /// Bounded identities for comparing delayed L1 copies with already-executed feed messages.
     recent_messages: BTreeMap<u64, AppliedMessageIdentity>,
+    genesis_block: u64,
+    message_journal: MessageJournal,
+    pending_journal_events: VecDeque<MessageJournalEntry>,
+    l1_verified_tip: Arc<AtomicU64>,
+}
+
+fn open_message_journal_for_tip(
+    datadir: &std::path::Path,
+    genesis_block: u64,
+    tip_number: u64,
+    tip_hash: B256,
+    allow_bootstrap: bool,
+) -> eyre::Result<MessageJournal> {
+    let journal_path = MessageJournal::path_in(datadir);
+    let divergence_path = MessageJournal::divergence_path_in(datadir);
+    if divergence_path.exists() {
+        return Err(eyre!(
+            "unresolved feed/L1 divergence marker at {}; keep the node stopped, rewind/recover, then clear the marker explicitly",
+            divergence_path.display()
+        ));
+    }
+    let expected_sequence = tip_number.checked_sub(genesis_block).ok_or_else(|| {
+        eyre!("durable database tip {tip_number} is below L2 genesis block {genesis_block}")
+    })?;
+    let journal = if journal_path.exists() {
+        if allow_bootstrap {
+            return Err(eyre!(
+                "message journal already exists at {}; remove --init-message-journal-at-tip after its one successful use",
+                journal_path.display()
+            ));
+        }
+        MessageJournal::open(journal_path)?
+    } else {
+        if tip_number != genesis_block && !allow_bootstrap {
+            return Err(eyre!(
+                "message journal is missing for non-genesis database tip {tip_number} at {}; initialize an explicit trusted anchor with --init-message-journal-at-tip",
+                journal_path.display()
+            ));
+        }
+        MessageJournal::create(
+            journal_path,
+            MessageJournalAnchor {
+                sequence: expected_sequence,
+                block_number: tip_number,
+                block_hash: tip_hash,
+            },
+        )?
+    };
+    let journal_tip = journal.watermark();
+    if journal_tip.sequence != expected_sequence
+        || journal_tip.block_number != tip_number
+        || journal_tip.block_hash != tip_hash
+    {
+        let recovery = if journal_tip.block_number < tip_number {
+            "rewind the database to the journal watermark"
+        } else {
+            "rerun the interrupted rewind at the current database tip"
+        };
+        return Err(eyre!(
+            "message journal watermark {} / {} ({:#x}) does not match durable database tip {} / {} ({:#x}); keep the node stopped and {recovery} before restarting",
+            journal_tip.sequence,
+            journal_tip.block_number,
+            journal_tip.block_hash,
+            expected_sequence,
+            tip_number,
+            tip_hash,
+        ));
+    }
+    Ok(journal)
 }
 
 impl<N> ArbEngineDriver<N>
@@ -1276,8 +1393,25 @@ where
         runtime: Runtime,
         tuning: ArbEngineTuning,
         prune_builder: Option<PrunerBuilder>,
+        allow_message_journal_bootstrap: bool,
+        l1_verified_tip: Arc<AtomicU64>,
         tx_log_stream: Option<ArbTxLogBroadcaster>,
     ) -> eyre::Result<Self> {
+        let message_journal = {
+            let db_provider = factory.database_provider_ro()?;
+            let db_path = db_provider.storage_path();
+            let datadir = db_path.parent().ok_or_else(|| {
+                eyre!("database path {} has no datadir parent", db_path.display())
+            })?;
+            open_message_journal_for_tip(
+                datadir,
+                genesis_block,
+                genesis_tip.number,
+                genesis_tip.hash(),
+                allow_message_journal_bootstrap,
+            )?
+        };
+
         // ---- persistence service (real MDBX writer; pruner from --prune.* flags) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
             tokio::sync::watch::channel(reth_exex_types::FinishedExExHeight::NoExExs);
@@ -1391,8 +1525,11 @@ where
             pending_applied: None,
             next_seq,
             pending: BTreeMap::new(),
-            tracking_start_seq: next_seq,
             recent_messages: BTreeMap::new(),
+            genesis_block,
+            message_journal,
+            pending_journal_events: VecDeque::new(),
+            l1_verified_tip,
         })
     }
 
@@ -1449,6 +1586,7 @@ where
     where
         F: FnMut(u64, ArbAppliedMessageTiming),
     {
+        self.flush_durable_message_journal()?;
         let seq = input.sequence_number();
         if seq < self.next_seq {
             self.verify_applied_overlap(input)?;
@@ -1520,19 +1658,30 @@ where
 
     fn verify_applied_overlap(&mut self, input: &ArbEngineInput) -> eyre::Result<()> {
         let sequence = input.sequence_number();
-        let Some(applied) = self.recent_messages.get_mut(&sequence) else {
-            if sequence >= self.tracking_start_seq {
-                return Err(eyre!(
-                    "cannot verify overlap at sequence {sequence}: applied identity fell outside the in-memory reconciliation window"
-                ));
+        let applied = self
+            .recent_messages
+            .get(&sequence)
+            .copied()
+            .or_else(|| self.message_journal.entry(sequence).map(Into::into));
+        let Some(mut applied) = applied else {
+            if sequence > self.message_journal.anchor().sequence {
+                return Err(divergence(format!(
+                    "cannot verify overlap at sequence {sequence}: no durable or in-memory message identity exists"
+                )));
             }
-            // Pre-start persisted history will be covered by the durable journal. Until that slice
-            // lands, preserve startup compatibility without claiming that this overlap was checked.
+            // The explicit or compacted journal anchor trusts the older prefix as one indivisible
+            // L1-verified snapshot.
+            if input.source() == ArbEngineInputSource::L1 {
+                self.l1_verified_tip.fetch_max(
+                    self.genesis_block.saturating_add(sequence),
+                    Ordering::Release,
+                );
+            }
             return Ok(());
         };
         let incoming = fingerprint_message(input.message())?;
         if !applied.fingerprint.semantically_matches(incoming) {
-            return Err(eyre!(
+            return Err(divergence(format!(
                 "feed/L1 message disagreement at applied sequence {sequence}: applied source {:?} block {:#x} parent {:#x} core {:#x}, incoming source {:?} core {:#x}",
                 applied.source,
                 applied.block_hash,
@@ -1540,10 +1689,17 @@ where
                 applied.fingerprint.core,
                 input.source(),
                 incoming.core,
-            ));
+            )));
         }
         if input.source() == ArbEngineInputSource::L1 {
-            applied.source = ArbEngineInputSource::L1;
+            if applied.source == ArbEngineInputSource::Feed {
+                applied.source = ArbEngineInputSource::L1;
+                applied.fingerprint = incoming;
+                self.recent_messages.insert(sequence, applied);
+                self.trim_recent_messages();
+                self.pending_journal_events
+                    .push_back(applied.journal_entry(sequence));
+            }
         }
         Ok(())
     }
@@ -1555,21 +1711,82 @@ where
         block_hash: B256,
         parent_hash: B256,
     ) -> eyre::Result<()> {
-        self.recent_messages.insert(
-            sequence,
-            AppliedMessageIdentity {
-                fingerprint: fingerprint_message(input.message())?,
-                source: input.source(),
-                block_hash,
-                parent_hash,
-            },
-        );
+        let block_number = self
+            .genesis_block
+            .checked_add(sequence)
+            .ok_or_else(|| eyre!("message sequence overflows L2 block number"))?;
+        if block_number != self.tip.number {
+            return Err(eyre!(
+                "message sequence {sequence} maps to block {block_number}, but produced tip is {}",
+                self.tip.number
+            ));
+        }
+        let identity = AppliedMessageIdentity {
+            fingerprint: fingerprint_message(input.message())?,
+            source: input.source(),
+            block_number,
+            block_hash,
+            parent_hash,
+            delayed_messages_read: input.message().message_with_meta_data.delayed_messages_read,
+        };
+        self.recent_messages.insert(sequence, identity);
+        self.pending_journal_events
+            .push_back(identity.journal_entry(sequence));
+        self.trim_recent_messages();
+        Ok(())
+    }
+
+    fn trim_recent_messages(&mut self) {
         while self.recent_messages.len() > MAX_RECENT_MESSAGE_IDENTITIES {
             let Some(oldest) = self.recent_messages.first_key_value().map(|(&key, _)| key) else {
                 break;
             };
             self.recent_messages.remove(&oldest);
         }
+    }
+
+    /// Durably block automatic restart after any fail-closed driver error.
+    pub fn write_divergence_marker(&self, input: &ArbEngineInput, error: &str) -> eyre::Result<()> {
+        self.message_journal.write_divergence_marker(
+            self.tip.number,
+            self.tip.hash(),
+            self.next_seq,
+            input,
+            error,
+        )
+    }
+
+    /// Persist every journal event whose corresponding block is already durable in Reth.
+    pub fn flush_durable_message_journal(&mut self) -> eyre::Result<()> {
+        if self.pending_journal_events.is_empty() {
+            return Ok(());
+        }
+        let durable_tip = self.provider.last_block_number()?;
+        let count = self
+            .pending_journal_events
+            .iter()
+            .take_while(|entry| entry.block_number <= durable_tip)
+            .count();
+        if count == 0 {
+            return Ok(());
+        }
+        let entries = self
+            .pending_journal_events
+            .iter()
+            .take(count)
+            .copied()
+            .collect::<Vec<_>>();
+        self.message_journal.append_durable(&entries)?;
+        if let Some(verified_tip) = entries
+            .iter()
+            .filter(|entry| entry.source == ArbEngineInputSource::L1)
+            .map(|entry| entry.block_number)
+            .max()
+        {
+            self.l1_verified_tip
+                .fetch_max(verified_tip, Ordering::Release);
+        }
+        self.pending_journal_events.drain(..count);
         Ok(())
     }
 
@@ -1648,10 +1865,10 @@ where
         if let Some(claimed_hash) = input.claimed_block_hash()
             && claimed_hash != produced_hash
         {
-            return Err(eyre!(
+            return Err(divergence(format!(
                 "sequencer feed block hash mismatch at sequence {sequence_number}: claimed \
                  {claimed_hash:#x}, produced {produced_hash:#x}"
-            ));
+            )));
         }
 
         let new_hash = self.queue_applied_block(
@@ -2103,6 +2320,54 @@ mod termination_tests {
 #[cfg(test)]
 mod reconciliation_tests {
     use super::*;
+
+    #[test]
+    fn journal_startup_gate_requires_explicit_bootstrap_and_exact_tip() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let hash = B256::repeat_byte(0x11);
+
+        let missing = open_message_journal_for_tip(dir.path(), 0, 10, hash, false)
+            .err()
+            .expect("non-genesis tip must not be trusted implicitly");
+        assert!(
+            missing
+                .to_string()
+                .contains("--init-message-journal-at-tip")
+        );
+
+        open_message_journal_for_tip(dir.path(), 0, 10, hash, true)?;
+        let repeated = open_message_journal_for_tip(dir.path(), 0, 10, hash, true)
+            .err()
+            .expect("bootstrap flag must be one-shot");
+        assert!(repeated.to_string().contains("already exists"));
+        open_message_journal_for_tip(dir.path(), 0, 10, hash, false)?;
+
+        let mismatch =
+            open_message_journal_for_tip(dir.path(), 0, 11, B256::repeat_byte(0x22), false)
+                .err()
+                .expect("DB ahead of journal must refuse startup");
+        assert!(
+            mismatch
+                .to_string()
+                .contains("rewind the database to the journal watermark")
+        );
+
+        std::fs::write(
+            MessageJournal::divergence_path_in(dir.path()),
+            b"torn marker",
+        )?;
+        let marked = open_message_journal_for_tip(dir.path(), 0, 10, hash, false)
+            .err()
+            .expect("any marker file must block startup");
+        assert!(marked.to_string().contains("unresolved feed/L1 divergence"));
+        Ok(())
+    }
+
+    #[test]
+    fn only_typed_message_failures_are_divergence() {
+        assert!(is_message_divergence(&divergence("message mismatch")));
+        assert!(!is_message_divergence(&eyre!("engine timeout")));
+    }
 
     fn message() -> BroadcastFeedMessage {
         serde_json::from_str(include_str!(

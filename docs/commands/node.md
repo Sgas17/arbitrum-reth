@@ -36,7 +36,13 @@ arb-reth node \
 
 ## L1 derivation
 
-`--l1-rpc` starts the catch-up loop. The node records durable boundaries in `arb-l1-resume.json` under the datadir and resumes from that checkpoint by default.
+`--l1-rpc` starts the catch-up loop. The node records L1-verified durable boundaries in `arb-l1-resume.json` under the datadir and resumes from that checkpoint by default.
+
+The node also maintains `arb-message-journal.ndjson` under the datadir. A pre-existing non-genesis database without this journal requires `--init-message-journal-at-tip` once, after independently validating its current tip. Remove the flag after that successful startup; repeated use is rejected. New genesis databases create the journal automatically.
+
+Startup refuses when the durable database tip is ahead of the journal or while `arb-message-divergence.json` exists. This includes an unclean shutdown where asynchronous database persistence outran the last journal fsync. Keep the node stopped and use `arb-reth rewind` to the journal watermark or the block before the confirmed divergence; successful recovery clears the marker.
+
+Journal compaction only discards an L1-verified prefix. A feed-only node cannot compact its journal, so `--no-l1-derive` is intended for bounded replay/debug runs rather than unattended operation.
 
 Use `--l1-start-block` and `--l1-start-delayed` only when the supplied values describe the existing L2 tip. `--l1-end-block` caps derivation at an inclusive L1 height. `--l1-getlogs-range` should match the provider's `eth_getLogs` span limit. `--l1-prefetch` controls concurrent batch resolution.
 

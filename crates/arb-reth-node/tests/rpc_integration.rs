@@ -66,6 +66,8 @@ async fn rpc_serves_eth_queries() {
         genesis_block: 0,
         tuning: arb_reth_node::ArbEngineTuning::reth_defaults(),
         prune_config: None,
+        init_message_journal_at_tip: false,
+        l1_verified_tip: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         feed_messages: feed_rx,
         l1_messages: l1_rx,
         feed_latency: None,

@@ -37,8 +37,8 @@ use reth_db_api::models::StorageSettings;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_provider::{
     providers::{RocksDBProvider, StaticFileProvider},
-    BlockExecutionWriter, BlockNumReader, DatabaseProviderFactory, DBProvider, ProviderFactory,
-    StorageSettingsCache,
+    BlockExecutionWriter, BlockNumReader, DatabaseProviderFactory, DBProvider, HeaderProvider,
+    ProviderFactory, StorageSettingsCache,
 };
 use reth_tasks::Runtime;
 use reth_tracing::tracing::info;
@@ -177,10 +177,10 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
     let current_tip = factory.provider()?.last_block_number()?;
     info!(target: "arb-rewind", current_tip, genesis = genesis_num, new_tip, "opened database (consistency healed)");
 
-    // Validate the target: it must be a real, earlier block at or above the imported genesis.
-    if new_tip >= current_tip {
+    // Equality is allowed so a run interrupted after DB commit can finish sidecar recovery.
+    if new_tip > current_tip {
         return Err(eyre::eyre!(
-            "new tip {new_tip} is not below the current tip {current_tip}; nothing to rewind"
+            "new tip {new_tip} is above the current tip {current_tip}"
         ));
     }
     if new_tip < genesis_num {
@@ -189,6 +189,13 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
              reset the datadir instead (arb-reset-db.sh)"
         ));
     }
+
+    let target_header = factory
+        .provider()?
+        .sealed_header(new_tip)?
+        .ok_or_else(|| eyre::eyre!("rewind target block {new_tip} is missing"))?;
+    let target_hash = target_header.hash();
+    arb_reth_engine::validate_journal_target_at(&args.datadir, new_tip, target_hash)?;
 
     // Truncate the resume log to a boundary at or below the new tip, so the next start resumes
     // derivation from there. Preview it first; without a surviving boundary the caller must supply
@@ -205,54 +212,69 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
         None => info!(
             target: "arb-rewind",
             "no resume-log boundary at or below {new_tip}; the next sync will re-derive from Nitro \
-             genesis and skip already-present blocks (derivation-only up to the new tip)",
+             genesis and verify already-present blocks against the message journal",
         ),
     }
 
-    // Diagnostic: the v2 state revert (`remove_state_above`) restores `HashedAccounts` from the
-    // account/storage changesets in `(new_tip, current_tip]`. If those read back empty, the revert
-    // is a silent no-op (blocks removed, state left at the old tip). Log the
-    // counts so a mis-read is obvious.
-    {
-        use reth_provider::{ChangeSetReader, StaticFileProviderFactory, StorageChangeSetReader};
-        use reth_static_file_types::StaticFileSegment;
-        let sfp = factory.static_file_provider();
+    if new_tip < current_tip {
+        // Diagnostic: the v2 state revert (`remove_state_above`) restores `HashedAccounts` from the
+        // account/storage changesets in `(new_tip, current_tip]`. If those read back empty, the revert
+        // is a silent no-op (blocks removed, state left at the old tip).
+        {
+            use reth_provider::{ChangeSetReader, StaticFileProviderFactory};
+            use reth_static_file_types::StaticFileSegment;
+            let sfp = factory.static_file_provider();
 
-        info!(
-            target: "arb-rewind",
-            headers = ?sfp.get_highest_static_file_block(StaticFileSegment::Headers),
-            account_changesets_tip = ?sfp.get_highest_static_file_block(StaticFileSegment::AccountChangeSets),
-            storage_changesets_tip = ?sfp.get_highest_static_file_block(StaticFileSegment::StorageChangeSets),
-            receipts = ?sfp.get_highest_static_file_block(StaticFileSegment::Receipts),
-            "static-file segment tips",
-        );
-        let ro = factory.database_provider_ro()?;
-        // Binary-search the block where changesets stop being written (they exist early, not late).
-        let has_cs = |bn: u64| -> bool {
-            ro.account_changesets_range(bn..=bn).map(|v| !v.is_empty()).unwrap_or(false)
-        };
-        let (mut lo, mut hi) = (genesis_num + 1, current_tip);
-        while hi - lo > 1 {
-            let mid = (lo + hi) / 2;
-            // scan a small window around mid (a single block may legitimately have 0 changes)
-            let any = (mid..=(mid + 20).min(current_tip)).any(has_cs);
-            if any { lo = mid } else { hi = mid }
+            info!(
+                target: "arb-rewind",
+                headers = ?sfp.get_highest_static_file_block(StaticFileSegment::Headers),
+                account_changesets_tip = ?sfp.get_highest_static_file_block(StaticFileSegment::AccountChangeSets),
+                storage_changesets_tip = ?sfp.get_highest_static_file_block(StaticFileSegment::StorageChangeSets),
+                receipts = ?sfp.get_highest_static_file_block(StaticFileSegment::Receipts),
+                "static-file segment tips",
+            );
+            let ro = factory.database_provider_ro()?;
+            // Binary-search the block where changesets stop being written (they exist early, not late).
+            let has_cs = |bn: u64| -> bool {
+                ro.account_changesets_range(bn..=bn).map(|v| !v.is_empty()).unwrap_or(false)
+            };
+            let (mut lo, mut hi) = (genesis_num + 1, current_tip);
+            while hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                // scan a small window around mid (a single block may legitimately have 0 changes)
+                let any = (mid..=(mid + 20).min(current_tip)).any(has_cs);
+                if any { lo = mid } else { hi = mid }
+            }
+            info!(target: "arb-rewind", last_block_with_changesets = lo, current_tip, "changeset write boundary");
+            let mut cursor = new_tip + 1;
+            let mut sample = None;
+            while cursor <= current_tip && sample.is_none() {
+                let end = cursor.saturating_add(1023).min(current_tip);
+                let accounts = ro.account_changesets_range(cursor..=end)?;
+                sample = accounts.first().map(|(bn, account)| {
+                    (*bn, account.address, account.info.map(|info| info.nonce))
+                });
+                cursor = end.saturating_add(1);
+            }
+            info!(target: "arb-rewind", ?sample, "bounded revert-range changeset check");
+            if sample.is_none() {
+                return Err(eyre::eyre!(
+                    "no account changesets found in ({new_tip}, {current_tip}]; the v2 state revert \
+                     would be a no-op and leave the DB inconsistent; aborting before any write"
+                ));
+            }
         }
-        info!(target: "arb-rewind", last_block_with_changesets = lo, current_tip, "changeset write boundary");
-        let accts = ro.account_changesets_range(new_tip + 1..=current_tip)?;
-        let stors = ro.storage_changesets_range(new_tip + 1..=current_tip)?;
-        let sample = accts.first().map(|(bn, a)| (*bn, a.address, a.info.map(|i| i.nonce)));
-        info!(
-            target: "arb-rewind",
-            account_changesets = accts.len(), storage_changesets = stors.len(), ?sample,
-            "revert-range changesets (must be > 0 for state to revert)",
-        );
-        if accts.is_empty() {
-            return Err(eyre::eyre!(
-                "no account changesets found in ({new_tip}, {current_tip}]; the v2 state revert \
-                 would be a no-op and leave the DB inconsistent; aborting before any write"
-            ));
+
+        if args.dry_run {
+            info!(target: "arb-rewind", "dry run: no changes written");
+            return Ok(());
         }
+
+        // Unwind the DB: remove every block/receipt/state/trie/history entry above `new_tip`.
+        info!(target: "arb-rewind", removing_above = new_tip, "unwinding database (this may take a while)");
+        let provider_rw = factory.database_provider_rw()?;
+        provider_rw.remove_block_and_execution_above(new_tip)?;
+        provider_rw.commit().map_err(|e| eyre::eyre!("commit unwind: {e}"))?;
     }
 
     if args.dry_run {
@@ -260,11 +282,8 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
         return Ok(());
     }
 
-    // Unwind the DB: remove every block/receipt/state/trie/history entry above `new_tip`.
-    info!(target: "arb-rewind", removing_above = new_tip, "unwinding database (this may take a while)");
-    let provider_rw = factory.database_provider_rw()?;
-    provider_rw.remove_block_and_execution_above(new_tip)?;
-    provider_rw.commit().map_err(|e| eyre::eyre!("commit unwind: {e}"))?;
+    // Sidecars follow the authoritative DB commit. Re-running the same target is idempotent.
+    arb_reth_engine::truncate_journal_at(&args.datadir, new_tip, target_hash)?;
 
     // Now truncate the resume log to match (only after the DB unwind committed).
     if let Some(log) = log.as_mut() {
@@ -272,7 +291,8 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
         if log.checkpoints.is_empty() {
             // Nothing survives: remove the stale log so the next start doesn't refuse on an
             // all-above-tip log; the operator resumes via --l1-start-block or reset.
-            let _ = std::fs::remove_file(&log_path);
+            L1ResumeLog::remove(&log_path)
+                .map_err(|e| eyre::eyre!("remove resume log: {e}"))?;
         } else {
             log.save(&log_path).map_err(|e| eyre::eyre!("rewrite resume log: {e}"))?;
         }
@@ -285,6 +305,7 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
             "post-rewind tip is {final_tip}, expected {new_tip}; unwind did not land where expected"
         ));
     }
+    arb_reth_engine::clear_divergence_marker_at(&args.datadir)?;
     println!("rewound {current_tip} -> {new_tip}  (removed {} blocks)", current_tip - new_tip);
     Ok(())
 }

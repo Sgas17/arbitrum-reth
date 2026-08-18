@@ -59,7 +59,7 @@ If an import fails after creating database files, discard the entire output dire
 
 A successful import writes `snapshot-import.json` only after the state root, snapshot head, launch check, and static-file layout all pass. The node refuses to boot a new-format snapshot datadir without this completion manifest.
 
-Use `/data/head-block.stream` with `node --snapshot-head` when starting the converted datadir.
+Use `/data/head-block.stream` with `node --snapshot-head` when starting the converted datadir. On its first start, also pass `--init-message-journal-at-tip` to anchor the new message journal at the import-validated tip, then remove that one-shot flag.
 
 ## Storage V2 preimages
 

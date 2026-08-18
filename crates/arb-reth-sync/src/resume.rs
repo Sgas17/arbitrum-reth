@@ -29,6 +29,7 @@
 //! and derivation resumes at a clean batch boundary; the L1-sync runtime drops any re-derived
 //! blocks it already has.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -89,8 +90,24 @@ impl L1ResumeLog {
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec(self).expect("L1ResumeLog serializes");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, path)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        sync_parent(path)
+    }
+
+    /// Durably remove a resume log that has no boundary surviving an offline rewind.
+    pub fn remove(path: &Path) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => sync_parent(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// The newest boundary at or below `l2_block`, i.e. the furthest safe point to resume a chain
@@ -124,6 +141,11 @@ impl L1ResumeLog {
     }
 }
 
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)?.sync_all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +165,18 @@ mod tests {
         log.record(cp(200, 20));
         log.save(&path).expect("save");
         assert_eq!(L1ResumeLog::load(&path), Some(log));
+    }
+
+    #[test]
+    fn remove_is_idempotent() {
+        let dir = reth_db::test_utils::tempdir_path();
+        let path = L1ResumeLog::path_in(&dir);
+        let mut log = L1ResumeLog::default();
+        log.record(cp(100, 10));
+        log.save(&path).unwrap();
+        L1ResumeLog::remove(&path).unwrap();
+        L1ResumeLog::remove(&path).unwrap();
+        assert_eq!(L1ResumeLog::load(&path), None);
     }
 
     #[test]

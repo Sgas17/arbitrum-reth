@@ -26,13 +26,20 @@ use arbitrum_alloy_consensus::reth::ArbPrimitives;
 pub mod engine;
 pub mod engine_spike;
 mod message_compare;
+mod message_journal;
 pub mod native_payload;
 mod storage_v2;
 mod tx_log_stream;
 
-pub use engine::{ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, wait_for_head};
+pub use engine::{
+    ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, ArbMessageDivergence,
+    is_message_divergence, wait_for_head,
+};
 pub use engine_spike::ArbPayloadValidator;
 pub use message_compare::{ArbMessageEnrichment, ArbMessageFingerprint, fingerprint_message};
+pub use message_journal::{
+    clear_divergence_marker_at, truncate_journal_at, validate_journal_target_at,
+};
 pub use native_payload::ArbPayloadBuilder;
 pub use tx_log_stream::{
     ArbExecutionFrontier, ArbExecutionFrontierStore, ArbTxExecutionKind, ArbTxLogBroadcaster,
@@ -40,7 +47,8 @@ pub use tx_log_stream::{
 };
 
 /// Provenance of an ordered message submitted to the engine driver.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ArbEngineInputSource {
     /// Message decoded from a sequencer feed or replay file.
     Feed,

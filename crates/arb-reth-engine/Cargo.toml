@@ -27,6 +27,7 @@ eyre = "0.6.12"
 metrics = "0.24"
 rayon = "1"
 serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json.workspace = true
 tracing = "0.1"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
@@ -58,7 +59,6 @@ reth-trie-db = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e6
 reth-trie = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 
 [dev-dependencies]
-serde_json.workspace = true
 reth-db-common = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 reth-chainspec = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 reth-node-types = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }

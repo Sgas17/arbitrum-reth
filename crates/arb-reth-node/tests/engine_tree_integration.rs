@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 
 mod tests {
-    use arb_reth_engine::{ArbEngineDriver, ArbEngineTuning};
+    use arb_reth_engine::{ArbEngineDriver, ArbEngineInput, ArbEngineTuning};
     use arb_reth_evm::ArbEvmConfig;
 
     use std::sync::Arc;
@@ -140,8 +140,9 @@ mod tests {
         for (index, message) in messages.into_iter().enumerate() {
             let number = message.sequence_number;
             let defer_tail = index + 1 < message_count;
+            let input = ArbEngineInput::feed(message, None);
             let hash = driver
-                .advance_with_applied_overlap(&message, defer_tail, |sequence_number, _| {
+                .advance_with_applied_overlap(&input, defer_tail, |sequence_number, _| {
                     canonicalized.push(sequence_number);
                 })
                 .await

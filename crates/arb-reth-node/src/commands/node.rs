@@ -595,7 +595,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // The held senders keep the driver parked (and the node alive) until SIGTERM. Keep the
     // live-feed backlog separate from authoritative L1 derivation so a relay reconnect cannot
     // place the L1 gap-closer behind thousands of feed-ahead messages.
-    let (feed_tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
+    let (feed_tx, feed_rx) = tokio::sync::mpsc::channel::<crate::ArbEngineInput>(4096);
     let (l1_tx, l1_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
     // Only live WebSocket messages carry an ingress timestamp. L1-derived and replay messages
     // still drive the same engine callback, but have no sample to record.
@@ -663,9 +663,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                 if line.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<BroadcastFeedMessage>(line) {
+                match serde_json::from_str::<feed::FeedWireMessage>(line) {
                     Ok(msg) => {
-                        if tx.send(msg).await.is_err() {
+                        if tx.send(msg.into_engine_input()).await.is_err() {
                             reth_tracing::tracing::warn!(
                                 target: "arb-reth",
                                 "feed channel closed before replay finished"

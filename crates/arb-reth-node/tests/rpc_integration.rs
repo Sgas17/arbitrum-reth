@@ -11,7 +11,9 @@ use reth_chainspec::MAINNET;
 use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
 use reth_tasks::Runtime;
 
-use arb_reth_node::{ArbLauncher, ArbNode, ArbTxExecutionKind, ArbTxLogBroadcaster};
+use arb_reth_node::{
+    ArbEngineInput, ArbLauncher, ArbNode, ArbTxExecutionKind, ArbTxLogBroadcaster,
+};
 
 /// `eth_*` JSON-RPC is live after node launch. Boots `ArbLauncher` with RPC on an
 /// ephemeral port, feeds two deposits, and verifies `eth_getBlockByNumber` and
@@ -27,15 +29,15 @@ async fn rpc_serves_eth_queries() {
     let task_executor = Runtime::test();
     // The driver dedups by sequence number, so the two messages must be sequential (a fresh
     // genesis DB has genesis_block 0, so the first digested message is index 1).
-    let (tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
+    let (tx, feed_rx) = tokio::sync::mpsc::channel::<ArbEngineInput>(4);
     let (l1_tx, l1_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(1);
     drop(l1_tx);
     let mut m1 = feed_msg.clone();
     m1.sequence_number = 1;
     let mut m2 = feed_msg.clone();
     m2.sequence_number = 2;
-    tx.send(m1).await.unwrap();
-    tx.send(m2).await.unwrap();
+    tx.send(ArbEngineInput::feed(m1, None)).await.unwrap();
+    tx.send(ArbEngineInput::feed(m2, None)).await.unwrap();
     drop(tx);
 
     let datadir = reth_db::test_utils::tempdir_path();

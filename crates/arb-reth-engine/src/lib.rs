@@ -13,7 +13,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use alloy_eips::eip4895::Withdrawal;
-use alloy_primitives::{Bytes, U256};
+use alloy_primitives::{B256, Bytes, U256};
 use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload as AlloyExecutionPayload, PayloadId};
 use reth_execution_cache::CacheStats;
 use reth_payload_primitives::{
@@ -36,6 +36,70 @@ pub use tx_log_stream::{
     ArbExecutionFrontier, ArbExecutionFrontierStore, ArbTxExecutionKind, ArbTxLogBroadcaster,
     ArbTxLogEvent,
 };
+
+/// Provenance of an ordered message submitted to the engine driver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArbEngineInputSource {
+    /// Message decoded from a sequencer feed or replay file.
+    Feed,
+    /// Message derived from canonical L1 data.
+    L1,
+}
+
+/// Source-aware input for one locally produced Arbitrum block.
+#[derive(Clone, Debug)]
+pub struct ArbEngineInput {
+    message: arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage,
+    source: ArbEngineInputSource,
+    claimed_block_hash: Option<B256>,
+}
+
+impl ArbEngineInput {
+    /// Wraps a sequencer-feed message and its optional top-level `blockHash` claim.
+    pub const fn feed(
+        message: arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage,
+        claimed_block_hash: Option<B256>,
+    ) -> Self {
+        Self {
+            message,
+            source: ArbEngineInputSource::Feed,
+            claimed_block_hash,
+        }
+    }
+
+    /// Wraps an L1-derived message, which has no sequencer-feed hash claim.
+    pub const fn l1(
+        message: arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage,
+    ) -> Self {
+        Self {
+            message,
+            source: ArbEngineInputSource::L1,
+            claimed_block_hash: None,
+        }
+    }
+
+    /// Returns the ordered message body.
+    pub const fn message(
+        &self,
+    ) -> &arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage {
+        &self.message
+    }
+
+    /// Returns this input's provenance.
+    pub const fn source(&self) -> ArbEngineInputSource {
+        self.source
+    }
+
+    /// Returns the optional sequencer-feed block hash claim.
+    pub const fn claimed_block_hash(&self) -> Option<B256> {
+        self.claimed_block_hash
+    }
+
+    /// Returns the feed sequence number used for ordering.
+    pub const fn sequence_number(&self) -> u64 {
+        self.message.sequence_number
+    }
+}
 
 /// An executed Arbitrum payload produced by the local payload builder.
 #[derive(Debug, Clone)]

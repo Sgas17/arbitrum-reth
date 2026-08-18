@@ -78,7 +78,7 @@ use revm::context_interface::ContextTr as _;
 
 use crate::native_payload::ArbPayloadJobGenerator;
 use crate::{
-    ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator,
+    ArbEngineInput, ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator,
     ArbTxExecutionKind, ArbTxLogBroadcaster, ArbTxLogEvent,
 };
 
@@ -1167,7 +1167,7 @@ where
     next_seq: u64,
     /// Feed-ahead reorder buffer: messages with `sequence_number > next_seq`, keyed by sequence.
     /// Bounded by `MAX_PENDING` to cap memory if the feed runs far ahead of derivation.
-    pending: BTreeMap<u64, BroadcastFeedMessage>,
+    pending: BTreeMap<u64, ArbEngineInput>,
 }
 
 impl<N> ArbEngineDriver<N>
@@ -1332,8 +1332,8 @@ where
     /// `TransactionStreamer` style. Drops it if already applied (`sequence_number < next_seq`),
     /// applies it if it is the next expected message, or buffers it as feed-ahead otherwise; after
     /// applying, drains any now-contiguous buffered messages. Returns the resulting head hash.
-    pub async fn advance(&mut self, msg: &BroadcastFeedMessage) -> eyre::Result<B256> {
-        self.advance_with_applied(msg, |_, _| {}).await
+    pub async fn advance(&mut self, input: &ArbEngineInput) -> eyre::Result<B256> {
+        self.advance_with_applied(input, |_, _| {}).await
     }
 
     /// Like [`Self::advance`], while notifying the caller after each message has become the
@@ -1341,13 +1341,13 @@ where
     /// closes, and deliberately excludes duplicate messages that were not applied.
     pub async fn advance_with_applied<F>(
         &mut self,
-        msg: &BroadcastFeedMessage,
+        input: &ArbEngineInput,
         mut on_applied: F,
     ) -> eyre::Result<B256>
     where
         F: FnMut(u64, ArbAppliedMessageTiming),
     {
-        self.advance_with_applied_inner(msg, false, &mut on_applied)
+        self.advance_with_applied_inner(input, false, &mut on_applied)
             .await
     }
 
@@ -1357,20 +1357,20 @@ where
     /// while overlapping the two driver round trips.
     pub async fn advance_with_applied_overlap<F>(
         &mut self,
-        msg: &BroadcastFeedMessage,
+        input: &ArbEngineInput,
         defer_tail: bool,
         mut on_applied: F,
     ) -> eyre::Result<B256>
     where
         F: FnMut(u64, ArbAppliedMessageTiming),
     {
-        self.advance_with_applied_inner(msg, defer_tail, &mut on_applied)
+        self.advance_with_applied_inner(input, defer_tail, &mut on_applied)
             .await
     }
 
     async fn advance_with_applied_inner<F>(
         &mut self,
-        msg: &BroadcastFeedMessage,
+        input: &ArbEngineInput,
         defer_tail: bool,
         on_applied: &mut F,
     ) -> eyre::Result<B256>
@@ -1378,7 +1378,7 @@ where
         F: FnMut(u64, ArbAppliedMessageTiming),
     {
         const MAX_PENDING: usize = 50_000;
-        let seq = msg.sequence_number;
+        let seq = input.sequence_number();
         if seq < self.next_seq {
             // Already applied by the other producer (feed/L1 overlap). Idempotent drop.
             if let Some((sequence_number, timing)) = self.settle_pending_applied().await? {
@@ -1389,7 +1389,7 @@ where
         if seq > self.next_seq {
             // Feed-ahead: hold until derivation fills the gap up to this sequence, then it drains.
             if self.pending.len() < MAX_PENDING {
-                self.pending.insert(seq, msg.clone());
+                self.pending.insert(seq, input.clone());
             }
             if let Some((sequence_number, timing)) = self.settle_pending_applied().await? {
                 on_applied(sequence_number, timing);
@@ -1400,7 +1400,7 @@ where
         // seq == next_seq: queue this block, then drain the contiguous feed-ahead buffer. Each
         // subsequent payload-attributes request is queued before the previous final FCU is
         // awaited, which restores the native engine overlap without reading pending state.
-        let (mut hash, completed) = self.apply_one_native(seq, msg, Instant::now()).await?;
+        let (mut hash, completed) = self.apply_one_native(seq, input, Instant::now()).await?;
         if let Some((sequence_number, timing)) = completed {
             on_applied(sequence_number, timing);
         }
@@ -1432,13 +1432,13 @@ where
     async fn apply_one_native(
         &mut self,
         sequence_number: u64,
-        msg: &BroadcastFeedMessage,
+        input: &ArbEngineInput,
         started_at: Instant,
     ) -> eyre::Result<(B256, Option<(u64, ArbAppliedMessageTiming)>)> {
         let payload_builder = self.payload_builder.clone();
         let parent = self.tip.hash();
         let phase_started_at = Instant::now();
-        let attributes = self.native_payload_attributes(msg);
+        let attributes = self.native_payload_attributes(input.message());
         let payload_attributes = phase_started_at.elapsed();
 
         // This is Reth's standard local-builder entry point. The engine tree validates the
@@ -1493,6 +1493,16 @@ where
             .executed_block()
             .ok_or_else(|| eyre!("native payload {payload_id:?} omitted execution output"))?;
         crate::storage_v2::mark_live_hashed_storage_wipes(&mut built);
+
+        let produced_hash = built.recovered_block.hash();
+        if let Some(claimed_hash) = input.claimed_block_hash()
+            && claimed_hash != produced_hash
+        {
+            return Err(eyre!(
+                "sequencer feed block hash mismatch at sequence {sequence_number}: claimed \
+                 {claimed_hash:#x}, produced {produced_hash:#x}"
+            ));
+        }
 
         let new_hash = self.queue_applied_block(
             sequence_number,

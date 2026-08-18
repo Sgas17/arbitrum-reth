@@ -44,7 +44,9 @@ use tokio::sync::oneshot;
 
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, reth::ArbBlock};
 
-use arb_reth_engine::{ArbEngineDriver, ArbEngineTuning, ArbTxLogBroadcaster};
+use arb_reth_engine::{
+    ArbEngineDriver, ArbEngineInput, ArbEngineInputSource, ArbEngineTuning, ArbTxLogBroadcaster,
+};
 
 /// Handle returned by `ArbLauncher` after the node has been launched.
 ///
@@ -93,7 +95,7 @@ pub struct ArbLauncher {
     pub prune_config: Option<reth_config::PruneConfig>,
     /// Live-feed and replay messages. These may be ahead of the local canonical cursor when the
     /// relay's bounded backlog begins after the database tip.
-    pub feed_messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    pub feed_messages: tokio::sync::mpsc::Receiver<ArbEngineInput>,
     /// Authoritative L1-derived messages. These are kept separate from the live feed so a large
     /// feed-ahead backlog cannot delay the message that closes a derivation gap.
     pub l1_messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
@@ -106,21 +108,15 @@ pub struct ArbLauncher {
     pub tx_log_stream: Option<ArbTxLogBroadcaster>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MessageSource {
-    L1,
-    Feed,
-}
-
 /// Receives the next message, preferring the authoritative L1 path whenever both sources are
 /// ready. This is only an ingress scheduling decision: the engine driver remains the single
 /// sequence-reconciliation point and still deduplicates both sources by message index.
 async fn recv_next_message(
-    feed_messages: &mut tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    feed_messages: &mut tokio::sync::mpsc::Receiver<ArbEngineInput>,
     l1_messages: &mut tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
     feed_open: &mut bool,
     l1_open: &mut bool,
-) -> Option<(MessageSource, BroadcastFeedMessage)> {
+) -> Option<ArbEngineInput> {
     loop {
         if !*feed_open && !*l1_open {
             return None;
@@ -129,11 +125,11 @@ async fn recv_next_message(
         tokio::select! {
             biased;
             message = l1_messages.recv(), if *l1_open => match message {
-                Some(message) => return Some((MessageSource::L1, message)),
+                Some(message) => return Some(ArbEngineInput::l1(message)),
                 None => *l1_open = false,
             },
             message = feed_messages.recv(), if *feed_open => match message {
-                Some(message) => return Some((MessageSource::Feed, message)),
+                Some(message) => return Some(message),
                 None => *feed_open = false,
             },
         }
@@ -392,7 +388,7 @@ impl ArbLauncher {
                 let mut l1_open = true;
                 loop {
                     let __r = std::time::Instant::now();
-                    let Some((source, first)) = recv_next_message(
+                    let Some(first) = recv_next_message(
                         &mut feed_messages,
                         &mut l1_messages,
                         &mut feed_open,
@@ -408,21 +404,24 @@ impl ArbLauncher {
                     // the receiver's racy `is_empty()` hint: historical catch-up can overlap the
                     // final FCU of every non-tail message, while a one-message live-feed batch
                     // remains fully settled before the next frame arrives.
+                    let source = first.source();
                     let mut batch = Vec::with_capacity(MAX_MESSAGE_BATCH);
                     batch.push(first);
                     let mut source_closed = false;
                     while batch.len() < MAX_MESSAGE_BATCH {
-                        let receiver = match source {
-                            MessageSource::L1 => &mut l1_messages,
-                            MessageSource::Feed => &mut feed_messages,
+                        let next = match source {
+                            ArbEngineInputSource::L1 => {
+                                l1_messages.try_recv().map(ArbEngineInput::l1)
+                            }
+                            ArbEngineInputSource::Feed => feed_messages.try_recv(),
                         };
-                        match receiver.try_recv() {
-                            Ok(msg) => batch.push(msg),
+                        match next {
+                            Ok(input) => batch.push(input),
                             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                                 match source {
-                                    MessageSource::L1 => l1_open = false,
-                                    MessageSource::Feed => feed_open = false,
+                                    ArbEngineInputSource::L1 => l1_open = false,
+                                    ArbEngineInputSource::Feed => feed_open = false,
                                 }
                                 source_closed = true;
                                 break;
@@ -431,18 +430,18 @@ impl ArbLauncher {
                     }
 
                     let batch_len = batch.len();
-                    for (index, msg) in batch.into_iter().enumerate() {
+                    for (index, input) in batch.into_iter().enumerate() {
                         let driver_dequeued_at = std::time::Instant::now();
-                        if source == MessageSource::Feed
+                        if source == ArbEngineInputSource::Feed
                             && let Some(feed_latency) = feed_latency.as_ref()
                         {
                             feed_latency
-                                .record_driver_dequeue(msg.sequence_number, driver_dequeued_at);
+                                .record_driver_dequeue(input.sequence_number(), driver_dequeued_at);
                         }
                         let __w = std::time::Instant::now();
                         driver
                             .advance_with_applied_overlap(
-                                &msg,
+                                &input,
                                 index + 1 < batch_len,
                                 |sequence_number, applied| {
                                     if let Some(feed_latency) = feed_latency.as_ref() {
@@ -475,10 +474,13 @@ impl ArbLauncher {
                         break;
                     }
                 }
-                driver.shutdown().await;
                 Ok(())
             }
             .await;
+            // Flush and terminate the engine tree on both normal channel closure and fail-closed
+            // driver errors. Dropping the guard requests termination, but awaiting shutdown here
+            // also settles persistence before the node reports its terminal result.
+            driver.shutdown().await;
             let _ = exit_tx.send(res); // ignore error if receiver was dropped
         });
 
@@ -533,7 +535,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use alloy_primitives::{U256, address};
+    use alloy_primitives::{B256, U256, address};
     use arb_revm::arbos_init::ArbosInitConfig;
     use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
     use reth_chainspec::MAINNET;
@@ -559,20 +561,120 @@ mod tests {
         let (feed_tx, mut feed_rx) = tokio::sync::mpsc::channel(4);
         let (l1_tx, mut l1_rx) = tokio::sync::mpsc::channel(4);
         feed_tx
-            .send(feed_message)
+            .send(ArbEngineInput::feed(feed_message, None))
             .await
             .expect("queue feed message");
         l1_tx.send(l1_message).await.expect("queue L1 message");
 
         let mut feed_open = true;
         let mut l1_open = true;
-        let (source, message) =
-            recv_next_message(&mut feed_rx, &mut l1_rx, &mut feed_open, &mut l1_open)
-                .await
-                .expect("one source must be ready");
+        let input = recv_next_message(&mut feed_rx, &mut l1_rx, &mut feed_open, &mut l1_open)
+            .await
+            .expect("one source must be ready");
 
-        assert_eq!(source, MessageSource::L1);
-        assert_eq!(message.sequence_number, 1);
+        assert_eq!(input.source(), ArbEngineInputSource::L1);
+        assert_eq!(input.sequence_number(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_feed_execution_rejects_wrong_block_hash() {
+        let mut message = deposit_message();
+        message.sequence_number = 1;
+
+        assert_feed_hash_mismatch(
+            vec![ArbEngineInput::feed(message, Some(B256::repeat_byte(0xff)))],
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn buffered_feed_ahead_execution_rejects_wrong_block_hash() {
+        let mut ahead = deposit_message();
+        ahead.sequence_number = 2;
+        let mut gap_closer = ahead.clone();
+        gap_closer.sequence_number = 1;
+
+        assert_feed_hash_mismatch(
+            vec![
+                ArbEngineInput::feed(ahead, Some(B256::repeat_byte(0xff))),
+                ArbEngineInput::feed(gap_closer, None),
+            ],
+            2,
+        )
+        .await;
+    }
+
+    fn deposit_message() -> BroadcastFeedMessage {
+        serde_json::from_str(include_str!("../tests/fixtures/deposit_message_only.json"))
+            .expect("parse feed fixture")
+    }
+
+    async fn assert_feed_hash_mismatch(inputs: Vec<ArbEngineInput>, sequence_number: u64) {
+        let task_executor = Runtime::test();
+        let chain_id = 412346u64;
+        let init = ArbosInitConfig {
+            initial_arbos_version: 40,
+            initial_chain_owner: address!("5E1497dD1f08C87b2d8FE23e9AAB6c1De833D927"),
+            chain_id: U256::from(chain_id),
+            genesis_block_number: 0,
+            initial_l1_base_fee: U256::from(167u64),
+            serialized_chain_config: include_bytes!(
+                "../tests/fixtures/testnode_l2_chain_config.json"
+            )
+            .to_vec(),
+            debug_precompiles: true,
+        };
+        let chain_spec = Arc::new(crate::arb_chain_spec(&init).expect("build ArbOS chain spec"));
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(inputs.len().max(1));
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
+        drop(l1_tx);
+        for input in inputs {
+            feed_tx.send(input).await.expect("queue feed input");
+        }
+        drop(feed_tx);
+
+        let datadir = reth_db::test_utils::tempdir_path();
+        let db = reth_db::test_utils::create_test_rw_db_with_datadir(&datadir);
+        let maybe_path =
+            reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
+                datadir,
+            );
+        let config = NodeConfig::test()
+            .with_chain(chain_spec.clone())
+            .with_datadir_args(reth_node_core::args::DatadirArgs {
+                datadir: maybe_path.clone(),
+                ..Default::default()
+            });
+        let data_dir =
+            maybe_path.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
+        let launcher = ArbLauncher {
+            ctx: LaunchContext::new(task_executor, data_dir),
+            chain_id,
+            genesis_block: 0,
+            tuning: ArbEngineTuning::reth_defaults(),
+            prune_config: None,
+            feed_messages: feed_rx,
+            l1_messages: l1_rx,
+            feed_latency: None,
+            rpc_addr: None,
+            tx_log_stream: None,
+        };
+        let handle = launcher
+            .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
+            .await
+            .expect("launch must succeed");
+        let err = handle
+            .wait_for_node_exit()
+            .await
+            .expect_err("wrong feed hash must stop the driver");
+        let detail = format!("{err:#}");
+        assert!(
+            detail.contains(&format!(
+                "sequencer feed block hash mismatch at sequence {sequence_number}"
+            )),
+            "unexpected error: {detail}"
+        );
     }
 
     /// `ArbLauncher` boots over reth's `LaunchContext` with full pruning, then persists two
@@ -610,13 +712,13 @@ mod tests {
         // The driver dedups by sequence number, so messages must be sequential (a fresh genesis
         // DB has genesis_block 0, so the first digested message is index 1). Four messages with a
         // persistence threshold of two guarantee a second save after sender pruning has run.
-        let (tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
+        let (tx, feed_rx) = tokio::sync::mpsc::channel::<ArbEngineInput>(4);
         let (l1_tx, l1_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(1);
         drop(l1_tx);
         for sequence_number in 1..=4 {
             let mut message = feed_msg.clone();
             message.sequence_number = sequence_number;
-            tx.send(message).await.unwrap();
+            tx.send(ArbEngineInput::feed(message, None)).await.unwrap();
         }
         drop(tx);
 
@@ -735,7 +837,7 @@ mod tests {
         let single_deposit = U256::from(111_000_000_000_000_000u128);
 
         let task_executor = Runtime::test();
-        let (tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
+        let (tx, feed_rx) = tokio::sync::mpsc::channel::<ArbEngineInput>(4096);
         let (l1_tx, l1_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(1);
         drop(l1_tx);
         let datadir = reth_db::test_utils::tempdir_path();
@@ -781,7 +883,7 @@ mod tests {
         for sequence_number in 1..=blocks {
             let mut message = feed_msg.clone();
             message.sequence_number = sequence_number;
-            tx.send(message)
+            tx.send(ArbEngineInput::feed(message, None))
                 .await
                 .expect("driver must accept the next message");
         }

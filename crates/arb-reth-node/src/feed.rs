@@ -5,9 +5,12 @@
 //! execution channel.
 
 use crate::metrics::FeedLatencyTracker;
-use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
+use alloy_primitives::B256;
+use arb_reth_engine::ArbEngineInput;
+use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::{Result, ensure, eyre};
 use metrics::{Counter, Gauge, Histogram};
+use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fmt,
@@ -100,8 +103,30 @@ pub(crate) fn expand_feed_sources(
     Ok(sources)
 }
 
-pub(crate) struct FeedIngress {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FeedWireMessage {
+    #[serde(flatten)]
     message: BroadcastFeedMessage,
+    block_hash: Option<B256>,
+}
+
+impl FeedWireMessage {
+    pub(crate) fn into_engine_input(self) -> ArbEngineInput {
+        ArbEngineInput::feed(self.message, self.block_hash)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedWireRoot {
+    #[serde(rename = "version")]
+    _version: u8,
+    messages: Option<Vec<FeedWireMessage>>,
+}
+
+pub(crate) struct FeedIngress {
+    message: ArbEngineInput,
     frame_received_at: Instant,
     ready_for_channel_at: Instant,
     metrics: Arc<FeedSourceMetrics>,
@@ -208,13 +233,13 @@ pub(crate) fn ingress_channel() -> (mpsc::Sender<FeedIngress>, mpsc::Receiver<Fe
 /// Forward the first decoded copy of every sequence to the engine channel.
 pub(crate) async fn coordinate(
     mut ingress: mpsc::Receiver<FeedIngress>,
-    output: mpsc::Sender<BroadcastFeedMessage>,
+    output: mpsc::Sender<ArbEngineInput>,
     feed_latency: FeedLatencyTracker,
     resume_sequence: Arc<AtomicU64>,
 ) {
     let mut race = SequenceRace::new(resume_sequence.load(Ordering::Acquire));
     while let Some(item) = ingress.recv().await {
-        let sequence = item.message.sequence_number;
+        let sequence = item.message.sequence_number();
         match race.observe(sequence, item.ready_for_channel_at) {
             Observation::First => {
                 item.metrics.wins.increment(1);
@@ -321,7 +346,7 @@ pub(crate) async fn follow(
                         }
                     };
 
-                    let root = match serde_json::from_str::<Root>(&text) {
+                    let root = match serde_json::from_str::<FeedWireRoot>(&text) {
                         Ok(root) => root,
                         Err(err) => {
                             metrics.errors.increment(1);
@@ -339,7 +364,7 @@ pub(crate) async fn follow(
                     for message in root.messages.into_iter().flatten() {
                         metrics.messages.increment(1);
                         let item = FeedIngress {
-                            message,
+                            message: message.into_engine_input(),
                             frame_received_at,
                             ready_for_channel_at,
                             metrics: metrics.clone(),
@@ -519,10 +544,13 @@ mod tests {
         for (sequence, source) in [(10, 0), (10, 1), (12, 1), (11, 0)] {
             ingress_tx
                 .send(FeedIngress {
-                    message: BroadcastFeedMessage {
-                        sequence_number: sequence,
-                        ..Default::default()
-                    },
+                    message: ArbEngineInput::feed(
+                        BroadcastFeedMessage {
+                            sequence_number: sequence,
+                            ..Default::default()
+                        },
+                        None,
+                    ),
                     frame_received_at: started,
                     ready_for_channel_at: Instant::now(),
                     metrics: metrics[source].clone(),
@@ -534,11 +562,28 @@ mod tests {
 
         let mut forwarded = Vec::new();
         while let Some(message) = output_rx.recv().await {
-            forwarded.push(message.sequence_number);
+            forwarded.push(message.sequence_number());
         }
         coordinator.await.unwrap();
 
         assert_eq!(forwarded, vec![10, 12, 11]);
         assert_eq!(resume.load(Ordering::Acquire), 13);
+    }
+
+    #[test]
+    fn wire_message_preserves_optional_block_hash() {
+        let json = include_str!("../tests/fixtures/deposit_message_only.json");
+        let wire: FeedWireMessage = serde_json::from_str(json).expect("feed wire message");
+        let input = wire.into_engine_input();
+
+        assert_eq!(input.sequence_number(), 707);
+        assert_eq!(
+            input.claimed_block_hash(),
+            Some(
+                "0x661d745a7b0b89974f1dc34f4d6fa43aa2974652108f4f652b56e8a852ece36c"
+                    .parse()
+                    .unwrap()
+            )
+        );
     }
 }

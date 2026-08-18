@@ -25,6 +25,7 @@ use arb_revm::executor::{
     scheduled_retries_from_redeem_logs,
 };
 use arb_revm::{ArbSpecId, ArbosState};
+use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
@@ -78,9 +79,73 @@ use revm::context_interface::ContextTr as _;
 
 use crate::native_payload::ArbPayloadJobGenerator;
 use crate::{
-    ArbEngineInput, ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator,
-    ArbTxExecutionKind, ArbTxLogBroadcaster, ArbTxLogEvent,
+    ArbEngineInput, ArbEngineInputSource, ArbMessageFingerprint, ArbPayloadAttributes,
+    ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator, ArbTxExecutionKind,
+    ArbTxLogBroadcaster, ArbTxLogEvent, fingerprint_message,
 };
+
+const MAX_PENDING_MESSAGES: usize = 50_000;
+const MAX_RECENT_MESSAGE_IDENTITIES: usize = 100_000;
+
+#[derive(Clone, Copy, Debug)]
+struct AppliedMessageIdentity {
+    fingerprint: ArbMessageFingerprint,
+    source: ArbEngineInputSource,
+    block_hash: B256,
+    parent_hash: B256,
+}
+
+fn validate_batch_report_metadata(
+    arbos_version: u64,
+    sequence: u64,
+    input: &ArbEngineInput,
+) -> eyre::Result<()> {
+    let incoming = &input.message().message_with_meta_data.l1_incoming_message;
+    if arbos_version >= 50 && incoming.header.kind == 13 && incoming.batch_data_stats.is_none() {
+        return Err(eyre!(
+            "batch posting report at sequence {sequence} is missing BatchDataStats required by ArbOS {arbos_version}"
+        ));
+    }
+    Ok(())
+}
+
+fn merge_same_sequence_inputs(
+    existing: &ArbEngineInput,
+    incoming: &ArbEngineInput,
+) -> eyre::Result<ArbEngineInput> {
+    let sequence = existing.sequence_number();
+    if incoming.sequence_number() != sequence {
+        return Err(eyre!(
+            "cannot reconcile different sequences {sequence} and {}",
+            incoming.sequence_number()
+        ));
+    }
+    let existing_fingerprint = fingerprint_message(existing.message())?;
+    let incoming_fingerprint = fingerprint_message(incoming.message())?;
+    if !existing_fingerprint.semantically_matches(incoming_fingerprint) {
+        return Err(eyre!(
+            "feed/L1 message disagreement at sequence {sequence}: existing source {:?} core {:#x}, incoming source {:?} core {:#x}",
+            existing.source(),
+            existing_fingerprint.core,
+            incoming.source(),
+            incoming_fingerprint.core,
+        ));
+    }
+
+    match (existing.source(), incoming.source()) {
+        (ArbEngineInputSource::Feed, ArbEngineInputSource::L1) => Ok(incoming.clone()),
+        (ArbEngineInputSource::L1, _) => Ok(existing.clone()),
+        (ArbEngineInputSource::Feed, ArbEngineInputSource::Feed) => {
+            match (existing.claimed_block_hash(), incoming.claimed_block_hash()) {
+                (Some(first), Some(second)) if first != second => Err(eyre!(
+                    "sequencer feed supplied conflicting block hashes at sequence {sequence}: {first:#x} and {second:#x}"
+                )),
+                (None, Some(_)) => Ok(incoming.clone()),
+                _ => Ok(existing.clone()),
+            }
+        }
+    }
+}
 
 /// The concrete sender type returned by [`EngineApiTreeHandler::spawn_new`] for `ArbNode`.
 type ToTree = crossbeam_channel::Sender<
@@ -1161,13 +1226,18 @@ where
     /// next message index to apply; a feed/derived message with `sequence_number` maps to L2 block
     /// `sequence_number + genesis_block`. Messages below `next_seq` are already-applied duplicates
     /// (dropped); the one equal to it is applied; ones above it are feed-ahead and buffered in
-    /// `pending` until derivation closes the gap. This lets `--l1-rpc` derivation and `--feed-url`
-    /// both feed the single driver channel without double-applying (Nitro's model, sans byte-compare
-    /// reorg: an honest sequencer's feed and L1 agree, so index dedup suffices).
+    /// `pending` until derivation closes the gap. Feed/L1 copies applied during this process are
+    /// compared by normalized message identity; the next slice extends that invariant across
+    /// restarts with a durable journal.
     next_seq: u64,
-    /// Feed-ahead reorder buffer: messages with `sequence_number > next_seq`, keyed by sequence.
-    /// Bounded by `MAX_PENDING` to cap memory if the feed runs far ahead of derivation.
+    /// Feed-ahead reorder buffer, retaining source authority and rejecting conflicting copies.
     pending: BTreeMap<u64, ArbEngineInput>,
+    /// First sequence applied by this driver process. Older persisted history requires the durable
+    /// message journal added by the next slice; within this process every applied sequence must be
+    /// represented in `recent_messages` or reconciliation fails closed.
+    tracking_start_seq: u64,
+    /// Bounded identities for comparing delayed L1 copies with already-executed feed messages.
+    recent_messages: BTreeMap<u64, AppliedMessageIdentity>,
 }
 
 impl<N> ArbEngineDriver<N>
@@ -1321,6 +1391,8 @@ where
             pending_applied: None,
             next_seq,
             pending: BTreeMap::new(),
+            tracking_start_seq: next_seq,
+            recent_messages: BTreeMap::new(),
         })
     }
 
@@ -1377,19 +1449,24 @@ where
     where
         F: FnMut(u64, ArbAppliedMessageTiming),
     {
-        const MAX_PENDING: usize = 50_000;
         let seq = input.sequence_number();
         if seq < self.next_seq {
-            // Already applied by the other producer (feed/L1 overlap). Idempotent drop.
+            self.verify_applied_overlap(input)?;
             if let Some((sequence_number, timing)) = self.settle_pending_applied().await? {
                 on_applied(sequence_number, timing);
             }
             return Ok(self.tip.hash());
         }
         if seq > self.next_seq {
-            // Feed-ahead: hold until derivation fills the gap up to this sequence, then it drains.
-            if self.pending.len() < MAX_PENDING {
+            if let Some(existing) = self.pending.get(&seq) {
+                let reconciled = merge_same_sequence_inputs(existing, input)?;
+                self.pending.insert(seq, reconciled);
+            } else if self.pending.len() < MAX_PENDING_MESSAGES {
                 self.pending.insert(seq, input.clone());
+            } else if input.source() == ArbEngineInputSource::L1 {
+                return Err(eyre!(
+                    "authoritative L1 message at sequence {seq} cannot enter full feed-ahead buffer"
+                ));
             }
             if let Some((sequence_number, timing)) = self.settle_pending_applied().await? {
                 on_applied(sequence_number, timing);
@@ -1397,19 +1474,32 @@ where
             return Ok(self.tip.hash());
         }
 
+        // If a feed-ahead copy already occupies the sequence that L1 just closed, compare before
+        // choosing the authoritative representation. Never let map insertion order choose history.
+        let selected = match self.pending.remove(&seq) {
+            Some(buffered) => merge_same_sequence_inputs(&buffered, input)?,
+            None => input.clone(),
+        };
+
         // seq == next_seq: queue this block, then drain the contiguous feed-ahead buffer. Each
         // subsequent payload-attributes request is queued before the previous final FCU is
         // awaited, which restores the native engine overlap without reading pending state.
-        let (mut hash, completed) = self.apply_one_native(seq, input, Instant::now()).await?;
+        let parent_hash = self.tip.hash();
+        let (mut hash, completed) = self
+            .apply_one_native(seq, &selected, Instant::now())
+            .await?;
+        self.record_applied_message(seq, &selected, hash, parent_hash)?;
         if let Some((sequence_number, timing)) = completed {
             on_applied(sequence_number, timing);
         }
         self.next_seq += 1;
         while let Some(buffered) = self.pending.remove(&self.next_seq) {
             let sequence_number = self.next_seq;
+            let parent_hash = self.tip.hash();
             let (new_hash, completed) = self
                 .apply_one_native(sequence_number, &buffered, Instant::now())
                 .await?;
+            self.record_applied_message(sequence_number, &buffered, new_hash, parent_hash)?;
             hash = new_hash;
             if let Some((completed_sequence, timing)) = completed {
                 on_applied(completed_sequence, timing);
@@ -1428,6 +1518,61 @@ where
         Ok(hash)
     }
 
+    fn verify_applied_overlap(&mut self, input: &ArbEngineInput) -> eyre::Result<()> {
+        let sequence = input.sequence_number();
+        let Some(applied) = self.recent_messages.get_mut(&sequence) else {
+            if sequence >= self.tracking_start_seq {
+                return Err(eyre!(
+                    "cannot verify overlap at sequence {sequence}: applied identity fell outside the in-memory reconciliation window"
+                ));
+            }
+            // Pre-start persisted history will be covered by the durable journal. Until that slice
+            // lands, preserve startup compatibility without claiming that this overlap was checked.
+            return Ok(());
+        };
+        let incoming = fingerprint_message(input.message())?;
+        if !applied.fingerprint.semantically_matches(incoming) {
+            return Err(eyre!(
+                "feed/L1 message disagreement at applied sequence {sequence}: applied source {:?} block {:#x} parent {:#x} core {:#x}, incoming source {:?} core {:#x}",
+                applied.source,
+                applied.block_hash,
+                applied.parent_hash,
+                applied.fingerprint.core,
+                input.source(),
+                incoming.core,
+            ));
+        }
+        if input.source() == ArbEngineInputSource::L1 {
+            applied.source = ArbEngineInputSource::L1;
+        }
+        Ok(())
+    }
+
+    fn record_applied_message(
+        &mut self,
+        sequence: u64,
+        input: &ArbEngineInput,
+        block_hash: B256,
+        parent_hash: B256,
+    ) -> eyre::Result<()> {
+        self.recent_messages.insert(
+            sequence,
+            AppliedMessageIdentity {
+                fingerprint: fingerprint_message(input.message())?,
+                source: input.source(),
+                block_hash,
+                parent_hash,
+            },
+        );
+        while self.recent_messages.len() > MAX_RECENT_MESSAGE_IDENTITIES {
+            let Some(oldest) = self.recent_messages.first_key_value().map(|(&key, _)| key) else {
+                break;
+            };
+            self.recent_messages.remove(&oldest);
+        }
+        Ok(())
+    }
+
     /// Drive Reth's local payload lifecycle for one already-ordered Arbitrum message.
     async fn apply_one_native(
         &mut self,
@@ -1435,6 +1580,11 @@ where
         input: &ArbEngineInput,
         started_at: Instant,
     ) -> eyre::Result<(B256, Option<(u64, ArbAppliedMessageTiming)>)> {
+        let parent_arbos_version = ArbHeaderInfo::decode_header(self.tip.header())
+            .map(|info| info.arbos_format_version)
+            .unwrap_or_default();
+        validate_batch_report_metadata(parent_arbos_version, sequence_number, input)?;
+
         let payload_builder = self.payload_builder.clone();
         let parent = self.tip.hash();
         let phase_started_at = Instant::now();
@@ -1947,6 +2097,70 @@ mod termination_tests {
         };
         // The guard intentionally drops the acknowledgement receiver after requesting shutdown.
         assert!(tx.send(()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+
+    fn message() -> BroadcastFeedMessage {
+        serde_json::from_str(include_str!(
+            "../../arb-reth-node/tests/fixtures/deposit_message_only.json"
+        ))
+        .expect("fixture must parse")
+    }
+
+    #[test]
+    fn matching_l1_copy_replaces_buffered_feed_copy() {
+        let feed = ArbEngineInput::feed(message(), Some(B256::repeat_byte(0x11)));
+        let l1 = ArbEngineInput::l1(message());
+
+        let selected = merge_same_sequence_inputs(&feed, &l1).unwrap();
+        assert_eq!(selected.source(), ArbEngineInputSource::L1);
+        assert_eq!(selected.claimed_block_hash(), None);
+    }
+
+    #[test]
+    fn conflicting_l1_copy_is_rejected() {
+        let feed = ArbEngineInput::feed(message(), None);
+        let mut changed = message();
+        changed.message_with_meta_data.delayed_messages_read += 1;
+        let l1 = ArbEngineInput::l1(changed);
+
+        let error = merge_same_sequence_inputs(&feed, &l1).unwrap_err();
+        assert!(error.to_string().contains("feed/L1 message disagreement"));
+    }
+
+    #[test]
+    fn conflicting_feed_hash_claims_are_rejected() {
+        let first = ArbEngineInput::feed(message(), Some(B256::repeat_byte(0x11)));
+        let second = ArbEngineInput::feed(message(), Some(B256::repeat_byte(0x22)));
+
+        let error = merge_same_sequence_inputs(&first, &second).unwrap_err();
+        assert!(error.to_string().contains("conflicting block hashes"));
+    }
+
+    #[test]
+    fn arbos_fifty_requires_batch_report_stats() {
+        let mut report = message();
+        report
+            .message_with_meta_data
+            .l1_incoming_message
+            .header
+            .kind = 13;
+        let input = ArbEngineInput::feed(report.clone(), None);
+        validate_batch_report_metadata(49, 1, &input).unwrap();
+        assert!(validate_batch_report_metadata(50, 1, &input).is_err());
+
+        report
+            .message_with_meta_data
+            .l1_incoming_message
+            .batch_data_stats = Some(arbitrum_alloy_sequencer::sequencer::feed::BatchDataStats {
+            length: 100,
+            non_zeros: 80,
+        });
+        validate_batch_report_metadata(50, 1, &ArbEngineInput::feed(report, None)).unwrap();
     }
 }
 

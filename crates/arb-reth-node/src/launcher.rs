@@ -581,9 +581,10 @@ mod tests {
         let mut message = deposit_message();
         message.sequence_number = 1;
 
-        assert_feed_hash_mismatch(
+        assert_driver_result(
             vec![ArbEngineInput::feed(message, Some(B256::repeat_byte(0xff)))],
-            1,
+            None,
+            Some("sequencer feed block hash mismatch at sequence 1"),
         )
         .await;
     }
@@ -595,12 +596,41 @@ mod tests {
         let mut gap_closer = ahead.clone();
         gap_closer.sequence_number = 1;
 
-        assert_feed_hash_mismatch(
+        assert_driver_result(
             vec![
                 ArbEngineInput::feed(ahead, Some(B256::repeat_byte(0xff))),
                 ArbEngineInput::feed(gap_closer, None),
             ],
-            2,
+            None,
+            Some("sequencer feed block hash mismatch at sequence 2"),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn applied_feed_message_rejects_conflicting_l1_copy() {
+        let mut feed = deposit_message();
+        feed.sequence_number = 1;
+        let mut l1 = feed.clone();
+        l1.message_with_meta_data.delayed_messages_read += 1;
+
+        assert_driver_result(
+            vec![ArbEngineInput::feed(feed, None)],
+            Some((1, l1)),
+            Some("feed/L1 message disagreement at applied sequence 1"),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn applied_feed_message_accepts_matching_l1_copy() {
+        let mut feed = deposit_message();
+        feed.sequence_number = 1;
+
+        assert_driver_result(
+            vec![ArbEngineInput::feed(feed.clone(), None)],
+            Some((1, feed)),
+            None,
         )
         .await;
     }
@@ -610,7 +640,11 @@ mod tests {
             .expect("parse feed fixture")
     }
 
-    async fn assert_feed_hash_mismatch(inputs: Vec<ArbEngineInput>, sequence_number: u64) {
+    async fn assert_driver_result(
+        inputs: Vec<ArbEngineInput>,
+        l1_after_head: Option<(u64, BroadcastFeedMessage)>,
+        expected_error: Option<&str>,
+    ) {
         let task_executor = Runtime::test();
         let chain_id = 412346u64;
         let init = ArbosInitConfig {
@@ -628,7 +662,6 @@ mod tests {
         let chain_spec = Arc::new(crate::arb_chain_spec(&init).expect("build ArbOS chain spec"));
         let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(inputs.len().max(1));
         let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
-        drop(l1_tx);
         for input in inputs {
             feed_tx.send(input).await.expect("queue feed input");
         }
@@ -664,17 +697,35 @@ mod tests {
             .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
             .await
             .expect("launch must succeed");
-        let err = handle
-            .wait_for_node_exit()
+        if let Some((head, message)) = l1_after_head {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if handle.provider.best_block_number().unwrap_or_default() >= head {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
             .await
-            .expect_err("wrong feed hash must stop the driver");
-        let detail = format!("{err:#}");
-        assert!(
-            detail.contains(&format!(
-                "sequencer feed block hash mismatch at sequence {sequence_number}"
-            )),
-            "unexpected error: {detail}"
-        );
+            .expect("feed message must become canonical");
+            l1_tx
+                .send(message)
+                .await
+                .expect("queue conflicting L1 copy");
+        }
+        drop(l1_tx);
+
+        let result = handle.wait_for_node_exit().await;
+        match expected_error {
+            Some(expected) => {
+                let detail = format!(
+                    "{:#}",
+                    result.expect_err("fail-closed input must stop the driver")
+                );
+                assert!(detail.contains(expected), "unexpected error: {detail}");
+            }
+            None => result.expect("matching L1 copy must be accepted"),
+        }
     }
 
     /// `ArbLauncher` boots over reth's `LaunchContext` with full pruning, then persists two

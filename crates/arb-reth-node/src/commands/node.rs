@@ -24,7 +24,7 @@ use std::{
     fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{Arc, atomic::AtomicU64},
 };
 
 use crate::feed;
@@ -635,6 +635,8 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         feed_latency: feed_latency.clone(),
         rpc_addr,
         tx_log_stream: mev_tx_log_ipc.as_ref().map(MevTxLogIpc::broadcaster),
+        #[cfg(test)]
+        driver_test_control: None,
     };
 
     let handle = launcher.launch_node(node_builder).await?;
@@ -729,6 +731,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                 source,
                 ingress_tx.clone(),
                 resume_sequence.clone(),
+                handle.ingress_metrics.clone(),
             ));
         }
     }
@@ -860,9 +863,10 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             sync_cfg.batch_window = n;
             sync_cfg.delayed_window = n;
         }
-        l1_verified_tip.fetch_max(start_l2_block, Ordering::Release);
         sync_cfg.start_l2_block = start_l2_block;
         sync_cfg.db_tip_l2 = db_tip;
+        // The driver seeds this exclusively from the durable message journal; L1 reconciliation
+        // advances it only after journal authority is published.
         sync_cfg.l1_verified_tip = l1_verified_tip.clone();
         // Messages are numbered by message index (block - genesis_block) for the driver's
         // sequence-reconciliation; without this a non-zero genesis (Arbitrum One) mis-numbers every

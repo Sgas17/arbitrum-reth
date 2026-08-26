@@ -3,15 +3,330 @@
 use arb_reth_engine::ArbAppliedMessageTiming;
 use reth_metrics::{
     Metrics,
-    metrics::{Counter, Histogram},
+    metrics::{Counter, Gauge, Histogram},
 };
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, OnceLock},
-    time::Instant,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_TRACKED_MESSAGES: usize = 16_384;
+
+/// Source-independent ingress and execution-frontier metrics.
+#[derive(Metrics)]
+#[metrics(scope = "arb_reth.ingress")]
+struct IngressMetricHandles {
+    /// Sampled logical Feed backlog, including an unselected scheduler-owned head.
+    feed_queue_depth: Gauge,
+    /// Sampled logical L1 backlog, including an unselected scheduler-owned head.
+    l1_queue_depth: Gauge,
+    /// Feed items physically removed from the bounded driver channel.
+    feed_dequeued_total: Counter,
+    /// L1 items physically removed from the bounded driver channel.
+    l1_dequeued_total: Counter,
+    /// Latest canonical in-memory block number observed by the driver.
+    executed_tip: Gauge,
+    /// Latest sampled durable database block number.
+    durable_tip: Gauge,
+    /// Latest journal-durable contiguous L1-authoritative block number.
+    l1_verified_tip: Gauge,
+    /// Executed blocks not yet covered by the journal-durable L1 authority frontier.
+    verification_distance: Gauge,
+    /// Unix timestamp seconds of the latest live-feed WebSocket text or binary frame.
+    last_feed_frame_timestamp_seconds: Gauge,
+    /// Unix timestamp seconds of the latest physical Feed driver-channel dequeue.
+    last_feed_dequeue_timestamp_seconds: Gauge,
+}
+
+struct IngressMetricsInner {
+    handles: IngressMetricHandles,
+    executed_tip: AtomicU64,
+    sampled_verified_tip: AtomicU64,
+    latest_feed_frame_timestamp: AtomicU64,
+    #[cfg(test)]
+    executed_publish_pause: ExecutedPublishPause,
+    #[cfg(test)]
+    frame_before_max_pause: ExecutedPublishPause,
+    #[cfg(test)]
+    frame_after_max_pause: ExecutedPublishPause,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ExecutedPublishPause {
+    requested: std::sync::atomic::AtomicBool,
+    paused: tokio::sync::Notify,
+    resumed: std::sync::Mutex<bool>,
+    resume: std::sync::Condvar,
+}
+
+/// Cloneable, lock-free handle shared by ingress, feed followers, and the frontier sampler.
+#[derive(Clone)]
+pub(crate) struct IngressMetrics {
+    inner: Arc<IngressMetricsInner>,
+}
+
+impl IngressMetrics {
+    /// Register all ten metrics. Construct this only after the Prometheus recorder is installed.
+    pub(crate) fn new() -> Self {
+        Self::from_handles(IngressMetricHandles::default())
+    }
+
+    fn from_handles(handles: IngressMetricHandles) -> Self {
+        handles.feed_queue_depth.set(0.0);
+        handles.l1_queue_depth.set(0.0);
+        handles.feed_dequeued_total.increment(0);
+        handles.l1_dequeued_total.increment(0);
+        handles.executed_tip.set(0.0);
+        handles.durable_tip.set(0.0);
+        handles.l1_verified_tip.set(0.0);
+        handles.verification_distance.set(0.0);
+        handles.last_feed_frame_timestamp_seconds.set(0.0);
+        handles.last_feed_dequeue_timestamp_seconds.set(0.0);
+        Self {
+            inner: Arc::new(IngressMetricsInner {
+                handles,
+                executed_tip: AtomicU64::new(0),
+                sampled_verified_tip: AtomicU64::new(0),
+                latest_feed_frame_timestamp: AtomicU64::new(0),
+                #[cfg(test)]
+                executed_publish_pause: ExecutedPublishPause::default(),
+                #[cfg(test)]
+                frame_before_max_pause: ExecutedPublishPause::default(),
+                #[cfg(test)]
+                frame_after_max_pause: ExecutedPublishPause::default(),
+            }),
+        }
+    }
+
+    pub(crate) fn set_queue_depths(&self, feed: usize, l1: usize) {
+        self.inner.handles.feed_queue_depth.set(feed as f64);
+        self.inner.handles.l1_queue_depth.set(l1 as f64);
+    }
+
+    pub(crate) fn record_feed_dequeues(&self, count: usize) {
+        self.inner
+            .handles
+            .feed_dequeued_total
+            .increment(count as u64);
+        let timestamp = unix_timestamp_seconds();
+        self.inner
+            .handles
+            .last_feed_dequeue_timestamp_seconds
+            .set(timestamp as f64);
+    }
+
+    pub(crate) fn record_l1_dequeues(&self, count: usize) {
+        self.inner.handles.l1_dequeued_total.increment(count as u64);
+    }
+
+    pub(crate) fn record_feed_frame(&self) {
+        let timestamp = unix_timestamp_seconds();
+        #[cfg(test)]
+        Self::pause_test_publish(&self.inner.frame_before_max_pause);
+        let previous = self
+            .inner
+            .latest_feed_frame_timestamp
+            .fetch_max(timestamp, Ordering::AcqRel);
+        let mut latest = previous.max(timestamp);
+        #[cfg(test)]
+        Self::pause_test_publish(&self.inner.frame_after_max_pause);
+        loop {
+            self.inner
+                .handles
+                .last_feed_frame_timestamp_seconds
+                .set(latest as f64);
+            let current = self
+                .inner
+                .latest_feed_frame_timestamp
+                .load(Ordering::Acquire);
+            if current == latest {
+                break;
+            }
+            latest = current;
+        }
+    }
+
+    pub(crate) fn set_executed_tip(&self, tip: u64) {
+        self.inner.executed_tip.store(tip, Ordering::Release);
+        loop {
+            self.inner.handles.executed_tip.set(tip as f64);
+            let verified = self.inner.sampled_verified_tip.load(Ordering::Acquire);
+            #[cfg(test)]
+            self.pause_executed_publish_after_verified_load();
+            self.inner
+                .handles
+                .verification_distance
+                .set(tip.saturating_sub(verified) as f64);
+            if self.inner.sampled_verified_tip.load(Ordering::Acquire) == verified {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn executed_tip(&self) -> u64 {
+        self.inner.executed_tip.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_executed_publish(&self) {
+        self.inner
+            .executed_publish_pause
+            .requested
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_executed_publish_paused(&self) {
+        self.inner.executed_publish_pause.paused.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_executed_publish(&self) {
+        let mut resumed = self
+            .inner
+            .executed_publish_pause
+            .resumed
+            .lock()
+            .expect("executed publish pause lock poisoned");
+        *resumed = true;
+        self.inner.executed_publish_pause.resume.notify_one();
+    }
+
+    #[cfg(test)]
+    fn pause_executed_publish_after_verified_load(&self) {
+        Self::pause_test_publish(&self.inner.executed_publish_pause);
+    }
+
+    #[cfg(test)]
+    fn pause_test_publish(pause: &ExecutedPublishPause) {
+        if !pause.requested.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        pause.paused.notify_one();
+        let mut resumed = pause
+            .resumed
+            .lock()
+            .expect("metric publish pause lock poisoned");
+        while !*resumed {
+            resumed = pause
+                .resume
+                .wait(resumed)
+                .expect("metric publish pause lock poisoned");
+        }
+        *resumed = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_frame_before_max(&self) {
+        self.inner
+            .frame_before_max_pause
+            .requested
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_frame_before_max_paused(&self) {
+        self.inner.frame_before_max_pause.paused.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_frame_before_max(&self) {
+        Self::resume_test_publish(&self.inner.frame_before_max_pause);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_frame_after_max(&self) {
+        self.inner
+            .frame_after_max_pause
+            .requested
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_frame_after_max_paused(&self) {
+        self.inner.frame_after_max_pause.paused.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_frame_after_max(&self) {
+        Self::resume_test_publish(&self.inner.frame_after_max_pause);
+    }
+
+    #[cfg(test)]
+    fn resume_test_publish(pause: &ExecutedPublishPause) {
+        let mut resumed = pause
+            .resumed
+            .lock()
+            .expect("metric publish pause lock poisoned");
+        *resumed = true;
+        pause.resume.notify_one();
+    }
+
+    /// Initialize the shared executed frontier and all four frontier gauges from one startup sample.
+    pub(crate) fn initialize_frontiers(&self, executed: u64, durable: u64, verified: u64) {
+        let distance = executed.saturating_sub(verified);
+        self.inner.executed_tip.store(executed, Ordering::Release);
+        self.inner
+            .sampled_verified_tip
+            .store(verified, Ordering::Release);
+        self.inner.handles.executed_tip.set(executed as f64);
+        self.inner.handles.durable_tip.set(durable as f64);
+        self.inner.handles.l1_verified_tip.set(verified as f64);
+        self.inner
+            .handles
+            .verification_distance
+            .set(distance as f64);
+    }
+
+    /// Apply one sampler tick while preserving the previous durable value on a read failure.
+    pub(crate) fn refresh_frontiers<E>(
+        &self,
+        durable: &mut u64,
+        durable_read: Result<u64, E>,
+        verified: u64,
+        captured_executed: u64,
+    ) -> Result<(), E> {
+        let result = match durable_read {
+            Ok(sample) => {
+                *durable = sample;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        self.inner
+            .sampled_verified_tip
+            .store(verified, Ordering::Release);
+        self.inner.handles.durable_tip.set(*durable as f64);
+        self.inner.handles.l1_verified_tip.set(verified as f64);
+
+        let mut executed = captured_executed;
+        loop {
+            self.inner.handles.executed_tip.set(executed as f64);
+            self.inner
+                .handles
+                .verification_distance
+                .set(executed.saturating_sub(verified) as f64);
+            let current = self.executed_tip();
+            if current == executed {
+                break;
+            }
+            executed = current;
+        }
+        result
+    }
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// End-to-end latency from receiving a WebSocket data frame to the corresponding block becoming
 /// the canonical in-memory head.

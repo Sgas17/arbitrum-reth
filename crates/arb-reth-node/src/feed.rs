@@ -4,7 +4,7 @@
 //! only the first decoded copy to the engine, keeping duplicate work off the latency-sensitive
 //! execution channel.
 
-use crate::metrics::FeedLatencyTracker;
+use crate::metrics::{FeedLatencyTracker, IngressMetrics};
 use alloy_primitives::B256;
 use arb_reth_engine::ArbEngineInput;
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
@@ -230,6 +230,25 @@ pub(crate) fn ingress_channel() -> (mpsc::Sender<FeedIngress>, mpsc::Receiver<Fe
     mpsc::channel(4096)
 }
 
+pub(crate) fn data_frame_text(
+    message: Message,
+    ingress_metrics: &IngressMetrics,
+) -> Result<Option<String>> {
+    match message {
+        Message::Text(text) => {
+            ingress_metrics.record_feed_frame();
+            Ok(Some(text.as_str().to_owned()))
+        }
+        Message::Binary(bytes) => {
+            ingress_metrics.record_feed_frame();
+            let text = core::str::from_utf8(bytes.as_ref())
+                .map_err(|_| eyre!("feed binary frame is not UTF-8"))?;
+            Ok(Some(text.to_owned()))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Forward the first decoded copy of every sequence to the engine channel.
 pub(crate) async fn coordinate(
     mut ingress: mpsc::Receiver<FeedIngress>,
@@ -279,6 +298,7 @@ pub(crate) async fn follow(
     source: FeedSource,
     ingress: mpsc::Sender<FeedIngress>,
     resume_sequence: Arc<AtomicU64>,
+    ingress_metrics: IngressMetrics,
 ) {
     use futures_util::StreamExt;
 
@@ -323,16 +343,15 @@ pub(crate) async fn follow(
                 while let Some(frame) = websocket.next().await {
                     let frame_received_at = Instant::now();
                     let text = match frame {
-                        Ok(Message::Text(text)) => text.as_str().to_owned(),
-                        Ok(Message::Binary(bytes)) => match core::str::from_utf8(bytes.as_ref()) {
-                            Ok(text) => text.to_owned(),
+                        Ok(Message::Close(_)) => break,
+                        Ok(message) => match data_frame_text(message, &ingress_metrics) {
+                            Ok(Some(text)) => text,
+                            Ok(None) => continue,
                             Err(_) => {
                                 metrics.errors.increment(1);
                                 continue;
                             }
                         },
-                        Ok(Message::Close(_)) => break,
-                        Ok(_) => continue,
                         Err(err) => {
                             metrics.errors.increment(1);
                             reth_tracing::tracing::warn!(

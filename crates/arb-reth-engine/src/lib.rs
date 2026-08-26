@@ -31,6 +31,8 @@ pub mod native_payload;
 mod storage_v2;
 mod tx_log_stream;
 
+#[cfg(debug_assertions)]
+pub use engine::ArbEngineLifecycleProbe;
 pub use engine::{
     ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, ArbMessageDivergence,
     is_message_divergence, message_divergence_sequence, wait_for_head,

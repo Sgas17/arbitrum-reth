@@ -206,7 +206,7 @@ mod tests {
             "the same append must durably publish every promoted overlap",
         );
 
-        driver.shutdown().await;
+        driver.shutdown().await.expect("shut down replay driver");
         driver
             .flush_durable_message_journal()
             .expect("flush message journal through durable tip");
@@ -237,6 +237,9 @@ mod tests {
             None,
         )
         .expect("journal watermark must match restart tip");
-        restart_driver.shutdown().await;
+        restart_driver
+            .shutdown()
+            .await
+            .expect("shut down restart driver");
     }
 }

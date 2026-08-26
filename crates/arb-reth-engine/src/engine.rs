@@ -35,7 +35,7 @@ use std::{
     error::Error,
     fmt,
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -1473,6 +1473,9 @@ where
     _persistence_proxy_guard: crate::storage_v2::PersistenceProxyGuard,
     /// Reth's local payload-builder service for deterministic ArbOS message payloads.
     payload_builder: PayloadBuilderHandle<ArbPayloadTypes>,
+    // Declared after the handle so driver drop closes the command channel before the explicit
+    // service stop/join fallback runs.
+    payload_service: PayloadServiceGuard,
     canonical: CanonicalInMemoryState<ArbPrimitives>,
     obs_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, B256)>,
     /// The final FCU for the most recently produced block. Historical catch-up may leave this in
@@ -1495,6 +1498,211 @@ where
     /// Last sequence observed from the ordered L1 chunk stream in this process.
     last_l1_sequence: Option<u64>,
     l1_verified_tip: Arc<AtomicU64>,
+    #[cfg(debug_assertions)]
+    reconciliation_calls: u64,
+    #[cfg(debug_assertions)]
+    lifecycle_probe: ArbEngineLifecycleProbe,
+}
+
+struct PayloadServiceGuard {
+    command: Mutex<Option<tokio::sync::mpsc::Sender<PayloadServiceCommand>>>,
+    #[cfg(debug_assertions)]
+    early_return: tokio::sync::mpsc::Sender<()>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    failed: Arc<AtomicBool>,
+}
+
+enum PayloadServiceCommand {
+    Stop,
+    #[cfg(debug_assertions)]
+    PanicForTest,
+}
+
+impl PayloadServiceGuard {
+    fn stop_and_join(&self) -> eyre::Result<()> {
+        if let Some(command) = self
+            .command
+            .lock()
+            .expect("payload command lock poisoned")
+            .take()
+        {
+            let _ = command.try_send(PayloadServiceCommand::Stop);
+        }
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .expect("payload thread lock poisoned")
+            .take()
+            && thread.join().is_err()
+        {
+            self.failed.store(true, Ordering::Release);
+        }
+        if self.failed.load(Ordering::Acquire) {
+            Err(eyre!("arb payload service terminated unexpectedly"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for PayloadServiceGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
+}
+
+struct PayloadServiceThreadExit {
+    stopped: Option<tokio::sync::oneshot::Sender<()>>,
+    failed: Arc<AtomicBool>,
+    runtime: Runtime,
+}
+
+impl Drop for PayloadServiceThreadExit {
+    fn drop(&mut self) {
+        let _ = self
+            .stopped
+            .take()
+            .expect("payload stopped sender exists")
+            .send(());
+        if std::thread::panicking() {
+            self.failed.store(true, Ordering::Release);
+            tracing::error!(
+                target: "arb-reth::engine",
+                "arb payload service thread panicked; requesting shutdown",
+            );
+            let _ = self.runtime.initiate_graceful_shutdown();
+        }
+    }
+}
+
+fn spawn_payload_service_thread<F>(
+    runtime: &Runtime,
+    service: F,
+) -> eyre::Result<PayloadServiceGuard>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(1);
+    #[cfg(debug_assertions)]
+    let (early_return_tx, mut early_return_rx) = tokio::sync::mpsc::channel(1);
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel::<()>();
+    let failed = Arc::new(AtomicBool::new(false));
+    let thread_failed = failed.clone();
+    let thread_runtime = runtime.clone();
+    let runtime_handle = runtime.handle().clone();
+    let thread = std::thread::Builder::new()
+        .name("arb-payload-service".to_string())
+        .spawn(move || {
+            let _exit = PayloadServiceThreadExit {
+                stopped: Some(stopped_tx),
+                failed: thread_failed.clone(),
+                runtime: thread_runtime.clone(),
+            };
+            #[cfg(debug_assertions)]
+            let service = async move {
+                tokio::pin!(service);
+                tokio::select! {
+                    _ = &mut service => {}
+                    _ = early_return_rx.recv() => {}
+                }
+            };
+            let stopped_by_request = runtime_handle.block_on(async move {
+                tokio::pin!(service);
+                tokio::select! {
+                    _ = &mut service => false,
+                    command = command_rx.recv() => match command {
+                        Some(PayloadServiceCommand::Stop) => true,
+                        #[cfg(debug_assertions)]
+                        Some(PayloadServiceCommand::PanicForTest) => {
+                            panic!("injected payload service panic")
+                        }
+                        None => false,
+                    },
+                }
+            });
+            if !stopped_by_request {
+                thread_failed.store(true, Ordering::Release);
+                tracing::error!(
+                    target: "arb-reth::engine",
+                    "arb payload service stopped unexpectedly; requesting shutdown",
+                );
+                let _ = thread_runtime.initiate_graceful_shutdown();
+            }
+        })
+        .map_err(|error| eyre!("failed to spawn arb payload service thread: {error}"))?;
+    runtime.spawn_with_graceful_shutdown_signal(|shutdown| async move {
+        tokio::pin!(shutdown);
+        tokio::pin!(stopped_rx);
+        tokio::select! {
+            guard = &mut shutdown => {
+                let _ = stopped_rx.as_mut().await;
+                drop(guard);
+            }
+            _ = &mut stopped_rx => {}
+        }
+    });
+    Ok(PayloadServiceGuard {
+        command: Mutex::new(Some(command_tx)),
+        #[cfg(debug_assertions)]
+        early_return: early_return_tx,
+        thread: Mutex::new(Some(thread)),
+        failed,
+    })
+}
+
+/// Per-driver debug probe incremented inside the actual shutdown and journal-flush methods.
+#[cfg(debug_assertions)]
+#[derive(Clone, Default)]
+pub struct ArbEngineLifecycleProbe {
+    inner: Arc<ArbEngineLifecycleProbeInner>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct ArbEngineLifecycleProbeInner {
+    shutdown_calls: AtomicU64,
+    journal_flush_calls: AtomicU64,
+    payload_service_command: Mutex<Option<tokio::sync::mpsc::Sender<PayloadServiceCommand>>>,
+    payload_service_early_return: Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
+}
+
+#[cfg(debug_assertions)]
+impl ArbEngineLifecycleProbe {
+    /// Number of entries into the engine's actual shutdown method.
+    pub fn shutdown_calls(&self) -> u64 {
+        self.inner.shutdown_calls.load(Ordering::Relaxed)
+    }
+
+    /// Number of entries into the engine's actual durable-journal flush method.
+    pub fn journal_flush_calls(&self) -> u64 {
+        self.inner.journal_flush_calls.load(Ordering::Relaxed)
+    }
+
+    /// Trigger a panic in the actual payload-service thread for terminal-failure tests.
+    #[doc(hidden)]
+    pub fn panic_payload_service_for_test(&self) {
+        self.inner
+            .payload_service_command
+            .lock()
+            .expect("payload service test command lock poisoned")
+            .as_ref()
+            .expect("payload service command is installed")
+            .try_send(PayloadServiceCommand::PanicForTest)
+            .expect("payload service accepts panic command");
+    }
+
+    /// Make the actual payload-service future return normally for terminal-failure tests.
+    #[doc(hidden)]
+    pub fn return_payload_service_for_test(&self) {
+        self.inner
+            .payload_service_early_return
+            .lock()
+            .expect("payload service early-return lock poisoned")
+            .as_ref()
+            .expect("payload service early-return sender is installed")
+            .try_send(())
+            .expect("payload service accepts early-return command");
+    }
 }
 
 fn open_message_journal_for_tip(
@@ -1616,6 +1824,12 @@ where
                 allow_message_journal_bootstrap,
             )?
         };
+        // The opened journal is the durable authority source on every start. Overwrite rather
+        // than taking a maximum so a stale or speculative caller seed cannot survive a restart.
+        l1_verified_tip.store(
+            message_journal.l1_verified_tip().block_number,
+            Ordering::Release,
+        );
 
         // ---- persistence service (real MDBX writer; pruner from --prune.* flags) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
@@ -1680,11 +1894,31 @@ where
             generator,
             provider.canonical_state_stream(),
         );
-        runtime.spawn_critical_os_thread(
-            "arb-payload-service",
-            "arb native payload builder service",
-            service,
-        );
+        // Runtime critical tasks are cancelled as soon as global shutdown is signalled. The
+        // driver, however, must finish an already-selected batch before it observes that signal.
+        // Keep this dependency on its dedicated thread until the driver explicitly stops it, and
+        // hold a graceful-shutdown guard while that final batch is in flight.
+        let payload_service = spawn_payload_service_thread(&runtime, service)?;
+        #[cfg(debug_assertions)]
+        let lifecycle_probe = {
+            let probe = ArbEngineLifecycleProbe::default();
+            *probe
+                .inner
+                .payload_service_command
+                .lock()
+                .expect("payload service test command lock poisoned") = payload_service
+                .command
+                .lock()
+                .expect("payload command lock poisoned")
+                .clone();
+            *probe
+                .inner
+                .payload_service_early_return
+                .lock()
+                .expect("payload service early-return lock poisoned") =
+                Some(payload_service.early_return.clone());
+            probe
+        };
 
         let (to_tree, mut from_tree) = EngineApiTreeHandler::spawn_new(
             provider.clone(),
@@ -1725,6 +1959,7 @@ where
             to_tree,
             _persistence_proxy_guard: persistence_proxy_guard,
             payload_builder,
+            payload_service,
             canonical,
             obs_rx,
             pending_applied: None,
@@ -1736,6 +1971,10 @@ where
             pending_journal_events: VecDeque::new(),
             last_l1_sequence: None,
             l1_verified_tip,
+            #[cfg(debug_assertions)]
+            reconciliation_calls: 0,
+            #[cfg(debug_assertions)]
+            lifecycle_probe,
         })
     }
 
@@ -1799,6 +2038,10 @@ where
     where
         F: FnMut(u64, ArbAppliedMessageTiming),
     {
+        #[cfg(debug_assertions)]
+        {
+            self.reconciliation_calls += 1;
+        }
         let authority_sequence = self.l1_authority_sequence();
         let plan = plan_applied_l1_chunk(
             inputs,
@@ -2076,6 +2319,11 @@ where
 
     /// Persist every journal event whose corresponding block is already durable in Reth.
     pub fn flush_durable_message_journal(&mut self) -> eyre::Result<()> {
+        #[cfg(debug_assertions)]
+        self.lifecycle_probe
+            .inner
+            .journal_flush_calls
+            .fetch_add(1, Ordering::Relaxed);
         if self.pending_journal_events.is_empty() {
             return Ok(());
         }
@@ -2569,34 +2817,57 @@ where
         &self.tip
     }
 
+    /// Returns the checked sequence number of the next executable message.
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Returns the number of bulk reconciliation API calls observed by this test driver.
+    #[cfg(debug_assertions)]
+    pub const fn reconciliation_call_count(&self) -> u64 {
+        self.reconciliation_calls
+    }
+
+    /// Returns the per-driver probe updated inside actual lifecycle methods.
+    #[cfg(debug_assertions)]
+    pub fn lifecycle_probe(&self) -> ArbEngineLifecycleProbe {
+        self.lifecycle_probe.clone()
+    }
+
     /// Returns a clone of the in-memory canonical state (shared with the `BlockchainProvider`).
     pub fn canonical_in_memory(&self) -> CanonicalInMemoryState<ArbPrimitives> {
         self.canonical.clone()
     }
 
     /// Ask the engine tree to persist its in-memory tail and terminate.
-    pub async fn shutdown(&self) {
-        let Some(terminated_rx) = self.engine_termination_guard.request() else {
+    pub async fn shutdown(&self) -> eyre::Result<()> {
+        #[cfg(debug_assertions)]
+        self.lifecycle_probe
+            .inner
+            .shutdown_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let terminated_rx = self.engine_termination_guard.request();
+        if terminated_rx.is_none() {
             tracing::warn!(
                 target: "arb-reth::engine",
                 "engine termination was already requested or the engine channel is closed",
             );
-            return;
-        };
-
-        match tokio::time::timeout(Duration::from_secs(10), terminated_rx).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::warn!(
-                target: "arb-reth::engine",
-                %err,
-                "engine termination response channel closed",
-            ),
-            Err(_) => tracing::warn!(
-                target: "arb-reth::engine",
-                target_block = self.tip.number,
-                "timed out waiting for engine termination",
-            ),
+        } else if let Some(terminated_rx) = terminated_rx {
+            match tokio::time::timeout(Duration::from_secs(10), terminated_rx).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::warn!(
+                    target: "arb-reth::engine",
+                    %err,
+                    "engine termination response channel closed",
+                ),
+                Err(_) => tracing::warn!(
+                    target: "arb-reth::engine",
+                    target_block = self.tip.number,
+                    "timed out waiting for engine termination",
+                ),
+            }
         }
+        self.payload_service.stop_and_join()
     }
 }
 
@@ -2617,6 +2888,44 @@ mod termination_tests {
         };
         // The guard intentionally drops the acknowledgement receiver after requesting shutdown.
         assert!(tx.send(()).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn payload_service_panic_requests_shutdown_and_returns_failure() {
+        let runtime = Runtime::test();
+        let shutdown = runtime.on_shutdown_signal().clone();
+        let guard = spawn_payload_service_thread(&runtime, async {
+            panic!("injected payload service panic");
+        })
+        .expect("spawn payload service test thread");
+
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("payload panic must request process shutdown");
+        let error = guard
+            .stop_and_join()
+            .expect_err("payload panic must remain a terminal failure");
+        assert!(error.to_string().contains("terminated unexpectedly"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn payload_service_ordinary_return_requests_shutdown_and_returns_failure() {
+        let runtime = Runtime::test();
+        let shutdown = runtime.on_shutdown_signal().clone();
+        let guard = spawn_payload_service_thread(&runtime, std::future::pending())
+            .expect("spawn payload service test thread");
+
+        guard
+            .early_return
+            .try_send(())
+            .expect("trigger ordinary payload service return");
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("ordinary payload return must request process shutdown");
+        let error = guard
+            .stop_and_join()
+            .expect_err("ordinary payload return must remain a terminal failure");
+        assert!(error.to_string().contains("terminated unexpectedly"));
     }
 }
 

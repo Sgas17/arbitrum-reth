@@ -13,9 +13,9 @@ mod tests {
     use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 
     use reth_primitives_traits::SealedHeader;
-    use reth_provider::HeaderProvider;
     use reth_provider::providers::BlockchainProvider;
     use reth_provider::test_utils::create_test_provider_factory_with_node_types;
+    use reth_provider::{BlockNumReader, HeaderProvider};
     use reth_tasks::Runtime;
 
     use arb_reth_node::ArbNode;
@@ -111,6 +111,7 @@ mod tests {
         let restart_factory = factory.clone();
         let provider = BlockchainProvider::new(factory.clone()).expect("BlockchainProvider::new");
         let canonical = provider.canonical_in_memory_state();
+        let l1_verified_tip = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut driver = ArbEngineDriver::<TestNodeTypes>::spawn(
             factory,
             provider,
@@ -123,7 +124,7 @@ mod tests {
             tuning,
             None,
             false,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            l1_verified_tip.clone(),
             None,
         )
         .expect("spawn native payload driver");
@@ -135,13 +136,19 @@ mod tests {
             .filter(|message| message.sequence_number > 0 && message.sequence_number <= TARGET)
             .collect::<Vec<_>>();
         let message_count = messages.len();
+        let l1_overlap = messages
+            .iter()
+            .take(3)
+            .cloned()
+            .map(ArbEngineInput::l1)
+            .collect::<Vec<_>>();
         let mut canonicalized = Vec::with_capacity(message_count);
         for (index, message) in messages.into_iter().enumerate() {
             let number = message.sequence_number;
             let defer_tail = index + 1 < message_count;
             let input = ArbEngineInput::feed(message, None);
             let hash = driver
-                .advance_with_applied_overlap(&input, defer_tail, |sequence_number, _| {
+                .advance_with_applied_overlap(&input, defer_tail, true, |sequence_number, _| {
                     canonicalized.push(sequence_number);
                 })
                 .await
@@ -162,6 +169,42 @@ mod tests {
             );
         }
         assert_eq!(canonicalized, (1..=TARGET).collect::<Vec<_>>());
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if restart_factory
+                    .provider()
+                    .expect("durable provider")
+                    .last_block_number()
+                    .expect("durable tip")
+                    >= 3
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("overlap blocks must become durable");
+        let append_operations_before = driver.message_journal_append_operations();
+        let suffix = driver
+            .reconcile_applied_l1_chunk(&l1_overlap, |_, _| {})
+            .await
+            .expect("bulk overlap reconciliation");
+        assert!(
+            suffix.is_empty(),
+            "the complete L1 chunk is applied overlap"
+        );
+        assert_eq!(
+            driver.message_journal_append_operations() - append_operations_before,
+            1,
+            "multiple durable promotions must share one journal append operation",
+        );
+        assert_eq!(
+            l1_verified_tip.load(std::sync::atomic::Ordering::Acquire),
+            3,
+            "the same append must durably publish every promoted overlap",
+        );
 
         driver.shutdown().await;
         driver

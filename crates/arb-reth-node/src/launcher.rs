@@ -444,8 +444,45 @@ impl ArbLauncher {
                         }
                     }
 
-                    let batch_len = batch.len();
-                    for (index, input) in batch.into_iter().enumerate() {
+                    let mut execution_inputs = None;
+                    if source == ArbEngineInputSource::L1 {
+                        let __w = std::time::Instant::now();
+                        match driver
+                            .reconcile_applied_l1_chunk(&batch, |sequence_number, applied| {
+                                if let Some(feed_latency) = feed_latency.as_ref() {
+                                    feed_latency.record_canonical(sequence_number, applied);
+                                }
+                            })
+                            .await
+                        {
+                            Ok(resolved_suffix) => execution_inputs = Some(resolved_suffix),
+                            Err(error) => {
+                                tracing::error!(
+                                    target: "arb-reth::engine",
+                                    %error,
+                                    "engine driver stopped while reconciling L1 chunk",
+                                );
+                                if arb_reth_engine::is_message_divergence(&error) {
+                                    let failed = arb_reth_engine::message_divergence_sequence(&error)
+                                        .and_then(|sequence| {
+                                            batch.iter().find(|input| {
+                                                input.sequence_number() == sequence
+                                            })
+                                        })
+                                        .unwrap_or(&batch[0]);
+                                    driver
+                                        .write_divergence_marker_for_error(failed, &error)
+                                        .wrap_err("failed to persist divergence marker before shutdown")?;
+                                }
+                                return Err(error);
+                            }
+                        }
+                        bench_work_us += __w.elapsed().as_micros();
+                    }
+
+                    let execution_inputs = execution_inputs.unwrap_or(batch);
+                    let suffix_len = execution_inputs.len();
+                    for (index, input) in execution_inputs.into_iter().enumerate() {
                         let driver_dequeued_at = std::time::Instant::now();
                         if source == ArbEngineInputSource::Feed
                             && let Some(feed_latency) = feed_latency.as_ref()
@@ -457,7 +494,8 @@ impl ArbLauncher {
                         if let Err(error) = driver
                             .advance_with_applied_overlap(
                                 &input,
-                                index + 1 < batch_len,
+                                index + 1 < suffix_len,
+                                source == ArbEngineInputSource::Feed || index + 1 == suffix_len,
                                 |sequence_number, applied| {
                                     if let Some(feed_latency) = feed_latency.as_ref() {
                                         feed_latency.record_canonical(sequence_number, applied);
@@ -473,19 +511,20 @@ impl ArbLauncher {
                             );
                             if arb_reth_engine::is_message_divergence(&error) {
                                 driver
-                                    .write_divergence_marker(&input, &format!("{error:#}"))
+                                    .write_divergence_marker_for_error(&input, &error)
                                     .wrap_err("failed to persist divergence marker before shutdown")?;
                             }
                             return Err(error);
                         }
                         bench_work_us += __w.elapsed().as_micros();
-                        bench_n += 1;
-                        if bench_n.is_multiple_of(1000) {
+                    }
+                    bench_n += suffix_len as u64;
+                    if bench_n >= 1000 {
                             let wall_ms = bench_wall.elapsed().as_millis().max(1);
                             tracing::info!(
                                 target: "arb-reth::bench",
                                 blocks = bench_n,
-                                blk_per_s = (1000u128 * 1000 / wall_ms) as u64,
+                                blk_per_s = (bench_n as u128 * 1000 / wall_ms) as u64,
                                 recv_ms = (bench_recv_us / 1000) as u64,
                                 work_ms = (bench_work_us / 1000) as u64,
                                 recv_pct = (100 * bench_recv_us
@@ -494,8 +533,8 @@ impl ArbLauncher {
                             );
                             bench_recv_us = 0;
                             bench_work_us = 0;
+                            bench_n = 0;
                             bench_wall = std::time::Instant::now();
-                        }
                     }
 
                     if source_closed && !feed_open && !l1_open {
@@ -627,6 +666,10 @@ mod tests {
             vec![ArbEngineInput::feed(message, Some(B256::repeat_byte(0xff)))],
             None,
             Some("sequencer feed block hash mismatch at sequence 1"),
+            false,
+            Some(0),
+            0,
+            Some(ArbEngineInputSource::Feed),
         )
         .await;
     }
@@ -645,6 +688,10 @@ mod tests {
             ],
             None,
             Some("sequencer feed block hash mismatch at sequence 2"),
+            false,
+            Some(1),
+            0,
+            Some(ArbEngineInputSource::Feed),
         )
         .await;
     }
@@ -658,8 +705,12 @@ mod tests {
 
         assert_driver_result(
             vec![ArbEngineInput::feed(feed, None)],
-            Some((1, l1)),
+            Some((1, vec![l1])),
             Some("feed/L1 message disagreement at applied sequence 1"),
+            false,
+            Some(1),
+            0,
+            Some(ArbEngineInputSource::L1),
         )
         .await;
     }
@@ -671,10 +722,147 @@ mod tests {
 
         assert_driver_result(
             vec![ArbEngineInput::feed(feed.clone(), None)],
-            Some((1, feed)),
+            Some((1, vec![feed])),
+            None,
+            false,
+            None,
+            1,
             None,
         )
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initial_l1_chunk_gap_is_deterministic_divergence() {
+        let mut l1 = deposit_message();
+        l1.sequence_number = 2;
+
+        assert_driver_result(
+            Vec::new(),
+            Some((0, vec![l1])),
+            Some("L1 reconciliation starts after the next executable sequence"),
+            false,
+            Some(0),
+            0,
+            Some(ArbEngineInputSource::L1),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l1_gap_closing_suffix_compares_buffered_feed_before_execution() {
+        let mut l1_first = deposit_message();
+        l1_first.sequence_number = 1;
+        let mut l1_second = l1_first.clone();
+        l1_second.sequence_number = 2;
+        let mut feed_ahead = l1_second.clone();
+        feed_ahead
+            .message_with_meta_data
+            .l1_incoming_message
+            .header
+            .timestamp += 1;
+
+        assert_driver_result(
+            vec![ArbEngineInput::feed(feed_ahead, None)],
+            Some((0, vec![l1_first, l1_second])),
+            Some("feed/L1 message disagreement at sequence 2"),
+            true,
+            Some(0),
+            0,
+            Some(ArbEngineInputSource::Feed),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l1_gap_closing_suffix_preserves_feed_hash_claim() {
+        let mut l1_first = deposit_message();
+        l1_first.sequence_number = 1;
+        let mut l1_second = l1_first.clone();
+        l1_second.sequence_number = 2;
+
+        assert_driver_result(
+            vec![ArbEngineInput::feed(
+                l1_second.clone(),
+                Some(B256::repeat_byte(0xff)),
+            )],
+            Some((0, vec![l1_first, l1_second])),
+            Some("sequencer feed block hash mismatch at sequence 2"),
+            true,
+            Some(1),
+            1,
+            Some(ArbEngineInputSource::Feed),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn later_buffered_mismatch_cannot_mutate_overlap_authority() {
+        let mut feed_first = deposit_message();
+        feed_first.sequence_number = 1;
+        let mut l1_second = feed_first.clone();
+        l1_second.sequence_number = 2;
+        let mut l1_third = feed_first.clone();
+        l1_third.sequence_number = 3;
+        let mut feed_third = l1_third.clone();
+        feed_third
+            .message_with_meta_data
+            .l1_incoming_message
+            .header
+            .timestamp += 1;
+
+        assert_driver_result(
+            vec![
+                ArbEngineInput::feed(feed_first.clone(), None),
+                ArbEngineInput::feed(feed_third, None),
+            ],
+            Some((1, vec![feed_first, l1_second, l1_third])),
+            Some("feed/L1 message disagreement at sequence 3"),
+            true,
+            Some(1),
+            0,
+            Some(ArbEngineInputSource::Feed),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn first_l1_chunk_cannot_skip_unverified_applied_prefix() {
+        let mut feed_inputs = Vec::new();
+        for sequence in 1..=4 {
+            let mut message = deposit_message();
+            message.sequence_number = sequence;
+            feed_inputs.push(ArbEngineInput::feed(message, None));
+        }
+        let mut l1 = deposit_message();
+        l1.sequence_number = 5;
+
+        assert_driver_result(
+            feed_inputs,
+            Some((4, vec![l1])),
+            Some("L1 overlap starts after the contiguous authority frontier"),
+            false,
+            Some(4),
+            0,
+            Some(ArbEngineInputSource::L1),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l1_chunk_bulk_promotes_matching_prefix_and_leaves_feed_suffix_unsafe() {
+        let mut feed_inputs = Vec::new();
+        let mut l1_chunk = Vec::new();
+        for sequence in 1..=3 {
+            let mut message = deposit_message();
+            message.sequence_number = sequence;
+            feed_inputs.push(ArbEngineInput::feed(message.clone(), None));
+            if sequence <= 2 {
+                l1_chunk.push(message);
+            }
+        }
+
+        assert_driver_result(feed_inputs, Some((3, l1_chunk)), None, false, None, 2, None).await;
     }
 
     fn deposit_message() -> BroadcastFeedMessage {
@@ -684,10 +872,18 @@ mod tests {
 
     async fn assert_driver_result(
         inputs: Vec<ArbEngineInput>,
-        l1_after_head: Option<(u64, BroadcastFeedMessage)>,
+        l1_after_head: Option<(u64, Vec<BroadcastFeedMessage>)>,
         expected_error: Option<&str>,
+        wait_for_feed_dequeue: bool,
+        expected_error_tip: Option<u64>,
+        expected_l1_verified_tip: u64,
+        expected_marker_source: Option<ArbEngineInputSource>,
     ) {
-        let expects_l1_verification = l1_after_head.is_some() && expected_error.is_none();
+        let expected_canonical_tip = inputs
+            .iter()
+            .map(ArbEngineInput::sequence_number)
+            .max()
+            .unwrap_or(0);
         let task_executor = Runtime::test();
         let chain_id = 412346u64;
         let init = ArbosInitConfig {
@@ -704,11 +900,14 @@ mod tests {
         };
         let chain_spec = Arc::new(crate::arb_chain_spec(&init).expect("build ArbOS chain spec"));
         let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(inputs.len().max(1));
-        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
+        let l1_capacity = l1_after_head
+            .as_ref()
+            .map_or(1, |(_, messages)| messages.len().max(1));
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(l1_capacity);
         for input in inputs {
             feed_tx.send(input).await.expect("queue feed input");
         }
-        drop(feed_tx);
+        let feed_tx = wait_for_feed_dequeue.then_some(feed_tx);
 
         let datadir = reth_db::test_utils::tempdir_path();
         let db = reth_db::test_utils::create_test_rw_db_with_datadir(&datadir);
@@ -754,7 +953,14 @@ mod tests {
                 .expect("database path has parent")
                 .join("arb-message-divergence.json")
         };
-        if let Some((head, message)) = l1_after_head {
+        let result_provider = handle.provider.clone();
+        if let Some(feed_tx) = feed_tx {
+            tokio::time::timeout(std::time::Duration::from_secs(10), feed_tx.reserve())
+                .await
+                .expect("launcher must dequeue the feed-ahead input")
+                .expect("feed channel must remain open");
+        }
+        if let Some((head, messages)) = l1_after_head {
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
                     if handle.provider.best_block_number().unwrap_or_default() >= head {
@@ -765,27 +971,59 @@ mod tests {
             })
             .await
             .expect("feed message must become canonical");
-            l1_tx
-                .send(message)
-                .await
-                .expect("queue conflicting L1 copy");
+            for message in messages {
+                l1_tx
+                    .try_send(message)
+                    .expect("queue complete L1 reconciliation chunk");
+            }
         }
         drop(l1_tx);
 
         let result = handle.wait_for_node_exit().await;
         match expected_error {
             Some(expected) => {
-                let detail = format!(
-                    "{:#}",
-                    result.expect_err("fail-closed input must stop the driver")
-                );
+                let error = result.expect_err("fail-closed input must stop the driver");
+                let divergence_sequence = arb_reth_engine::message_divergence_sequence(&error)
+                    .expect("deterministic message failure must identify its sequence");
+                let detail = format!("{error:#}");
                 assert!(detail.contains(expected), "unexpected error: {detail}");
+                let marker: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(&marker_path).expect("divergence marker must be readable"),
+                )
+                .expect("divergence marker must contain JSON");
+                assert_eq!(
+                    marker["incoming_message"]["sequenceNumber"].as_u64(),
+                    Some(divergence_sequence),
+                    "marker must retain the exact input that caused a buffered failure",
+                );
+                assert_eq!(
+                    marker["incoming_source"].as_str(),
+                    expected_marker_source.map(|source| match source {
+                        ArbEngineInputSource::Feed => "feed",
+                        ArbEngineInputSource::L1 => "l1",
+                    }),
+                    "marker must retain the exact source representation that diverged",
+                );
+                if let Some(expected_tip) = expected_error_tip {
+                    assert_eq!(
+                        result_provider.best_block_number().unwrap_or_default(),
+                        expected_tip,
+                        "no mismatching buffered message may execute before reconciliation",
+                    );
+                }
             }
-            None => result.expect("matching L1 copy must be accepted"),
+            None => {
+                result.expect("matching L1 chunk must be accepted");
+                assert_eq!(
+                    result_provider.best_block_number().unwrap_or_default(),
+                    expected_canonical_tip,
+                    "already-applied overlap must not execute another block",
+                );
+            }
         }
         assert_eq!(
             l1_verified_tip.load(std::sync::atomic::Ordering::Acquire),
-            u64::from(expects_l1_verification),
+            expected_l1_verified_tip,
         );
         assert_eq!(
             marker_path.exists(),

@@ -33,7 +33,7 @@ mod tx_log_stream;
 
 pub use engine::{
     ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, ArbMessageDivergence,
-    is_message_divergence, wait_for_head,
+    is_message_divergence, message_divergence_sequence, wait_for_head,
 };
 pub use engine_spike::ArbPayloadValidator;
 pub use message_compare::{ArbMessageEnrichment, ArbMessageFingerprint, fingerprint_message};
@@ -103,6 +103,14 @@ impl ArbEngineInput {
     /// Returns the optional sequencer-feed block hash claim.
     pub const fn claimed_block_hash(&self) -> Option<B256> {
         self.claimed_block_hash
+    }
+
+    pub(crate) const fn with_claimed_block_hash(
+        mut self,
+        claimed_block_hash: Option<B256>,
+    ) -> Self {
+        self.claimed_block_hash = claimed_block_hash;
+        self
     }
 
     /// Returns the feed sequence number used for ordering.

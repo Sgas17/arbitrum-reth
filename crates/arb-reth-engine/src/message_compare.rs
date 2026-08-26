@@ -102,6 +102,7 @@ fn encode_option<const N: usize>(out: &mut Vec<u8>, value: Option<[u8; N]>) {
 mod tests {
     use super::*;
     use arbitrum_alloy_sequencer::sequencer::feed::{BatchDataStats, BroadcastFeedMessage};
+    use base64::prelude::BASE64_STANDARD;
 
     fn message() -> BroadcastFeedMessage {
         serde_json::from_str(include_str!(
@@ -157,6 +158,7 @@ mod tests {
     #[test]
     fn conflicting_complete_batch_stats_do_not_match() {
         let mut first = message();
+        first.message_with_meta_data.l1_incoming_message.header.kind = 13;
         first
             .message_with_meta_data
             .l1_incoming_message
@@ -187,5 +189,47 @@ mod tests {
         let first = fingerprint_message(&first).unwrap();
         let second = fingerprint_message(&second).unwrap();
         assert!(!first.semantically_matches(second));
+    }
+
+    #[test]
+    fn payload_omission_addition_and_reordering_do_not_match() {
+        let original = message();
+        let payload = BASE64_STANDARD
+            .decode(&original.message_with_meta_data.l1_incoming_message.l2msg)
+            .expect("fixture payload");
+        assert!(payload.len() > 2, "fixture must exercise payload ordering");
+
+        let mut variants = Vec::new();
+        let mut omitted = payload.clone();
+        omitted.remove(1);
+        variants.push(omitted);
+        let mut added = payload.clone();
+        added.insert(1, 0xaa);
+        variants.push(added);
+        let mut reordered = payload.clone();
+        reordered.swap(0, 1);
+        variants.push(reordered);
+
+        let expected = fingerprint_message(&original).unwrap();
+        for payload in variants {
+            let mut changed = original.clone();
+            changed.message_with_meta_data.l1_incoming_message.l2msg =
+                BASE64_STANDARD.encode(payload);
+            assert!(!expected.semantically_matches(fingerprint_message(&changed).unwrap()));
+        }
+    }
+
+    #[test]
+    fn typed_header_metadata_difference_does_not_match() {
+        let original = message();
+        let expected = fingerprint_message(&original).unwrap();
+        let mut changed = original.clone();
+        changed
+            .message_with_meta_data
+            .l1_incoming_message
+            .header
+            .timestamp += 1;
+
+        assert!(!expected.semantically_matches(fingerprint_message(&changed).unwrap()));
     }
 }

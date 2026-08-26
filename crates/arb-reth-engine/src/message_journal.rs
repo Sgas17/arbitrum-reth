@@ -72,6 +72,7 @@ pub(crate) struct MessageJournal {
     path: PathBuf,
     anchor: MessageJournalAnchor,
     entries: BTreeMap<u64, MessageJournalEntry>,
+    append_operations: usize,
 }
 
 impl MessageJournal {
@@ -147,6 +148,7 @@ impl MessageJournal {
             path,
             anchor,
             entries: BTreeMap::new(),
+            append_operations: 0,
         })
     }
 
@@ -214,6 +216,7 @@ impl MessageJournal {
             path,
             anchor,
             entries,
+            append_operations: 0,
         })
     }
 
@@ -234,6 +237,29 @@ impl MessageJournal {
 
     pub(crate) fn entry(&self, sequence: u64) -> Option<MessageJournalEntry> {
         self.entries.get(&sequence).copied()
+    }
+
+    /// Return the journal-durable maximal contiguous L1-authoritative prefix.
+    pub(crate) fn l1_verified_tip(&self) -> MessageJournalAnchor {
+        let mut tip = self.anchor;
+        for entry in self.entries.values() {
+            let Some(expected) = tip.sequence.checked_add(1) else {
+                break;
+            };
+            if entry.sequence != expected || entry.source != ArbEngineInputSource::L1 {
+                break;
+            }
+            tip = MessageJournalAnchor {
+                sequence: entry.sequence,
+                block_number: entry.block_number,
+                block_hash: entry.block_hash,
+            };
+        }
+        tip
+    }
+
+    pub(crate) const fn append_operations(&self) -> usize {
+        self.append_operations
     }
 
     /// Append applied entries or L1 promotions and fsync them as one durability batch.
@@ -280,6 +306,7 @@ impl MessageJournal {
         writer.flush()?;
         writer.get_ref().sync_data()?;
         self.entries.extend(updates);
+        self.append_operations += 1;
         if self.entries.len() >= JOURNAL_COMPACT_TRIGGER {
             self.compact_verified_prefix(JOURNAL_RETAIN_MESSAGES)?;
         }
@@ -608,10 +635,7 @@ mod tests {
         ])?;
 
         let reopened = MessageJournal::open(path)?;
-        assert_eq!(
-            reopened.entry(11).unwrap().source,
-            ArbEngineInputSource::L1
-        );
+        assert_eq!(reopened.entry(11).unwrap().source, ArbEngineInputSource::L1);
         Ok(())
     }
 
@@ -629,6 +653,23 @@ mod tests {
         let mut conflict = entry(11, ArbEngineInputSource::L1);
         conflict.block_hash = B256::repeat_byte(0xff);
         assert!(journal.append_durable(&[conflict]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verified_tip_stops_at_the_first_feed_authority_entry() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = MessageJournal::path_in(dir.path());
+        let mut journal = MessageJournal::create(path, anchor())?;
+        journal.append_durable(&[
+            entry(11, ArbEngineInputSource::L1),
+            entry(12, ArbEngineInputSource::Feed),
+            entry(13, ArbEngineInputSource::L1),
+        ])?;
+
+        assert_eq!(journal.l1_verified_tip().sequence, 11);
+        journal.append_durable(&[entry(12, ArbEngineInputSource::L1)])?;
+        assert_eq!(journal.l1_verified_tip().sequence, 13);
         Ok(())
     }
 }

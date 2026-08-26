@@ -92,23 +92,36 @@ const MAX_RECENT_MESSAGE_IDENTITIES: usize = 100_000;
 
 /// Deterministic message-identity failure that requires operator recovery before restart.
 #[derive(Debug)]
-pub struct ArbMessageDivergence(String);
+pub struct ArbMessageDivergence {
+    sequence: Option<u64>,
+    message: String,
+}
 
 impl fmt::Display for ArbMessageDivergence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
 impl Error for ArbMessageDivergence {}
 
-fn divergence(message: impl Into<String>) -> eyre::Report {
-    eyre::Report::new(ArbMessageDivergence(message.into()))
+fn divergence_at(sequence: u64, message: impl Into<String>) -> eyre::Report {
+    eyre::Report::new(ArbMessageDivergence {
+        sequence: Some(sequence),
+        message: message.into(),
+    })
 }
 
 /// Returns true when an engine failure proves a deterministic feed/L1 identity disagreement.
 pub fn is_message_divergence(error: &eyre::Report) -> bool {
     error.downcast_ref::<ArbMessageDivergence>().is_some()
+}
+
+/// Return the exact incoming sequence attached to a deterministic message divergence, if known.
+pub fn message_divergence_sequence(error: &eyre::Report) -> Option<u64> {
+    error
+        .downcast_ref::<ArbMessageDivergence>()
+        .and_then(|divergence| divergence.sequence)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,9 +168,12 @@ fn validate_batch_report_metadata(
 ) -> eyre::Result<()> {
     let incoming = &input.message().message_with_meta_data.l1_incoming_message;
     if arbos_version >= 50 && incoming.header.kind == 13 && incoming.batch_data_stats.is_none() {
-        return Err(divergence(format!(
-            "batch posting report at sequence {sequence} is missing BatchDataStats required by ArbOS {arbos_version}"
-        )));
+        return Err(divergence_at(
+            sequence,
+            format!(
+                "batch posting report at sequence {sequence} is missing BatchDataStats required by ArbOS {arbos_version}"
+            ),
+        ));
     }
     Ok(())
 }
@@ -168,36 +184,223 @@ fn merge_same_sequence_inputs(
 ) -> eyre::Result<ArbEngineInput> {
     let sequence = existing.sequence_number();
     if incoming.sequence_number() != sequence {
-        return Err(divergence(format!(
-            "cannot reconcile different sequences {sequence} and {}",
-            incoming.sequence_number()
-        )));
+        return Err(divergence_at(
+            sequence,
+            format!(
+                "cannot reconcile different sequences {sequence} and {}",
+                incoming.sequence_number()
+            ),
+        ));
     }
     let existing_fingerprint = fingerprint_message(existing.message())?;
     let incoming_fingerprint = fingerprint_message(incoming.message())?;
     if !existing_fingerprint.semantically_matches(incoming_fingerprint) {
-        return Err(divergence(format!(
-            "feed/L1 message disagreement at sequence {sequence}: existing source {:?} core {:#x}, incoming source {:?} core {:#x}",
-            existing.source(),
-            existing_fingerprint.core,
-            incoming.source(),
-            incoming_fingerprint.core,
-        )));
+        return Err(divergence_at(
+            sequence,
+            format!(
+                "feed/L1 message disagreement at sequence {sequence}: existing source {:?} core {:#x}, incoming source {:?} core {:#x}",
+                existing.source(),
+                existing_fingerprint.core,
+                incoming.source(),
+                incoming_fingerprint.core,
+            ),
+        ));
     }
 
     match (existing.source(), incoming.source()) {
-        (ArbEngineInputSource::Feed, ArbEngineInputSource::L1) => Ok(incoming.clone()),
+        (ArbEngineInputSource::Feed, ArbEngineInputSource::L1) => {
+            let claimed_block_hash = match (
+                existing.claimed_block_hash(),
+                incoming.claimed_block_hash(),
+            ) {
+                (Some(first), Some(second)) if first != second => {
+                    return Err(divergence_at(
+                        sequence,
+                        format!(
+                            "sequencer feed supplied conflicting block hashes at sequence {sequence}: {first:#x} and {second:#x}"
+                        ),
+                    ));
+                }
+                (Some(claimed), _) | (_, Some(claimed)) => Some(claimed),
+                (None, None) => None,
+            };
+            Ok(incoming.clone().with_claimed_block_hash(claimed_block_hash))
+        }
         (ArbEngineInputSource::L1, _) => Ok(existing.clone()),
         (ArbEngineInputSource::Feed, ArbEngineInputSource::Feed) => {
             match (existing.claimed_block_hash(), incoming.claimed_block_hash()) {
-                (Some(first), Some(second)) if first != second => Err(divergence(format!(
-                    "sequencer feed supplied conflicting block hashes at sequence {sequence}: {first:#x} and {second:#x}"
-                ))),
+                (Some(first), Some(second)) if first != second => Err(divergence_at(
+                    sequence,
+                    format!(
+                        "sequencer feed supplied conflicting block hashes at sequence {sequence}: {first:#x} and {second:#x}"
+                    ),
+                )),
                 (None, Some(_)) => Ok(incoming.clone()),
                 _ => Ok(existing.clone()),
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct AppliedOverlapPlan {
+    overlap_len: usize,
+    promotions: Vec<(u64, AppliedMessageIdentity)>,
+}
+
+fn plan_applied_l1_chunk(
+    inputs: &[ArbEngineInput],
+    next_seq: u64,
+    anchor_sequence: u64,
+    mut l1_authority_sequence: u64,
+    previous_l1_sequence: Option<u64>,
+    mut identity: impl FnMut(u64) -> Option<AppliedMessageIdentity>,
+) -> eyre::Result<AppliedOverlapPlan> {
+    for (index, input) in inputs.iter().enumerate() {
+        let sequence = input.sequence_number();
+        if input.source() != ArbEngineInputSource::L1 {
+            return Err(divergence_at(
+                sequence,
+                format!("L1 reconciliation chunk contains feed input at sequence {sequence}"),
+            ));
+        }
+        if let Some(previous) = index
+            .checked_sub(1)
+            .map(|index| inputs[index].sequence_number())
+        {
+            let expected = previous.checked_add(1).ok_or_else(|| {
+                divergence_at(
+                    sequence,
+                    format!("L1 reconciliation sequence overflows after {previous}"),
+                )
+            })?;
+            if sequence != expected {
+                return Err(divergence_at(
+                    sequence,
+                    format!(
+                        "L1 reconciliation chunk is not strictly ordered and contiguous: expected sequence {expected}, got {sequence}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if let (Some(previous), Some(first)) = (previous_l1_sequence, inputs.first()) {
+        let sequence = first.sequence_number();
+        let expected = previous.checked_add(1).ok_or_else(|| {
+            divergence_at(
+                sequence,
+                format!("L1 reconciliation sequence overflows after {previous}"),
+            )
+        })?;
+        if sequence != expected {
+            return Err(divergence_at(
+                sequence,
+                format!(
+                    "L1 reconciliation chunks are not strictly ordered and contiguous: expected sequence {expected}, got {sequence}"
+                ),
+            ));
+        }
+    }
+
+    if let Some(first) = inputs.first()
+        && first.sequence_number() > next_seq
+    {
+        let sequence = first.sequence_number();
+        return Err(divergence_at(
+            sequence,
+            format!(
+                "L1 reconciliation starts after the next executable sequence: expected at most sequence {next_seq}, got {sequence}"
+            ),
+        ));
+    }
+
+    let overlap_len = inputs
+        .iter()
+        .take_while(|input| input.sequence_number() < next_seq)
+        .count();
+    if let Some(first) = inputs.first()
+        && first.sequence_number()
+            > l1_authority_sequence
+                .checked_add(1)
+                .ok_or_else(|| divergence_at(first.sequence_number(), "L1 authority overflow"))?
+    {
+        let sequence = first.sequence_number();
+        return Err(divergence_at(
+            sequence,
+            format!(
+                "L1 overlap starts after the contiguous authority frontier: expected at most sequence {}, got {sequence}",
+                l1_authority_sequence + 1,
+            ),
+        ));
+    }
+    let mut promotions = Vec::new();
+    for input in &inputs[..overlap_len] {
+        let sequence = input.sequence_number();
+        let Some(mut applied) = identity(sequence) else {
+            if sequence > anchor_sequence {
+                return Err(divergence_at(
+                    sequence,
+                    format!(
+                        "cannot verify overlap at sequence {sequence}: no durable or in-memory message identity exists"
+                    ),
+                ));
+            }
+            continue;
+        };
+        let incoming = fingerprint_message(input.message()).map_err(|error| {
+            divergence_at(
+                sequence,
+                format!("cannot normalize L1 overlap at sequence {sequence}: {error:#}"),
+            )
+        })?;
+        if !applied.fingerprint.semantically_matches(incoming) {
+            return Err(divergence_at(
+                sequence,
+                format!(
+                    "feed/L1 message disagreement at applied sequence {sequence}: applied source {:?} block {:#x} parent {:#x} core {:#x}, incoming source {:?} core {:#x}",
+                    applied.source,
+                    applied.block_hash,
+                    applied.parent_hash,
+                    applied.fingerprint.core,
+                    input.source(),
+                    incoming.core,
+                ),
+            ));
+        }
+
+        let next_authority = l1_authority_sequence.checked_add(1);
+        if next_authority == Some(sequence) {
+            if applied.source == ArbEngineInputSource::Feed {
+                applied.source = ArbEngineInputSource::L1;
+                applied.fingerprint = incoming;
+                promotions.push((sequence, applied));
+            }
+            l1_authority_sequence = sequence;
+        }
+    }
+
+    Ok(AppliedOverlapPlan {
+        overlap_len,
+        promotions,
+    })
+}
+
+fn append_durable_message_events(
+    journal: &mut MessageJournal,
+    pending: &mut VecDeque<MessageJournalEntry>,
+    additional: &[MessageJournalEntry],
+    durable_tip: u64,
+) -> eyre::Result<()> {
+    let entries = pending
+        .iter()
+        .chain(additional)
+        .filter(|entry| entry.block_number <= durable_tip)
+        .copied()
+        .collect::<Vec<_>>();
+    journal.append_durable(&entries)?;
+    pending.retain(|entry| entry.block_number > durable_tip);
+    Ok(())
 }
 
 /// The concrete sender type returned by [`EngineApiTreeHandler::spawn_new`] for `ArbNode`.
@@ -1289,6 +1492,8 @@ where
     genesis_block: u64,
     message_journal: MessageJournal,
     pending_journal_events: VecDeque<MessageJournalEntry>,
+    /// Last sequence observed from the ordered L1 chunk stream in this process.
+    last_l1_sequence: Option<u64>,
     l1_verified_tip: Arc<AtomicU64>,
 }
 
@@ -1529,6 +1734,7 @@ where
             genesis_block,
             message_journal,
             pending_journal_events: VecDeque::new(),
+            last_l1_sequence: None,
             l1_verified_tip,
         })
     }
@@ -1556,38 +1762,111 @@ where
     where
         F: FnMut(u64, ArbAppliedMessageTiming),
     {
-        self.advance_with_applied_inner(input, false, &mut on_applied)
+        self.advance_with_applied_inner(input, false, true, &mut on_applied)
             .await
     }
 
     /// Like [`Self::advance_with_applied`], but allows the final block's forkchoice response to
     /// remain in flight when the caller already has another message ready. The next call queues
     /// its payload-attributes FCU first, then settles this block, preserving engine request order
-    /// while overlapping the two driver round trips.
+    /// while overlapping the two driver round trips. `drain_pending` must be false before the tail
+    /// of an ordered L1 chunk so each authoritative copy is compared before a buffered feed copy
+    /// can execute.
     pub async fn advance_with_applied_overlap<F>(
         &mut self,
         input: &ArbEngineInput,
         defer_tail: bool,
+        drain_pending: bool,
         mut on_applied: F,
     ) -> eyre::Result<B256>
     where
         F: FnMut(u64, ArbAppliedMessageTiming),
     {
-        self.advance_with_applied_inner(input, defer_tail, &mut on_applied)
+        self.advance_with_applied_inner(input, defer_tail, drain_pending, &mut on_applied)
             .await
+    }
+
+    /// Reconcile the already-applied prefix of one ordered L1-derived chunk without execution.
+    ///
+    /// The complete chunk is validated and compared before any feed authority is promoted. The
+    /// return value is the fully source-resolved suffix that the caller must submit to the normal
+    /// execution path.
+    pub async fn reconcile_applied_l1_chunk<F>(
+        &mut self,
+        inputs: &[ArbEngineInput],
+        mut on_applied: F,
+    ) -> eyre::Result<Vec<ArbEngineInput>>
+    where
+        F: FnMut(u64, ArbAppliedMessageTiming),
+    {
+        let authority_sequence = self.l1_authority_sequence();
+        let plan = plan_applied_l1_chunk(
+            inputs,
+            self.next_seq,
+            self.message_journal.anchor().sequence,
+            authority_sequence,
+            self.last_l1_sequence,
+            |sequence| self.applied_identity(sequence),
+        )?;
+        let resolved_suffix = inputs[plan.overlap_len..]
+            .iter()
+            .map(|input| match self.pending.get(&input.sequence_number()) {
+                Some(buffered) => merge_same_sequence_inputs(buffered, input),
+                None => Ok(input.clone()),
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+
+        if plan.overlap_len > 0 {
+            let durable_tip = self.provider.last_block_number()?;
+            let durable_promotions = plan
+                .promotions
+                .iter()
+                .map(|&(sequence, identity)| identity.journal_entry(sequence))
+                .collect::<Vec<_>>();
+            append_durable_message_events(
+                &mut self.message_journal,
+                &mut self.pending_journal_events,
+                &durable_promotions,
+                durable_tip,
+            )?;
+
+            for (sequence, identity) in plan.promotions {
+                self.recent_messages.insert(sequence, identity);
+                if identity.block_number > durable_tip {
+                    self.pending_journal_events
+                        .push_back(identity.journal_entry(sequence));
+                }
+            }
+            self.trim_recent_messages();
+            self.publish_l1_verified_tip();
+
+            if let Some((sequence_number, timing)) = self.settle_pending_applied().await? {
+                on_applied(sequence_number, timing);
+            }
+        }
+        if let Some(last) = inputs.last() {
+            self.last_l1_sequence = Some(last.sequence_number());
+        }
+        Ok(resolved_suffix)
     }
 
     async fn advance_with_applied_inner<F>(
         &mut self,
         input: &ArbEngineInput,
         defer_tail: bool,
+        drain_pending: bool,
         on_applied: &mut F,
     ) -> eyre::Result<B256>
     where
         F: FnMut(u64, ArbAppliedMessageTiming),
     {
-        self.flush_durable_message_journal()?;
         let seq = input.sequence_number();
+        if seq < self.next_seq && input.source() == ArbEngineInputSource::L1 {
+            self.reconcile_applied_l1_chunk(core::slice::from_ref(input), on_applied)
+                .await?;
+            return Ok(self.tip.hash());
+        }
+        self.flush_durable_message_journal()?;
         if seq < self.next_seq {
             self.verify_applied_overlap(input)?;
             if let Some((sequence_number, timing)) = self.settle_pending_applied().await? {
@@ -1614,8 +1893,8 @@ where
 
         // If a feed-ahead copy already occupies the sequence that L1 just closed, compare before
         // choosing the authoritative representation. Never let map insertion order choose history.
-        let selected = match self.pending.remove(&seq) {
-            Some(buffered) => merge_same_sequence_inputs(&buffered, input)?,
+        let selected = match self.pending.get(&seq) {
+            Some(buffered) => merge_same_sequence_inputs(buffered, input)?,
             None => input.clone(),
         };
 
@@ -1627,17 +1906,19 @@ where
             .apply_one_native(seq, &selected, Instant::now())
             .await?;
         self.record_applied_message(seq, &selected, hash, parent_hash)?;
+        self.pending.remove(&seq);
         if let Some((sequence_number, timing)) = completed {
             on_applied(sequence_number, timing);
         }
         self.next_seq += 1;
-        while let Some(buffered) = self.pending.remove(&self.next_seq) {
+        while drain_pending && let Some(buffered) = self.pending.get(&self.next_seq).cloned() {
             let sequence_number = self.next_seq;
             let parent_hash = self.tip.hash();
             let (new_hash, completed) = self
                 .apply_one_native(sequence_number, &buffered, Instant::now())
                 .await?;
             self.record_applied_message(sequence_number, &buffered, new_hash, parent_hash)?;
+            self.pending.remove(&sequence_number);
             hash = new_hash;
             if let Some((completed_sequence, timing)) = completed {
                 on_applied(completed_sequence, timing);
@@ -1658,50 +1939,69 @@ where
 
     fn verify_applied_overlap(&mut self, input: &ArbEngineInput) -> eyre::Result<()> {
         let sequence = input.sequence_number();
-        let applied = self
-            .recent_messages
-            .get(&sequence)
-            .copied()
-            .or_else(|| self.message_journal.entry(sequence).map(Into::into));
-        let Some(mut applied) = applied else {
+        let applied = self.applied_identity(sequence);
+        let Some(applied) = applied else {
             if sequence > self.message_journal.anchor().sequence {
-                return Err(divergence(format!(
-                    "cannot verify overlap at sequence {sequence}: no durable or in-memory message identity exists"
-                )));
+                return Err(divergence_at(
+                    sequence,
+                    format!(
+                        "cannot verify overlap at sequence {sequence}: no durable or in-memory message identity exists"
+                    ),
+                ));
             }
             // The explicit or compacted journal anchor trusts the older prefix as one indivisible
             // L1-verified snapshot.
-            if input.source() == ArbEngineInputSource::L1 {
-                self.l1_verified_tip.fetch_max(
-                    self.genesis_block.saturating_add(sequence),
-                    Ordering::Release,
-                );
-            }
             return Ok(());
         };
-        let incoming = fingerprint_message(input.message())?;
+        let incoming = fingerprint_message(input.message()).map_err(|error| {
+            divergence_at(
+                sequence,
+                format!("cannot normalize overlap at sequence {sequence}: {error:#}"),
+            )
+        })?;
         if !applied.fingerprint.semantically_matches(incoming) {
-            return Err(divergence(format!(
-                "feed/L1 message disagreement at applied sequence {sequence}: applied source {:?} block {:#x} parent {:#x} core {:#x}, incoming source {:?} core {:#x}",
-                applied.source,
-                applied.block_hash,
-                applied.parent_hash,
-                applied.fingerprint.core,
-                input.source(),
-                incoming.core,
-            )));
-        }
-        if input.source() == ArbEngineInputSource::L1 {
-            if applied.source == ArbEngineInputSource::Feed {
-                applied.source = ArbEngineInputSource::L1;
-                applied.fingerprint = incoming;
-                self.recent_messages.insert(sequence, applied);
-                self.trim_recent_messages();
-                self.pending_journal_events
-                    .push_back(applied.journal_entry(sequence));
-            }
+            return Err(divergence_at(
+                sequence,
+                format!(
+                    "feed/L1 message disagreement at applied sequence {sequence}: applied source {:?} block {:#x} parent {:#x} core {:#x}, incoming source {:?} core {:#x}",
+                    applied.source,
+                    applied.block_hash,
+                    applied.parent_hash,
+                    applied.fingerprint.core,
+                    input.source(),
+                    incoming.core,
+                ),
+            ));
         }
         Ok(())
+    }
+
+    fn applied_identity(&self, sequence: u64) -> Option<AppliedMessageIdentity> {
+        self.recent_messages
+            .get(&sequence)
+            .copied()
+            .or_else(|| self.message_journal.entry(sequence).map(Into::into))
+    }
+
+    fn l1_authority_sequence(&self) -> u64 {
+        let mut sequence = self.message_journal.anchor().sequence;
+        while let Some(next) = sequence.checked_add(1) {
+            if next >= self.next_seq
+                || self
+                    .applied_identity(next)
+                    .is_none_or(|identity| identity.source != ArbEngineInputSource::L1)
+            {
+                break;
+            }
+            sequence = next;
+        }
+        sequence
+    }
+
+    fn publish_l1_verified_tip(&self) {
+        let verified = self.message_journal.l1_verified_tip();
+        self.l1_verified_tip
+            .fetch_max(verified.block_number, Ordering::Release);
     }
 
     fn record_applied_message(
@@ -1756,37 +2056,37 @@ where
         )
     }
 
+    /// Persist a divergence marker using the exact buffered message identified by the typed error.
+    pub fn write_divergence_marker_for_error(
+        &self,
+        fallback: &ArbEngineInput,
+        error: &eyre::Report,
+    ) -> eyre::Result<()> {
+        let input = message_divergence_sequence(error)
+            .and_then(|sequence| self.pending.get(&sequence))
+            .unwrap_or(fallback);
+        self.write_divergence_marker(input, &format!("{error:#}"))
+    }
+
+    /// Number of durability batches appended by this driver's message journal.
+    #[doc(hidden)]
+    pub const fn message_journal_append_operations(&self) -> usize {
+        self.message_journal.append_operations()
+    }
+
     /// Persist every journal event whose corresponding block is already durable in Reth.
     pub fn flush_durable_message_journal(&mut self) -> eyre::Result<()> {
         if self.pending_journal_events.is_empty() {
             return Ok(());
         }
         let durable_tip = self.provider.last_block_number()?;
-        let count = self
-            .pending_journal_events
-            .iter()
-            .take_while(|entry| entry.block_number <= durable_tip)
-            .count();
-        if count == 0 {
-            return Ok(());
-        }
-        let entries = self
-            .pending_journal_events
-            .iter()
-            .take(count)
-            .copied()
-            .collect::<Vec<_>>();
-        self.message_journal.append_durable(&entries)?;
-        if let Some(verified_tip) = entries
-            .iter()
-            .filter(|entry| entry.source == ArbEngineInputSource::L1)
-            .map(|entry| entry.block_number)
-            .max()
-        {
-            self.l1_verified_tip
-                .fetch_max(verified_tip, Ordering::Release);
-        }
-        self.pending_journal_events.drain(..count);
+        append_durable_message_events(
+            &mut self.message_journal,
+            &mut self.pending_journal_events,
+            &[],
+            durable_tip,
+        )?;
+        self.publish_l1_verified_tip();
         Ok(())
     }
 
@@ -1865,10 +2165,13 @@ where
         if let Some(claimed_hash) = input.claimed_block_hash()
             && claimed_hash != produced_hash
         {
-            return Err(divergence(format!(
-                "sequencer feed block hash mismatch at sequence {sequence_number}: claimed \
+            return Err(divergence_at(
+                sequence_number,
+                format!(
+                    "sequencer feed block hash mismatch at sequence {sequence_number}: claimed \
                  {claimed_hash:#x}, produced {produced_hash:#x}"
-            )));
+                ),
+            ));
         }
 
         let new_hash = self.queue_applied_block(
@@ -2320,6 +2623,8 @@ mod termination_tests {
 #[cfg(test)]
 mod reconciliation_tests {
     use super::*;
+    use arbitrum_alloy_sequencer::sequencer::feed::BatchDataStats;
+    use base64::{Engine as _, prelude::BASE64_STANDARD};
 
     #[test]
     fn journal_startup_gate_requires_explicit_bootstrap_and_exact_tip() -> eyre::Result<()> {
@@ -2365,7 +2670,7 @@ mod reconciliation_tests {
 
     #[test]
     fn only_typed_message_failures_are_divergence() {
-        assert!(is_message_divergence(&divergence("message mismatch")));
+        assert!(is_message_divergence(&divergence_at(1, "message mismatch")));
         assert!(!is_message_divergence(&eyre!("engine timeout")));
     }
 
@@ -2376,14 +2681,31 @@ mod reconciliation_tests {
         .expect("fixture must parse")
     }
 
+    fn input(sequence: u64) -> ArbEngineInput {
+        let mut message = message();
+        message.sequence_number = sequence;
+        ArbEngineInput::l1(message)
+    }
+
+    fn identity(sequence: u64, source: ArbEngineInputSource) -> AppliedMessageIdentity {
+        AppliedMessageIdentity {
+            fingerprint: fingerprint_message(input(sequence).message()).unwrap(),
+            source,
+            block_number: sequence + 100,
+            block_hash: B256::with_last_byte(sequence as u8),
+            parent_hash: B256::with_last_byte(sequence.saturating_sub(1) as u8),
+            delayed_messages_read: 1,
+        }
+    }
+
     #[test]
-    fn matching_l1_copy_replaces_buffered_feed_copy() {
+    fn matching_l1_copy_retains_buffered_feed_hash_claim() {
         let feed = ArbEngineInput::feed(message(), Some(B256::repeat_byte(0x11)));
         let l1 = ArbEngineInput::l1(message());
 
         let selected = merge_same_sequence_inputs(&feed, &l1).unwrap();
         assert_eq!(selected.source(), ArbEngineInputSource::L1);
-        assert_eq!(selected.claimed_block_hash(), None);
+        assert_eq!(selected.claimed_block_hash(), Some(B256::repeat_byte(0x11)));
     }
 
     #[test]
@@ -2404,6 +2726,304 @@ mod reconciliation_tests {
 
         let error = merge_same_sequence_inputs(&first, &second).unwrap_err();
         assert!(error.to_string().contains("conflicting block hashes"));
+    }
+
+    #[test]
+    fn plans_maximal_matching_overlap_and_leaves_feed_suffix_unsafe() {
+        let identities = (1..=3)
+            .map(|sequence| (sequence, identity(sequence, ArbEngineInputSource::Feed)))
+            .collect::<BTreeMap<_, _>>();
+        let chunk = [input(1), input(2)];
+        let plan = plan_applied_l1_chunk(&chunk, 4, 0, 0, None, |sequence| {
+            identities.get(&sequence).copied()
+        })
+        .unwrap();
+
+        assert_eq!(plan.overlap_len, 2);
+        assert_eq!(
+            plan.promotions
+                .iter()
+                .map(|(sequence, _)| *sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            identities.get(&3).unwrap().source,
+            ArbEngineInputSource::Feed,
+            "an absent feed-executed suffix is not divergence or L1-authoritative"
+        );
+    }
+
+    #[test]
+    fn validates_the_complete_chunk_before_planning_promotions() {
+        let identities = (1..=3)
+            .map(|sequence| (sequence, identity(sequence, ArbEngineInputSource::Feed)))
+            .collect::<BTreeMap<_, _>>();
+        for chunk in [[input(1), input(3)], [input(2), input(1)]] {
+            let error = plan_applied_l1_chunk(&chunk, 4, 0, 0, None, |sequence| {
+                identities.get(&sequence).copied()
+            })
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("strictly ordered and contiguous")
+            );
+            assert!(is_message_divergence(&error));
+        }
+    }
+
+    #[test]
+    fn rejects_gaps_at_overlap_and_chunk_boundaries() {
+        let identities = (1..=3)
+            .map(|sequence| (sequence, identity(sequence, ArbEngineInputSource::Feed)))
+            .collect::<BTreeMap<_, _>>();
+
+        let skipped_overlap = plan_applied_l1_chunk(&[input(2)], 4, 0, 0, None, |sequence| {
+            identities.get(&sequence).copied()
+        })
+        .unwrap_err();
+        assert_eq!(message_divergence_sequence(&skipped_overlap), Some(2));
+        assert!(skipped_overlap.to_string().contains("authority frontier"));
+
+        let cross_chunk_gap = plan_applied_l1_chunk(&[input(3)], 4, 0, 2, Some(1), |sequence| {
+            identities.get(&sequence).copied()
+        })
+        .unwrap_err();
+        assert_eq!(message_divergence_sequence(&cross_chunk_gap), Some(3));
+        assert!(
+            cross_chunk_gap
+                .to_string()
+                .contains("strictly ordered and contiguous")
+        );
+
+        let initial_execution_gap = plan_applied_l1_chunk(&[input(3)], 1, 0, 0, None, |sequence| {
+            identities.get(&sequence).copied()
+        })
+        .unwrap_err();
+        assert_eq!(message_divergence_sequence(&initial_execution_gap), Some(3));
+        assert!(
+            initial_execution_gap
+                .to_string()
+                .contains("next executable sequence")
+        );
+
+        let skipped_authority = plan_applied_l1_chunk(&[input(5)], 5, 0, 0, None, |sequence| {
+            identities.get(&sequence).copied()
+        })
+        .unwrap_err();
+        assert_eq!(message_divergence_sequence(&skipped_authority), Some(5));
+        assert!(skipped_authority.to_string().contains("authority frontier"));
+    }
+
+    #[test]
+    fn production_planner_rejects_every_execution_sensitive_mismatch() {
+        let original = input(1);
+        let payload = BASE64_STANDARD
+            .decode(
+                &original
+                    .message()
+                    .message_with_meta_data
+                    .l1_incoming_message
+                    .l2msg,
+            )
+            .expect("fixture payload");
+        assert!(payload.len() > 2, "fixture must exercise payload ordering");
+
+        let mut changed_messages = Vec::new();
+        for changed_payload in {
+            let mut omitted = payload.clone();
+            omitted.remove(1);
+            let mut added = payload.clone();
+            added.insert(1, 0xaa);
+            let mut reordered = payload;
+            reordered.swap(0, 1);
+            [omitted, added, reordered]
+        } {
+            let mut changed = original.message().clone();
+            changed.message_with_meta_data.l1_incoming_message.l2msg =
+                BASE64_STANDARD.encode(changed_payload);
+            changed_messages.push(changed);
+        }
+        let mut typed_metadata = original.message().clone();
+        typed_metadata
+            .message_with_meta_data
+            .l1_incoming_message
+            .header
+            .timestamp += 1;
+        changed_messages.push(typed_metadata);
+        let mut delayed_cursor = original.message().clone();
+        delayed_cursor.message_with_meta_data.delayed_messages_read += 1;
+        changed_messages.push(delayed_cursor);
+
+        let stored = identity(1, ArbEngineInputSource::Feed);
+        for changed in changed_messages {
+            let error =
+                plan_applied_l1_chunk(&[ArbEngineInput::l1(changed)], 2, 0, 0, None, |_| {
+                    Some(stored)
+                })
+                .unwrap_err();
+            assert_eq!(message_divergence_sequence(&error), Some(1));
+            assert!(error.to_string().contains("feed/L1 message disagreement"));
+        }
+
+        let mut complete = original.message().clone();
+        complete
+            .message_with_meta_data
+            .l1_incoming_message
+            .header
+            .kind = 13;
+        complete
+            .message_with_meta_data
+            .l1_incoming_message
+            .batch_data_stats = Some(BatchDataStats {
+            length: 100,
+            non_zeros: 80,
+        });
+        let complete_identity = AppliedMessageIdentity {
+            fingerprint: fingerprint_message(&complete).unwrap(),
+            ..stored
+        };
+        let mut incompatible = complete.clone();
+        incompatible
+            .message_with_meta_data
+            .l1_incoming_message
+            .batch_data_stats
+            .as_mut()
+            .unwrap()
+            .non_zeros = 79;
+        assert!(
+            plan_applied_l1_chunk(
+                &[ArbEngineInput::l1(incompatible)],
+                2,
+                0,
+                0,
+                None,
+                |_| Some(complete_identity),
+            )
+            .is_err()
+        );
+
+        complete
+            .message_with_meta_data
+            .l1_incoming_message
+            .batch_data_stats = None;
+        let permitted_missing =
+            plan_applied_l1_chunk(&[ArbEngineInput::l1(complete)], 2, 0, 0, None, |_| {
+                Some(complete_identity)
+            })
+            .expect("Nitro permits one representation to omit enrichment");
+        assert_eq!(permitted_missing.promotions.len(), 1);
+    }
+
+    #[test]
+    fn missing_identity_blocks_every_later_promotion() {
+        let identities = BTreeMap::from([
+            (1, identity(1, ArbEngineInputSource::Feed)),
+            (3, identity(3, ArbEngineInputSource::Feed)),
+        ]);
+        let error =
+            plan_applied_l1_chunk(&[input(1), input(2), input(3)], 4, 0, 0, None, |sequence| {
+                identities.get(&sequence).copied()
+            })
+            .unwrap_err();
+
+        assert_eq!(message_divergence_sequence(&error), Some(2));
+        assert!(error.to_string().contains("no durable or in-memory"));
+        assert_eq!(
+            identities.get(&3).unwrap().source,
+            ArbEngineInputSource::Feed
+        );
+    }
+
+    #[test]
+    fn unaligned_chunks_produce_the_same_authority_prefix() {
+        let initial = (1..=3)
+            .map(|sequence| (sequence, identity(sequence, ArbEngineInputSource::Feed)))
+            .collect::<BTreeMap<_, _>>();
+        let whole =
+            plan_applied_l1_chunk(&[input(1), input(2), input(3)], 4, 0, 0, None, |sequence| {
+                initial.get(&sequence).copied()
+            })
+            .unwrap();
+
+        let mut split = initial;
+        let first = plan_applied_l1_chunk(&[input(1)], 4, 0, 0, None, |sequence| {
+            split.get(&sequence).copied()
+        })
+        .unwrap();
+        for (sequence, promoted) in first.promotions {
+            split.insert(sequence, promoted);
+        }
+        let second = plan_applied_l1_chunk(&[input(2), input(3)], 4, 0, 1, Some(1), |sequence| {
+            split.get(&sequence).copied()
+        })
+        .unwrap();
+
+        assert_eq!(whole.promotions.len(), 3);
+        assert_eq!(second.promotions.len(), 2);
+        assert_eq!(second.promotions.last().unwrap().0, 3);
+    }
+
+    #[test]
+    fn durable_promotions_share_one_append_operation() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = MessageJournal::path_in(dir.path());
+        let anchor = MessageJournalAnchor {
+            sequence: 0,
+            block_number: 100,
+            block_hash: B256::repeat_byte(0x10),
+        };
+        let mut journal = MessageJournal::create(path, anchor)?;
+        let feed = [
+            identity(1, ArbEngineInputSource::Feed).journal_entry(1),
+            identity(2, ArbEngineInputSource::Feed).journal_entry(2),
+        ];
+        let mut pending = VecDeque::from(feed);
+        let promotions = [
+            identity(1, ArbEngineInputSource::L1).journal_entry(1),
+            identity(2, ArbEngineInputSource::L1).journal_entry(2),
+        ];
+
+        append_durable_message_events(&mut journal, &mut pending, &promotions, 102)?;
+
+        assert_eq!(journal.append_operations(), 1);
+        assert_eq!(journal.l1_verified_tip().sequence, 2);
+        assert!(pending.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn non_durable_promotion_cannot_publish_early() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = MessageJournal::path_in(dir.path());
+        let anchor = MessageJournalAnchor {
+            sequence: 0,
+            block_number: 100,
+            block_hash: B256::repeat_byte(0x10),
+        };
+        let mut journal = MessageJournal::create(path, anchor)?;
+        let mut pending = VecDeque::from([
+            identity(1, ArbEngineInputSource::Feed).journal_entry(1),
+            identity(2, ArbEngineInputSource::Feed).journal_entry(2),
+        ]);
+        let promotions = [
+            identity(1, ArbEngineInputSource::L1).journal_entry(1),
+            identity(2, ArbEngineInputSource::L1).journal_entry(2),
+        ];
+
+        append_durable_message_events(&mut journal, &mut pending, &promotions, 101)?;
+        pending.push_back(promotions[1]);
+        assert_eq!(journal.l1_verified_tip().sequence, 1);
+        assert_eq!(
+            pending.len(),
+            2,
+            "feed and promotion for block 102 remain queued"
+        );
+
+        append_durable_message_events(&mut journal, &mut pending, &[], 102)?;
+        assert_eq!(journal.l1_verified_tip().sequence, 2);
+        Ok(())
     }
 
     #[test]

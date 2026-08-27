@@ -27,8 +27,11 @@ pub(crate) struct MevTxLogIpc {
 }
 
 impl MevTxLogIpc {
-    /// Binds the requested local socket, replacing a stale socket from a previous shutdown.
-    pub(crate) fn bind(path: impl Into<PathBuf>) -> Result<Self> {
+    /// Binds after recovery releases publication, using the engine's existing internal publisher.
+    pub(crate) fn bind_with_broadcaster(
+        path: impl Into<PathBuf>,
+        broadcaster: ArbTxLogBroadcaster,
+    ) -> Result<Self> {
         let path = path.into();
         remove_stale_socket(&path)?;
         let listener = UnixListener::bind(&path).wrap_err_with(|| {
@@ -37,13 +40,8 @@ impl MevTxLogIpc {
         Ok(Self {
             listener,
             path,
-            broadcaster: ArbTxLogBroadcaster::new(),
+            broadcaster,
         })
-    }
-
-    /// Returns the execution-side publisher passed to the native payload builder.
-    pub(crate) fn broadcaster(&self) -> ArbTxLogBroadcaster {
-        self.broadcaster.clone()
     }
 
     /// Socket location, used only for the launch log.

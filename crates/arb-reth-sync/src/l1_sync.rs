@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -202,6 +202,9 @@ pub struct L1SyncConfig {
     pub genesis_block: u64,
     /// Where to persist the [`L1ResumeCheckpoint`] as sync advances (`None` disables checkpointing).
     pub checkpoint_path: Option<PathBuf>,
+    /// The production recovery readiness state. Checkpoints remain queued while false so the
+    /// marker-frozen resume artifact cannot race final reopened-storage validation.
+    pub checkpoint_writes_ready: Arc<AtomicBool>,
     /// Highest L2 block whose L1 authority the engine has fsynced to its message journal.
     /// Checkpoints may never advance beyond this frontier even when the feed persisted farther.
     pub l1_verified_tip: Arc<AtomicU64>,
@@ -235,6 +238,7 @@ impl L1SyncConfig {
             db_tip_l2: 0,
             genesis_block: 0,
             checkpoint_path: None,
+            checkpoint_writes_ready: Arc::new(AtomicBool::new(true)),
             l1_verified_tip: Arc::new(AtomicU64::new(0)),
             batch_window: 1_000,
             delayed_window: DEFAULT_DELAYED_WINDOW,
@@ -669,7 +673,8 @@ where
                 delayed_count: delayed,
                 l2_block: next_l2 - 1,
             });
-            maybe_write_checkpoint(
+            maybe_write_checkpoint_if_ready(
+                &cfg.checkpoint_writes_ready,
                 cfg.checkpoint_path.as_deref(),
                 &mut resume_log,
                 &mut pending_ckpt,
@@ -681,6 +686,19 @@ where
 
     tracing::info!(target: "arb-reth::l1-sync", final_block = consume_cursor.saturating_sub(1), "L1 sync reached end block");
     Ok(())
+}
+
+fn maybe_write_checkpoint_if_ready(
+    ready: &AtomicBool,
+    path: Option<&std::path::Path>,
+    log: &mut L1ResumeLog,
+    pending: &mut VecDeque<L1ResumeCheckpoint>,
+    persisted: u64,
+    l1_verified: u64,
+) {
+    if ready.load(Ordering::Acquire) {
+        maybe_write_checkpoint(path, log, pending, persisted, l1_verified);
+    }
 }
 
 /// Append every durable window boundary to the resume log and rewrite it.
@@ -906,6 +924,24 @@ mod tests {
             L1ResumeLog::load(&path).unwrap().resume_for(u64::MAX),
             Some(cp(300, 30))
         );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn recovery_readiness_blocks_checkpoint_rewrite_without_consuming_boundaries() {
+        let dir = reth_db::test_utils::tempdir_path();
+        let path = L1ResumeLog::path_in(&dir);
+        let ready = AtomicBool::new(false);
+        let mut log = L1ResumeLog::default();
+        let mut pending = [cp(100, 10)].into_iter().collect::<VecDeque<_>>();
+
+        maybe_write_checkpoint_if_ready(&ready, Some(&path), &mut log, &mut pending, 10, 10);
+        assert_eq!(L1ResumeLog::load(&path), None);
+        assert_eq!(pending, [cp(100, 10)].into_iter().collect::<VecDeque<_>>());
+
+        ready.store(true, Ordering::Release);
+        maybe_write_checkpoint_if_ready(&ready, Some(&path), &mut log, &mut pending, 10, 10);
+        assert_eq!(L1ResumeLog::load(&path).unwrap().checkpoints, [cp(100, 10)]);
         assert!(pending.is_empty());
     }
 

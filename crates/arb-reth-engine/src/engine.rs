@@ -2328,6 +2328,14 @@ where
             return Ok(());
         }
         let durable_tip = self.provider.last_block_number()?;
+        if self
+            .pending_journal_events
+            .front()
+            .is_some_and(|entry| entry.block_number <= durable_tip)
+            && self.message_journal.recovery_marker_exists()
+        {
+            recovery_failpoint("replay_db_persisted_before_journal");
+        }
         append_durable_message_events(
             &mut self.message_journal,
             &mut self.pending_journal_events,
@@ -2839,6 +2847,42 @@ where
         self.canonical.clone()
     }
 
+    /// Settle the exact recovery frontier, flush its journal, then release every engine-tree and
+    /// persistence writer before stopped storage is reopened for final proof.
+    pub async fn quiesce_for_recovery(mut self) -> eyre::Result<SealedHeader<Header>> {
+        #[cfg(debug_assertions)]
+        self.lifecycle_probe
+            .inner
+            .shutdown_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let terminated_rx = self
+            .engine_termination_guard
+            .request()
+            .ok_or_else(|| eyre!("recovery engine termination was already requested"))?;
+        match tokio::time::timeout(Duration::from_secs(120), terminated_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(eyre!(
+                    "recovery engine termination acknowledgement channel closed: {error}"
+                ));
+            }
+            Err(_) => {
+                return Err(eyre!(
+                    "timed out waiting for recovery persistence quiescence at block {}",
+                    self.tip.number
+                ));
+            }
+        }
+        recovery_failpoint("recovery_persistence_quiesced");
+        self.payload_service.stop_and_join()?;
+        self.flush_durable_message_journal()?;
+        recovery_failpoint("current_frontier_journal_fsynced_before_marker_removal");
+        let tip = self.tip.clone();
+        drop(self);
+        recovery_failpoint("recovery_writers_released_before_reopen");
+        Ok(tip)
+    }
+
     /// Ask the engine tree to persist its in-memory tail and terminate.
     pub async fn shutdown(&self) -> eyre::Result<()> {
         #[cfg(debug_assertions)]
@@ -2868,6 +2912,18 @@ where
             }
         }
         self.payload_service.stop_and_join()
+    }
+}
+
+fn recovery_failpoint(name: &str) {
+    if std::env::var_os("ARB_RETH_RECOVERY_FAILPOINT").as_deref()
+        == Some(std::ffi::OsStr::new(name))
+    {
+        unsafe extern "C" {
+            fn _exit(status: i32) -> !;
+        }
+        // SAFETY: this production test failpoint intentionally simulates sudden process loss.
+        unsafe { _exit(86) }
     }
 }
 

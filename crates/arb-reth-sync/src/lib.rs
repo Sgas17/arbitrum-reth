@@ -9,4 +9,6 @@ pub mod l1_sync;
 pub mod resume;
 
 pub use l1_sync::{run_l1_sync, supervise_l1_sync, L1SyncConfig, L1SyncError};
-pub use resume::{L1ResumeCheckpoint, L1ResumeLog};
+pub use resume::{
+    L1ResumeCheckpoint, L1ResumeLog, inspect_resume_log_strict, rewrite_resume_checkpoint_at,
+};

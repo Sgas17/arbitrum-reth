@@ -30,11 +30,16 @@ use std::{
 use crate::feed;
 use crate::launcher::ArbLauncher;
 use crate::metrics::FeedLatencyTracker;
-use crate::{
-    ARB_ONE_CHAIN_ID, ArbNode, L1ResumeLog, arb_chain_spec, arbos_init_from_chain_config_json,
-    arbos_init_from_parsed,
-};
 use crate::mev_tx_logs::MevTxLogIpc;
+use crate::recovery::{
+    ParentChainClaim, ParentChainClassification, RECOVERY_WORKER_ENV, RecoveryConfig,
+    finalize_recovery_and_release, is_recovery_worker, preflight_before_l1_genesis,
+    prepare_recovery, recovery_failpoint,
+};
+use crate::{
+    ARB_ONE_CHAIN_ID, ArbNode, ArbTxLogBroadcaster, L1ResumeLog, arb_chain_spec,
+    arbos_init_from_chain_config_json, arbos_init_from_parsed,
+};
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use arb_reth_l1::{DelayedInboxReader, SequencerInboxReader};
@@ -437,6 +442,30 @@ async fn derive_genesis_from_l1(
     Ok((spec, chain_id))
 }
 
+async fn derive_genesis_from_l1_after_preflight(
+    datadir: &Path,
+    genesis_block: u64,
+    l1_rpc: &str,
+    bridge: Address,
+    from_block: u64,
+    base_fee_override: Option<u128>,
+) -> eyre::Result<(std::sync::Arc<reth_chainspec::ChainSpec>, u64)> {
+    preflight_before_l1_genesis(datadir, genesis_block)?;
+    derive_genesis_from_l1(l1_rpc, bridge, from_block, base_fee_override).await
+}
+
+fn run_recovery_worker_subprocess() -> eyre::Result<()> {
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args(std::env::args_os().skip(1))
+        .env(RECOVERY_WORKER_ENV, "1")
+        .status()?;
+    eyre::ensure!(
+        status.success(),
+        "recovery worker exited before a quiesced durable frontier was acknowledged: {status}"
+    );
+    Ok(())
+}
+
 pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
     let feed_sources =
@@ -447,11 +476,10 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     if args.no_l1_derive {
         warn!(target: "arb-reth", "L1 derivation disabled; feed-only message journal history cannot be compacted");
     }
-    let mev_tx_log_ipc = args
+    let tx_log_stream = args
         .mev_tx_log_ipc
         .as_ref()
-        .map(|path| MevTxLogIpc::bind(path.clone()))
-        .transpose()?;
+        .map(|_| ArbTxLogBroadcaster::new());
 
     // --chain-info plus --genesis boots an Orbit chain. The pair supplies both the chain spec and
     // prealloc state, plus the L1 rollup deployment. Accepting either file alone would silently
@@ -544,7 +572,14 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             // message on that L1 (chain id + config + base fee all come from it). This is the
             // zero-config path for a fresh chain like a nitro-testnode.
             Some(l1_rpc) => {
-                let (spec, cid) = derive_genesis_from_l1(
+                let datadir = args.datadir.as_deref().ok_or_else(|| {
+                    eyre::eyre!(
+                        "L1-backed genesis requires an explicit --datadir so local recovery markers and stopped storage are classified before parent RPC access"
+                    )
+                })?;
+                let (spec, cid) = derive_genesis_from_l1_after_preflight(
+                    datadir,
+                    rollup.l2_genesis_block,
                     l1_rpc,
                     rollup.bridge,
                     rollup.deployed_at,
@@ -581,14 +616,14 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         ),
         None => info!(target: "arb-reth", "archive node (no pruning configured; keeping all history)"),
     }
-    let datadir_args = match args.datadir {
+    let datadir_args = match args.datadir.clone() {
         Some(path) => DatadirArgs {
             datadir: MaybePlatformPath::<DataDirPath>::from(path),
             ..Default::default()
         },
         None => DatadirArgs::default(),
     };
-    let config = NodeConfig::new(chain_spec)
+    let config = NodeConfig::new(chain_spec.clone())
         .with_datadir_args(datadir_args)
         .with_metrics(MetricArgs {
             prometheus: args.metrics,
@@ -598,6 +633,66 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 
     // Resolve the L1-derivation resume log path before `data_dir` is moved into the launcher.
     let resume_checkpoint_path = L1ResumeLog::path_in(data_dir.data_dir());
+
+    let parent_chain_claim = orbit
+        .as_ref()
+        .map(|(_, _, info)| ParentChainClaim {
+            chain_id: (info.parent_chain_id != 0).then_some(info.parent_chain_id),
+            classification: if info.parent_chain_is_arbitrum {
+                ParentChainClassification::Arbitrum
+            } else {
+                ParentChainClassification::NonArbitrum
+            },
+        })
+        .unwrap_or(ParentChainClaim {
+            chain_id: None,
+            classification: ParentChainClassification::Unspecified,
+        });
+    let recovery = prepare_recovery(RecoveryConfig {
+        datadir: data_dir.data_dir().to_path_buf(),
+        chain_spec: chain_spec.clone(),
+        chain_id: effective_chain_id,
+        genesis_block: rollup.l2_genesis_block,
+        sequencer_inbox: rollup.sequencer_inbox,
+        bridge: rollup.bridge,
+        deployed_at: rollup.deployed_at,
+        parent_chain_claim,
+        snapshot_seeded: args.snapshot_head.is_some(),
+        prune_config: prune_config.clone(),
+        no_fsync: args.no_fsync,
+        no_l1_derive: args.no_l1_derive,
+        l1_rpc: args.l1_rpc.clone(),
+        l1_beacon: args.l1_beacon.clone(),
+        l1_start_block: args.l1_start_block,
+        l1_start_delayed: args.l1_start_delayed,
+        l1_end_block: args.l1_end_block,
+    })
+    .await?;
+    let recovery_gate = recovery.gate;
+    let mut recovery_runtime = recovery.runtime;
+    if let Some(runtime) = recovery_runtime.as_ref().filter(|_| !is_recovery_worker()) {
+        // Rederivation owns a writable Reth storage epoch. Run it in a disposable process so a
+        // successful process exit proves every MDBX/static/Rocks handle and cached writer was
+        // dropped before this parent reopens the datadir for the final exact proof.
+        run_recovery_worker_subprocess()?;
+        recovery_failpoint("recovery_worker_exited_before_reopen");
+        finalize_recovery_and_release(runtime, &recovery_gate)?;
+        recovery_runtime = None;
+    }
+
+    // Normal startup preserves fail-fast socket binding. Recovery creates no public socket until
+    // the marker is durably removed and the shared gate releases services.
+    let mev_tx_log_ipc = if recovery_gate.is_ready() {
+        args.mev_tx_log_ipc
+            .as_ref()
+            .zip(tx_log_stream.as_ref())
+            .map(|(path, broadcaster)| {
+                MevTxLogIpc::bind_with_broadcaster(path.clone(), broadcaster.clone())
+            })
+            .transpose()?
+    } else {
+        None
+    };
 
     let db_path = data_dir.db();
     info!(target: "arb-reth", path = ?db_path, no_fsync = args.no_fsync, "opening database");
@@ -626,7 +721,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         chain_id: effective_chain_id,
         genesis_block: rollup.l2_genesis_block,
         tuning: crate::ArbEngineTuning {
-            persistence_threshold: args.persistence_threshold,
+            persistence_threshold: if recovery_runtime.is_some() {
+                0
+            } else {
+                args.persistence_threshold
+            },
             memory_block_buffer_target: args.memory_buffer_target,
             persistence_backpressure_threshold: args.persistence_backpressure,
             execution_cache_size: args.execution_cache_size_mb.saturating_mul(1024 * 1024),
@@ -641,7 +740,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         l1_messages: l1_rx,
         feed_latency: feed_latency.clone(),
         rpc_addr,
-        tx_log_stream: mev_tx_log_ipc.as_ref().map(MevTxLogIpc::broadcaster),
+        tx_log_stream: tx_log_stream.clone(),
+        recovery_gate: recovery_gate.clone(),
+        recovery: recovery_runtime,
         #[cfg(test)]
         driver_test_control: None,
     };
@@ -661,11 +762,34 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             ipc.serve(shutdown).await;
         });
         info!(target: "arb-reth::mev", path = %path.display(), "MEV transaction-log IPC listening");
+    } else if let Some((path, broadcaster)) = args
+        .mev_tx_log_ipc
+        .clone()
+        .zip(tx_log_stream.clone())
+        .filter(|_| !recovery_gate.is_ready())
+    {
+        let gate = recovery_gate.clone();
+        task_executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
+            gate.wait_ready().await;
+            match MevTxLogIpc::bind_with_broadcaster(path.clone(), broadcaster) {
+                Ok(ipc) => {
+                    info!(target: "arb-reth::mev", path = %path.display(), "MEV transaction-log IPC listening after recovery");
+                    ipc.serve(shutdown).await;
+                }
+                Err(error) => reth_tracing::tracing::error!(
+                    target: "arb-reth::mev",
+                    %error,
+                    "failed to bind MEV transaction-log IPC after recovery",
+                ),
+            }
+        });
     }
 
     if let Some(feed_path) = args.replay_feed {
         let tx = feed_tx.clone();
+        let gate = recovery_gate.clone();
         task_executor.spawn_task(async move {
+            gate.wait_ready().await;
             let content = match fs::read_to_string(&feed_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -727,19 +851,28 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             + 1;
         let resume_sequence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(feed_start_seq));
         let (ingress_tx, ingress_rx) = feed::ingress_channel();
-        task_executor.spawn_task(feed::coordinate(
-            ingress_rx,
-            feed_tx.clone(),
-            feed_latency,
-            resume_sequence.clone(),
-        ));
+        let gate = recovery_gate.clone();
+        let coordinator_resume = resume_sequence.clone();
+        let coordinator_feed = feed_tx.clone();
+        task_executor.spawn_task(async move {
+            gate.wait_ready().await;
+            feed::coordinate(
+                ingress_rx,
+                coordinator_feed,
+                feed_latency,
+                coordinator_resume,
+            )
+            .await;
+        });
         for source in feed_sources {
-            task_executor.spawn_task(feed::follow(
-                source,
-                ingress_tx.clone(),
-                resume_sequence.clone(),
-                handle.ingress_metrics.clone(),
-            ));
+            let gate = recovery_gate.clone();
+            let ingress_tx = ingress_tx.clone();
+            let resume_sequence = resume_sequence.clone();
+            let ingress_metrics = handle.ingress_metrics.clone();
+            task_executor.spawn_task(async move {
+                gate.wait_ready().await;
+                feed::follow(source, ingress_tx, resume_sequence, ingress_metrics).await;
+            });
         }
     }
 
@@ -875,6 +1008,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         // The driver seeds this exclusively from the durable message journal; L1 reconciliation
         // advances it only after journal authority is published.
         sync_cfg.l1_verified_tip = l1_verified_tip.clone();
+        sync_cfg.checkpoint_writes_ready = recovery_gate.readiness_atomic();
         // Messages are numbered by message index (block - genesis_block) for the driver's
         // sequence-reconciliation; without this a non-zero genesis (Arbitrum One) mis-numbers every
         // derived block and the driver applies none.
@@ -952,6 +1086,48 @@ mod tests {
             "https://user:pass@example.invalid:8545/path?query=1",
         ] {
             validate_l1_rpc(good).unwrap_or_else(|e| panic!("{good:?} should parse: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn divergence_and_recovery_markers_precede_l1_genesis_provider_access() {
+        for shape in ["divergence", "recovery", "orphan_static"] {
+            let dir = tempfile::tempdir().unwrap();
+            match shape {
+                "divergence" => {
+                    std::fs::write(dir.path().join("arb-message-divergence.json"), b"{").unwrap();
+                }
+                "recovery" => {
+                    std::fs::write(dir.path().join("arb-message-recovery.json"), b"{").unwrap();
+                }
+                "orphan_static" => {
+                    std::fs::create_dir(dir.path().join("static_files")).unwrap();
+                    std::fs::write(dir.path().join("static_files").join("orphan"), b"x").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+            assert!(
+                derive_genesis_from_l1_after_preflight(
+                    dir.path(),
+                    0,
+                    &endpoint,
+                    Address::ZERO,
+                    0,
+                    None,
+                )
+                .await
+                .is_err(),
+                "{shape} must stop before parent provider construction"
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "parent endpoint was touched before {shape} classification"
+            );
         }
     }
 

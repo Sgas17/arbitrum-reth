@@ -12,11 +12,14 @@
 use core::{future::Future, pin::Pin};
 use std::net::SocketAddr;
 
-use crate::metrics::{FeedLatencyTracker, IngressMetrics};
+use crate::{
+    metrics::{FeedLatencyTracker, IngressMetrics},
+    recovery::{RecoveryGate, RecoveryRuntime},
+};
 use alloy_consensus::Header;
 use arbitrum_alloy_consensus::reth::ArbPrimitives;
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
-use eyre::{WrapErr as _, eyre};
+use eyre::{WrapErr as _, ensure, eyre};
 use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
 use reth_evm::ConfigureEvm;
@@ -402,6 +405,12 @@ pub struct ArbLauncher {
     pub rpc_addr: Option<SocketAddr>,
     /// Optional best-effort publisher for per-transaction execution logs.
     pub tx_log_stream: Option<ArbTxLogBroadcaster>,
+    /// Shared production readiness gate for sources and externally visible services.
+    #[doc(hidden)]
+    pub recovery_gate: RecoveryGate,
+    /// Frozen recovery transaction, present only while authoritative L1 rederivation is required.
+    #[doc(hidden)]
+    pub recovery: Option<RecoveryRuntime>,
     #[cfg(test)]
     pub(crate) driver_test_control: Option<std::sync::Arc<DriverTestControl>>,
 }
@@ -879,6 +888,8 @@ impl ArbLauncher {
             feed_latency,
             rpc_addr,
             tx_log_stream,
+            recovery_gate,
+            recovery,
             #[cfg(test)]
             driver_test_control,
         } = self;
@@ -936,6 +947,7 @@ impl ArbLauncher {
         // Install reth's Prometheus recorder before any feed metric handles are initialized, and
         // serve it when `--metrics <addr>` is configured.
         let ctx = ctx.with_prometheus_server().await?;
+        recovery_gate.register_metric();
         let ingress_metrics = IngressMetrics::new();
 
         // Open the DB in storage v2 (hashed-state canonical, `PackedKeyAdapter`). This has to
@@ -1000,7 +1012,7 @@ impl ArbLauncher {
 
         // Stand up reth's engine tree (Tier-1 `InsertExecutedBlock` seam) and drive the
         // sequencer feed through it. Persistence to MDBX is async (tree background service).
-        let mut driver: ArbEngineDriver<NodeTypesWithDBAdapter<N, DB>> = ArbEngineDriver::spawn(
+        let driver: ArbEngineDriver<NodeTypesWithDBAdapter<N, DB>> = ArbEngineDriver::spawn(
             provider_factory,
             provider.clone(),
             arb_evm_config.clone(),
@@ -1017,8 +1029,9 @@ impl ArbLauncher {
         )?;
         #[cfg(test)]
         let engine_lifecycle_probe = driver.lifecycle_probe();
+        let mut driver = Some(driver);
 
-        let initial_executed_tip = driver.tip().number;
+        let initial_executed_tip = driver.as_ref().expect("driver initialized").tip().number;
         let initial_durable_tip = provider.last_block_number()?;
         let initial_verified_tip = l1_verified_tip.load(std::sync::atomic::Ordering::Acquire);
         ingress_metrics.initialize_frontiers(
@@ -1085,6 +1098,7 @@ impl ArbLauncher {
             |shutdown| async move {
             let mut shutdown = Box::pin(shutdown);
             let mut shutdown_guard = None;
+            let recovery = recovery;
             let res: eyre::Result<()> = async {
                 // Bench accounting: separate time spent WAITING for the next derived feed
                 // message (L1-fetch-bound) from time spent in advance() (compute/persist-bound).
@@ -1098,7 +1112,10 @@ impl ArbLauncher {
                     let selected = match next_driver_action(
                         shutdown.as_mut(),
                         &mut scheduler,
-                        driver.next_sequence(),
+                        driver
+                            .as_ref()
+                            .expect("driver exists while selecting work")
+                            .next_sequence(),
                     )
                     .await
                     {
@@ -1131,6 +1148,8 @@ impl ArbLauncher {
                         }
                         let __w = std::time::Instant::now();
                         let reconciliation = driver
+                            .as_mut()
+                            .expect("driver exists while reconciling")
                             .reconcile_applied_l1_chunk(&batch, |sequence_number, applied| {
                                 record_applied_executed_tip(
                                     &driver_metrics,
@@ -1144,7 +1163,10 @@ impl ArbLauncher {
                             .await;
                         #[cfg(test)]
                         task_test_observations.engine_reconciliation_calls.store(
-                            driver.reconciliation_call_count(),
+                            driver
+                                .as_ref()
+                                .expect("driver exists after reconciliation")
+                                .reconciliation_call_count(),
                             std::sync::atomic::Ordering::Relaxed,
                         );
                         match reconciliation {
@@ -1164,6 +1186,8 @@ impl ArbLauncher {
                                         })
                                         .unwrap_or(&batch[0]);
                                     driver
+                                        .as_ref()
+                                        .expect("driver exists after reconciliation failure")
                                         .write_divergence_marker_for_error(failed, &error)
                                         .wrap_err("failed to persist divergence marker before shutdown")?;
                                 }
@@ -1178,6 +1202,8 @@ impl ArbLauncher {
                     for (index, input) in execution_inputs.into_iter().enumerate() {
                         let __w = std::time::Instant::now();
                         if let Err(error) = driver
+                            .as_mut()
+                            .expect("driver exists while applying messages")
                             .advance_with_applied_overlap(
                                 &input,
                                 index + 1 < suffix_len,
@@ -1202,6 +1228,8 @@ impl ArbLauncher {
                             );
                             if arb_reth_engine::is_message_divergence(&error) {
                                 driver
+                                    .as_ref()
+                                    .expect("driver exists after apply failure")
                                     .write_divergence_marker_for_error(&input, &error)
                                     .wrap_err("failed to persist divergence marker before shutdown")?;
                             }
@@ -1213,10 +1241,52 @@ impl ArbLauncher {
                         }
                         bench_work_us += __w.elapsed().as_micros();
                     }
-                    driver_metrics.set_executed_tip(driver.tip().number);
+                    driver_metrics.set_executed_tip(
+                        driver
+                            .as_ref()
+                            .expect("driver exists after batch execution")
+                            .tip()
+                            .number,
+                    );
                     #[cfg(test)]
                     if let Some(control) = driver_test_control.as_ref() {
                         control.pause_after_post_batch_frontier().await;
+                    }
+                    if source == ArbEngineInputSource::L1
+                        && recovery
+                            .as_ref()
+                            .is_some_and(|runtime| {
+                                driver
+                                    .as_ref()
+                                    .expect("driver exists at recovery barrier")
+                                    .tip()
+                                    .number
+                                    >= runtime.marker.old_db_tip_number
+                            })
+                    {
+                        let barrier_tip = driver
+                            .as_ref()
+                            .expect("driver exists at recovery barrier")
+                            .tip()
+                            .number;
+                        let quiesced_tip = driver
+                            .take()
+                            .expect("driver exists at recovery barrier")
+                            .quiesce_for_recovery()
+                            .await?;
+                        ensure!(
+                            quiesced_tip.number == barrier_tip,
+                            "recovery quiescence acknowledged unexpected frontier {} instead of {barrier_tip}",
+                            quiesced_tip.number
+                        );
+                        ensure!(
+                            crate::recovery::is_recovery_worker(),
+                            "recovery rederivation must run in the disposable storage-owner process"
+                        );
+                        crate::recovery::recovery_failpoint(
+                            "recovery_worker_quiesced_before_process_exit",
+                        );
+                        return Ok(())
                     }
                     scheduler.complete_batch(source, kind);
                     #[cfg(test)]
@@ -1267,8 +1337,14 @@ impl ArbLauncher {
             // Flush and terminate the engine tree on both normal channel closure and fail-closed
             // driver errors. Dropping the guard requests termination, but awaiting shutdown here
             // also settles persistence before the node reports its terminal result.
-            let shutdown_result = driver.shutdown().await;
-            let journal_result = driver.flush_durable_message_journal();
+            let (shutdown_result, journal_result) = if let Some(driver) = driver.as_mut() {
+                (
+                    driver.shutdown().await,
+                    driver.flush_durable_message_journal(),
+                )
+            } else {
+                (Ok(()), Ok(()))
+            };
             let res = match (res, shutdown_result, journal_result) {
                 (Ok(()), Ok(()), journal_result) => journal_result,
                 (Ok(()), Err(shutdown_error), Ok(())) => Err(shutdown_error),
@@ -1311,18 +1387,14 @@ impl ArbLauncher {
             let (engine_tx, _engine_rx) = tokio::sync::mpsc::unbounded_channel();
             let beacon_engine_handle =
                 reth_engine_primitives::ConsensusEngineHandle::new(engine_tx);
-            let add_ons_ctx = AddOnsContext {
-                node: ctx.node_adapter().clone(),
-                config: ctx.node_config(),
-                beacon_engine_handle,
-                engine_events: reth_tokio_util::EventSender::default(),
-                jwt_secret: ctx.auth_jwt_secret()?,
-            };
+            let rpc_node = ctx.node_adapter().clone();
+            let rpc_config = ctx.node_config().clone();
+            let jwt_secret = ctx.auth_jwt_secret()?;
             let mut add_ons = crate::addons::arb_add_ons();
             if let Some(frontier_store) = frontier_store {
                 let frontier_provider = provider.clone();
                 let frontier_evm_config = arb_evm_config.clone();
-                let frontier_gas_cap = ctx.node_config().rpc.rpc_gas_cap;
+                let frontier_gas_cap = rpc_config.rpc.rpc_gas_cap;
                 add_ons = add_ons.extend_rpc_modules(move |rpc| {
                     let module = crate::mev_frontier_rpc::module(
                         frontier_store,
@@ -1334,8 +1406,50 @@ impl ArbLauncher {
                     Ok(())
                 });
             }
-            let handle = add_ons.launch_add_ons(add_ons_ctx).await?;
-            Some(handle.rpc_server_handles.rpc)
+            let launch_rpc = async move {
+                let add_ons_ctx = AddOnsContext {
+                    node: rpc_node,
+                    config: &rpc_config,
+                    beacon_engine_handle,
+                    engine_events: reth_tokio_util::EventSender::default(),
+                    jwt_secret,
+                };
+                let handle = add_ons.launch_add_ons(add_ons_ctx).await?;
+                Ok::<RpcServerHandle, eyre::Report>(handle.rpc_server_handles.rpc)
+            };
+            if recovery_gate.is_ready() {
+                Some(launch_rpc.await?)
+            } else {
+                let gate = recovery_gate.clone();
+                task_executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
+                    let mut shutdown = Box::pin(shutdown);
+                    tokio::select! {
+                        biased;
+                        guard = &mut shutdown => {
+                            drop(guard);
+                            return;
+                        }
+                        _ = gate.wait_ready() => {}
+                    }
+                    match launch_rpc.await {
+                        Ok(handle) => {
+                            tracing::info!(
+                                target: "arb-reth::rpc",
+                                "RPC released after durable recovery finalization",
+                            );
+                            let guard = shutdown.await;
+                            drop(handle);
+                            drop(guard);
+                        }
+                        Err(error) => tracing::error!(
+                            target: "arb-reth::rpc",
+                            %error,
+                            "failed to launch RPC after recovery",
+                        ),
+                    }
+                });
+                None
+            }
         } else {
             None
         };
@@ -1744,6 +1858,8 @@ mod tests {
                 feed_latency: None,
                 rpc_addr: None,
                 tx_log_stream: None,
+                recovery_gate: RecoveryGate::new(true),
+                recovery: None,
                 driver_test_control: None,
             }
             .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
@@ -1788,6 +1904,8 @@ mod tests {
             feed_latency: None,
             rpc_addr: None,
             tx_log_stream: None,
+            recovery_gate: RecoveryGate::new(true),
+            recovery: None,
             driver_test_control: Some(control.clone()),
         };
         let handle = launcher
@@ -2023,6 +2141,8 @@ mod tests {
             feed_latency: None,
             rpc_addr: None,
             tx_log_stream: None,
+            recovery_gate: RecoveryGate::new(true),
+            recovery: None,
             driver_test_control: None,
         }
         .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
@@ -2192,6 +2312,8 @@ mod tests {
             feed_latency: None,
             rpc_addr: None,
             tx_log_stream: None,
+            recovery_gate: RecoveryGate::new(true),
+            recovery: None,
             driver_test_control: Some(control.clone()),
         }
         .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
@@ -2552,6 +2674,8 @@ mod tests {
             feed_latency: None,
             rpc_addr: None,
             tx_log_stream: None,
+            recovery_gate: RecoveryGate::new(true),
+            recovery: None,
             driver_test_control: Some(control.clone()),
         }
         .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
@@ -2705,6 +2829,8 @@ mod tests {
                 feed_latency: None,
                 rpc_addr: None,
                 tx_log_stream: None,
+                recovery_gate: RecoveryGate::new(true),
+                recovery: None,
                 driver_test_control: None,
             }
             .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
@@ -2734,6 +2860,8 @@ mod tests {
             feed_latency: None,
             rpc_addr: None,
             tx_log_stream: None,
+            recovery_gate: RecoveryGate::new(true),
+            recovery: None,
             driver_test_control: Some(control.clone()),
         }
         .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
@@ -2870,6 +2998,8 @@ mod tests {
             feed_latency: None,
             rpc_addr: None,
             tx_log_stream: None,
+            recovery_gate: RecoveryGate::new(true),
+            recovery: None,
             driver_test_control: Some(control.clone()),
         }
         .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
@@ -2991,6 +3121,8 @@ mod tests {
                 feed_latency: None,
                 rpc_addr: None,
                 tx_log_stream: None,
+                recovery_gate: RecoveryGate::new(true),
+                recovery: None,
                 driver_test_control: None,
             }
             .launch_node(
@@ -3054,6 +3186,8 @@ mod tests {
             feed_latency: None,
             rpc_addr: None,
             tx_log_stream: None,
+            recovery_gate: RecoveryGate::new(true),
+            recovery: None,
             driver_test_control: None,
         }
         .launch_node(
@@ -3453,6 +3587,8 @@ mod tests {
             feed_latency: None,
             rpc_addr: None,
             tx_log_stream: None,
+            recovery_gate: RecoveryGate::new(true),
+            recovery: None,
             driver_test_control: None,
         };
         let handle = launcher
@@ -3654,6 +3790,8 @@ mod tests {
             feed_latency: None,
             rpc_addr: None,
             tx_log_stream: None,
+            recovery_gate: RecoveryGate::new(true),
+            recovery: None,
             driver_test_control: None,
         };
 
@@ -3768,6 +3906,8 @@ mod tests {
             feed_latency: None,
             rpc_addr: None,
             tx_log_stream: None,
+            recovery_gate: RecoveryGate::new(true),
+            recovery: None,
             driver_test_control: None,
         };
         let handle = launcher

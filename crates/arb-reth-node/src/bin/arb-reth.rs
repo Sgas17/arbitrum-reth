@@ -99,6 +99,10 @@ enum GenesisSub {
 }
 
 fn main() -> eyre::Result<()> {
+    if arb_reth_node::run_recovery_validation_child_from_env()? {
+        return Ok(())
+    }
+
     // Idiomatic reth tracing; guard is held for the process lifetime.
     let _guard = RethTracer::new().init()?;
 

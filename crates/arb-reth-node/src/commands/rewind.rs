@@ -26,7 +26,7 @@
 //! arb-reth rewind --datadir /tmp/arb1-sync --snapshot-head head-block.stream --to <N-1>
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{read_head_header, ArbNode, L1ResumeLog, ARB_ONE_CHAIN_ID};
@@ -37,8 +37,7 @@ use reth_db_api::models::StorageSettings;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_provider::{
     providers::{RocksDBProvider, StaticFileProvider},
-    BlockExecutionWriter, BlockNumReader, DatabaseProviderFactory, DBProvider, HeaderProvider,
-    ProviderFactory, StorageSettingsCache,
+    BlockNumReader, HeaderProvider, ProviderFactory, StorageSettingsCache,
 };
 use reth_tasks::Runtime;
 use reth_tracing::tracing::info;
@@ -141,7 +140,7 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
     // Only snapshot-seeded datadirs carry the mis-seeded layout; an orbit datadir booted fresh from
     // genesis files writes stock-aligned changeset segments, so skip the migration there.
     if snapshot_seeded {
-        migrate_changeset_layout(&static_files_path, genesis_num)?;
+        crate::recovery::normalize_snapshot_changeset_layout(&static_files_path, genesis_num)?;
     }
 
     let db = init_db(&db_path, DatabaseArguments::new(ClientVersion::default()))?;
@@ -217,53 +216,7 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
     }
 
     if new_tip < current_tip {
-        // Diagnostic: the v2 state revert (`remove_state_above`) restores `HashedAccounts` from the
-        // account/storage changesets in `(new_tip, current_tip]`. If those read back empty, the revert
-        // is a silent no-op (blocks removed, state left at the old tip).
-        {
-            use reth_provider::{ChangeSetReader, StaticFileProviderFactory};
-            use reth_static_file_types::StaticFileSegment;
-            let sfp = factory.static_file_provider();
-
-            info!(
-                target: "arb-rewind",
-                headers = ?sfp.get_highest_static_file_block(StaticFileSegment::Headers),
-                account_changesets_tip = ?sfp.get_highest_static_file_block(StaticFileSegment::AccountChangeSets),
-                storage_changesets_tip = ?sfp.get_highest_static_file_block(StaticFileSegment::StorageChangeSets),
-                receipts = ?sfp.get_highest_static_file_block(StaticFileSegment::Receipts),
-                "static-file segment tips",
-            );
-            let ro = factory.database_provider_ro()?;
-            // Binary-search the block where changesets stop being written (they exist early, not late).
-            let has_cs = |bn: u64| -> bool {
-                ro.account_changesets_range(bn..=bn).map(|v| !v.is_empty()).unwrap_or(false)
-            };
-            let (mut lo, mut hi) = (genesis_num + 1, current_tip);
-            while hi - lo > 1 {
-                let mid = (lo + hi) / 2;
-                // scan a small window around mid (a single block may legitimately have 0 changes)
-                let any = (mid..=(mid + 20).min(current_tip)).any(has_cs);
-                if any { lo = mid } else { hi = mid }
-            }
-            info!(target: "arb-rewind", last_block_with_changesets = lo, current_tip, "changeset write boundary");
-            let mut cursor = new_tip + 1;
-            let mut sample = None;
-            while cursor <= current_tip && sample.is_none() {
-                let end = cursor.saturating_add(1023).min(current_tip);
-                let accounts = ro.account_changesets_range(cursor..=end)?;
-                sample = accounts.first().map(|(bn, account)| {
-                    (*bn, account.address, account.info.map(|info| info.nonce))
-                });
-                cursor = end.saturating_add(1);
-            }
-            info!(target: "arb-rewind", ?sample, "bounded revert-range changeset check");
-            if sample.is_none() {
-                return Err(eyre::eyre!(
-                    "no account changesets found in ({new_tip}, {current_tip}]; the v2 state revert \
-                     would be a no-op and leave the DB inconsistent; aborting before any write"
-                ));
-            }
-        }
+        crate::recovery::validate_changeset_coverage(&factory, new_tip, current_tip)?;
 
         if args.dry_run {
             info!(target: "arb-rewind", "dry run: no changes written");
@@ -272,9 +225,7 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
 
         // Unwind the DB: remove every block/receipt/state/trie/history entry above `new_tip`.
         info!(target: "arb-rewind", removing_above = new_tip, "unwinding database (this may take a while)");
-        let provider_rw = factory.database_provider_rw()?;
-        provider_rw.remove_block_and_execution_above(new_tip)?;
-        provider_rw.commit().map_err(|e| eyre::eyre!("commit unwind: {e}"))?;
+        crate::recovery::commit_storage_v2_unwind(&factory, new_tip)?;
     }
 
     if args.dry_run {
@@ -307,89 +258,5 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
     }
     arb_reth_engine::clear_divergence_marker_at(&args.datadir)?;
     println!("rewound {current_tip} -> {new_tip}  (removed {} blocks)", current_tip - new_tip);
-    Ok(())
-}
-
-/// Realign the changeset static-file segments seeded by the snapshot import so stock reth's v2
-/// unwind and changeset reads are correct, with no reth patch required.
-///
-/// The import seeded `AccountChangeSets`/`StorageChangeSets` with `set_block_range(head, head)`,
-/// leaving `expected_block_start` at the file's fixed 500k-slot boundary (e.g. 22000000) while the
-/// data starts at `head` (genesis). Stock reth's `truncate_changesets` keys off
-/// `expected_block_start`, so it over-counts and zero-pads the offset sidecar on every unwind; and
-/// because genesis itself has no changeset, `csoff[0]` is really block `head+1`, so reads are shifted
-/// +1. Both are fixed by moving `expected_block_start` and `block_range.start` to `head+1` (the first
-/// block that actually has a changeset) and renaming the files to match.
-///
-/// This runs at the pure-filesystem level, before the DB is opened, so no reth code sees the
-/// mis-seeded layout. It is idempotent and guarded: it only rewrites a header whose fields match the
-/// recognized mis-seeded shape (`version == 1`, block_range present, `block_range.start == head`),
-/// and it re-renames on a resumed/partial run. The `.conf` is the NippyJar config whose leading bytes
-/// are the `SegmentHeader`: `[0]=version u64, [8]=expected_start u64, [16]=expected_end u64,
-/// [24]=block_range Option tag, [25]=block_start u64, [33]=block_end u64`.
-fn migrate_changeset_layout(static_files: &Path, genesis: u64) -> eyre::Result<()> {
-    let target = genesis + 1;
-    for seg in ["account-change-sets", "storage-change-sets"] {
-        let prefix = format!("static_file_{seg}_");
-        // The changeset data file is the one with this prefix and no extension.
-        let data_name = std::fs::read_dir(static_files)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .find(|n| n.starts_with(&prefix) && !n.contains('.'));
-        let Some(data_name) = data_name else { continue };
-
-        let conf_path = static_files.join(format!("{data_name}.conf"));
-        let conf = std::fs::read(&conf_path)?;
-        if conf.len() < 41 {
-            continue;
-        }
-        let rd = |off: usize| u64::from_le_bytes(conf[off..off + 8].try_into().unwrap());
-        let (version, some_tag, exp_start, exp_end, blk_start) =
-            (rd(0), conf[24], rd(8), rd(16), rd(25));
-
-        // Only touch the old mis-seeded shape (expected_block_start at the fixed 500k slot while the
-        // data starts at genesis). Anything already aligned is left alone: a fresh import from the
-        // fixed `arb-snapshot-import` sets expected_block_start == block_start == genesis (genesis
-        // gets an explicit empty changeset entry), and a prior migration set both to genesis+1.
-        // Both have `exp_start == blk_start`, so this is also the idempotency check.
-        if version != 1 || some_tag != 1 {
-            continue;
-        }
-        if exp_start == blk_start {
-            continue; // already aligned (fresh import or already migrated)
-        }
-        if blk_start != genesis {
-            continue; // not the mis-seeded layout we know how to fix
-        }
-
-        let new_base = format!("static_file_{seg}_{target}_{exp_end}");
-        // Rename first (idempotent): a crash between rename and patch is recovered on the next run,
-        // which finds the new-named file still carrying the old header and completes the patch.
-        for ext in ["", ".conf", ".off", ".csoff"] {
-            let src = static_files.join(format!("{data_name}{ext}"));
-            let dst = static_files.join(format!("{new_base}{ext}"));
-            if src.exists() && src != dst {
-                std::fs::rename(&src, &dst)?;
-            }
-        }
-        // Patch expected_block_start (@8) and block_range.start (@25) to genesis+1 in the (renamed)
-        // config, then fsync so the header is durable before any reader opens it.
-        let new_conf_path = static_files.join(format!("{new_base}.conf"));
-        let mut new_conf = std::fs::read(&new_conf_path)?;
-        new_conf[8..16].copy_from_slice(&target.to_le_bytes());
-        new_conf[25..33].copy_from_slice(&target.to_le_bytes());
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(&new_conf_path)?;
-            f.write_all(&new_conf)?;
-            f.sync_all()?;
-        }
-        info!(
-            target: "arb-rewind",
-            seg, old_expected_start = exp_start, new_start = target, block_end = rd(33),
-            renamed_to = %new_base,
-            "migrated changeset static-file layout to genesis+1 (stock-reth v2 unwind/read fix)"
-        );
-    }
     Ok(())
 }

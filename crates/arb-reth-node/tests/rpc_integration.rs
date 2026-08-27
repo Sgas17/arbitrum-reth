@@ -73,6 +73,8 @@ async fn rpc_serves_eth_queries() {
         feed_latency: None,
         rpc_addr: Some(rpc_addr),
         tx_log_stream: Some(tx_log_stream),
+        recovery_gate: arb_reth_node::RecoveryGate::new(true),
+        recovery: None,
     };
 
     let handle = launcher

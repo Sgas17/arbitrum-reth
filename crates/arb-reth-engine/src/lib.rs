@@ -40,7 +40,10 @@ pub use engine::{
 pub use engine_spike::ArbPayloadValidator;
 pub use message_compare::{ArbMessageEnrichment, ArbMessageFingerprint, fingerprint_message};
 pub use message_journal::{
-    clear_divergence_marker_at, truncate_journal_at, validate_journal_target_at,
+    DIVERGENCE_MARKER_FILE, MESSAGE_JOURNAL_FILE, MessageJournalAnchor, MessageJournalEntry,
+    MessageJournalInspection, clear_divergence_marker_at, divergence_marker_path,
+    inspect_message_journal, message_journal_path, rewrite_journal_to_identity_at,
+    truncate_journal_at, validate_journal_target_at,
 };
 pub use native_payload::ArbPayloadBuilder;
 pub use tx_log_stream::{

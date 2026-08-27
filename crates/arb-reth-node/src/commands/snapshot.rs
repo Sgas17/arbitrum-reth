@@ -88,8 +88,11 @@ use reth_trie_db::{
 // Boot-wiring: write head header + checkpoints so ProviderFactory opens at the block.
 use alloy_consensus::Header;
 use alloy_rlp::Decodable;
+use arb_reth_engine::{DIVERGENCE_MARKER_FILE, MESSAGE_JOURNAL_FILE};
 use arb_reth_sync::resume::RESUME_FILE_NAME;
 use arb_revm::ArbSpecId;
+
+use crate::recovery::RECOVERY_MARKER_FILE;
 use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use reth_provider::{
     BlockNumReader, DatabaseProviderFactory, StageCheckpointWriter, StaticFileProviderFactory,
@@ -645,6 +648,27 @@ pub(crate) fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
                 "snapshot import requires a fresh target; stale L1 resume metadata exists at {}",
                 path.display()
             );
+        }
+    }
+
+    if out.exists() {
+        for entry in std::fs::read_dir(out)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if [
+                MESSAGE_JOURNAL_FILE,
+                DIVERGENCE_MARKER_FILE,
+                RECOVERY_MARKER_FILE,
+            ]
+            .iter()
+            .any(|prefix| name == *prefix || name.starts_with(&format!("{prefix}.")))
+            {
+                eyre::bail!(
+                    "snapshot import requires a fresh target; stale message authority metadata exists at {}",
+                    entry.path().display()
+                );
+            }
         }
     }
 
@@ -1657,6 +1681,26 @@ mod tests {
         assert!(error.to_string().contains("stale L1 resume metadata"));
         std::fs::remove_file(resume_tmp_path)?;
 
+        for artifact in [
+            MESSAGE_JOURNAL_FILE.to_string(),
+            format!("{MESSAGE_JOURNAL_FILE}.truncate.tmp"),
+            format!("{MESSAGE_JOURNAL_FILE}.compact.tmp"),
+            format!("{MESSAGE_JOURNAL_FILE}.recovery.tmp"),
+            DIVERGENCE_MARKER_FILE.to_string(),
+            RECOVERY_MARKER_FILE.to_string(),
+            format!("{RECOVERY_MARKER_FILE}.tmp"),
+        ] {
+            let path = temp.path().join(artifact);
+            std::fs::write(&path, b"stale authority")?;
+            let error = ensure_fresh_import_target(temp.path()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("stale message authority metadata")
+            );
+            std::fs::remove_file(path)?;
+        }
+
         std::fs::create_dir(temp.path().join("db/.preimage.tmp"))?;
         assert!(find_staging_preimage_dir(&temp.path().join("db"))?.is_some());
         std::fs::remove_dir(temp.path().join("db/.preimage.tmp"))?;
@@ -1670,6 +1714,58 @@ mod tests {
         std::fs::write(other.path().join("db/mdbx.dat"), [])?;
         let error = ensure_fresh_import_target(other.path()).unwrap_err();
         assert!(error.to_string().contains("unexpected path"));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_import_entry_points_reject_authority_before_opening_inputs() -> eyre::Result<()> {
+        let ordinary = tempfile::tempdir()?;
+        std::fs::write(
+            ordinary.path().join(MESSAGE_JOURNAL_FILE),
+            b"stale authority",
+        )?;
+        let ordinary_args = SnapshotImportArgs::try_parse_from([
+            "arb-snapshot-import",
+            "--state",
+            "missing-state.stream",
+            "--out",
+            ordinary.path().to_str().unwrap(),
+            "--expect",
+            &format!("{:#x}", B256::ZERO),
+            "--blocks",
+            "missing-blocks.stream",
+        ])?;
+        let error = import(ordinary_args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stale message authority metadata")
+        );
+        assert!(!ordinary.path().join("static_files").exists());
+        assert!(!ordinary.path().join("rocksdb").exists());
+
+        let full = tempfile::tempdir()?;
+        std::fs::write(full.path().join(RECOVERY_MARKER_FILE), b"stale authority")?;
+        let full_args = super::super::snapshot_full::SnapshotImportFullArgs::try_parse_from([
+            "arb-snapshot-import-full",
+            "--stream",
+            "missing-full-snapshot.stream",
+            "--out",
+            full.path().to_str().unwrap(),
+            "--chain-info",
+            "missing-chaininfo.json",
+            "--genesis",
+            "missing-genesis.json",
+        ])?;
+        let error = super::super::snapshot_full::import_full(full_args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stale message authority metadata")
+        );
+        assert!(!full.path().join("db").exists());
+        assert!(!full.path().join("static_files").exists());
+        assert!(!full.path().join("rocksdb").exists());
         Ok(())
     }
 

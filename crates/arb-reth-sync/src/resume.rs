@@ -32,6 +32,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use eyre::{WrapErr as _, ensure};
 use serde::{Deserialize, Serialize};
 
 /// File name (under the data directory) of the L1-derivation resume log.
@@ -49,6 +50,7 @@ pub const MAX_CHECKPOINTS: usize = 128;
 /// has reached block `l2_block`. Resuming derivation from `l1_block` with `delayed_count` therefore
 /// produces block `l2_block + 1` next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L1ResumeCheckpoint {
     /// Next L1 block to derive from (the consumed window's `to + 1`).
     pub l1_block: u64,
@@ -61,9 +63,76 @@ pub struct L1ResumeCheckpoint {
 
 /// A bounded, ascending log of recent [`L1ResumeCheckpoint`]s, persisted as `arb-l1-resume.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L1ResumeLog {
     /// Boundaries in ascending `l2_block` order, newest last, capped at [`MAX_CHECKPOINTS`].
     pub checkpoints: Vec<L1ResumeCheckpoint>,
+}
+
+/// Strictly inspect recovery's resume sidecar, distinguishing absence from malformed content.
+///
+/// Unlike normal backward-compatible startup loading, this never treats a torn file as absent and
+/// never accepts the legacy bare-checkpoint representation as recovery authority.
+pub fn inspect_resume_log_strict(datadir: &Path) -> eyre::Result<Option<L1ResumeLog>> {
+    let path = L1ResumeLog::path_in(datadir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).wrap_err_with(|| format!("read {}", path.display())),
+    };
+    let log = serde_json::from_slice::<L1ResumeLog>(&bytes)
+        .wrap_err_with(|| format!("malformed recovery resume log {}", path.display()))?;
+    ensure!(
+        log.checkpoints.len() <= MAX_CHECKPOINTS,
+        "recovery resume log has {} checkpoints, exceeding limit {MAX_CHECKPOINTS}",
+        log.checkpoints.len()
+    );
+    for pair in log.checkpoints.windows(2) {
+        let [previous, current] = pair else {
+            unreachable!()
+        };
+        ensure!(
+            previous.l2_block < current.l2_block,
+            "recovery resume checkpoints are not strictly ascending by L2 block"
+        );
+        ensure!(
+            previous.l1_block <= current.l1_block,
+            "recovery resume checkpoints move backward on L1"
+        );
+        ensure!(
+            previous.delayed_count <= current.delayed_count,
+            "recovery resume checkpoints move backward in delayed-message count"
+        );
+    }
+    Ok(Some(log))
+}
+
+/// Durably set recovery's resume sidecar to exactly one frozen checkpoint, or remove it for none.
+pub fn rewrite_resume_checkpoint_at(
+    datadir: &Path,
+    checkpoint: Option<L1ResumeCheckpoint>,
+) -> eyre::Result<()> {
+    let path = L1ResumeLog::path_in(datadir);
+    match checkpoint {
+        Some(checkpoint) => {
+            L1ResumeLog {
+                checkpoints: vec![checkpoint],
+            }
+            .save(&path)
+            .wrap_err_with(|| format!("rewrite recovery resume log {}", path.display()))?;
+        }
+        None => L1ResumeLog::remove(&path)
+            .wrap_err_with(|| format!("remove recovery resume log {}", path.display()))?,
+    }
+    let actual = inspect_resume_log_strict(datadir)?;
+    let expected = checkpoint.map(|checkpoint| L1ResumeLog {
+        checkpoints: vec![checkpoint],
+    });
+    ensure!(
+        actual == expected,
+        "recovery resume rewrite did not persist the exact selection"
+    );
+    Ok(())
 }
 
 impl L1ResumeLog {
@@ -217,5 +286,30 @@ mod tests {
         assert_eq!(log.checkpoints, vec![cp(100, 10), cp(200, 20)]);
         assert_eq!(log.truncate_to(5), None, "target predates the log");
         assert!(log.checkpoints.is_empty());
+    }
+
+    #[test]
+    fn strict_inspection_rejects_torn_and_legacy_files() {
+        let dir = reth_db::test_utils::tempdir_path();
+        let path = L1ResumeLog::path_in(&dir);
+        std::fs::write(&path, b"{").unwrap();
+        assert!(inspect_resume_log_strict(&dir).is_err());
+        std::fs::write(&path, serde_json::to_vec(&cp(100, 10)).unwrap()).unwrap();
+        assert!(inspect_resume_log_strict(&dir).is_err());
+    }
+
+    #[test]
+    fn exact_recovery_rewrite_round_trips_checkpoint_and_none() {
+        let dir = reth_db::test_utils::tempdir_path();
+        let checkpoint = cp(100, 10);
+        rewrite_resume_checkpoint_at(&dir, Some(checkpoint)).unwrap();
+        assert_eq!(
+            inspect_resume_log_strict(&dir).unwrap(),
+            Some(L1ResumeLog {
+                checkpoints: vec![checkpoint]
+            })
+        );
+        rewrite_resume_checkpoint_at(&dir, None).unwrap();
+        assert_eq!(inspect_resume_log_strict(&dir).unwrap(), None);
     }
 }

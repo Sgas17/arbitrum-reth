@@ -29,6 +29,8 @@ extern crate alloc;
 
 pub mod commands;
 
+mod recovery;
+
 mod feed;
 
 pub mod genesis;
@@ -55,6 +57,8 @@ pub use arb_reth_sync::resume::{L1ResumeCheckpoint, L1ResumeLog};
 
 pub mod launcher;
 pub use launcher::{ArbLauncher, ArbNodeHandle};
+#[doc(hidden)]
+pub use recovery::{RecoveryGate, RecoveryRuntime, run_recovery_validation_child_from_env};
 
 mod mev_tx_logs;
 mod mev_frontier_rpc;

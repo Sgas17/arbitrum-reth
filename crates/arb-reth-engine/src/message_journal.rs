@@ -19,21 +19,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ArbEngineInput, ArbEngineInputSource, ArbMessageFingerprint};
 
-pub(crate) const MESSAGE_JOURNAL_FILE: &str = "arb-message-journal.ndjson";
-pub(crate) const DIVERGENCE_MARKER_FILE: &str = "arb-message-divergence.json";
+pub const MESSAGE_JOURNAL_FILE: &str = "arb-message-journal.ndjson";
+pub const DIVERGENCE_MARKER_FILE: &str = "arb-message-divergence.json";
 const JOURNAL_VERSION: u64 = 1;
 const JOURNAL_RETAIN_MESSAGES: usize = 100_000;
 const JOURNAL_COMPACT_TRIGGER: usize = 110_000;
 
+/// Complete journal identity at an anchor or applied message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct MessageJournalAnchor {
+#[serde(deny_unknown_fields)]
+pub struct MessageJournalAnchor {
     pub sequence: u64,
     pub block_number: u64,
     pub block_hash: B256,
 }
 
+/// Full durable identity for one applied Arbitrum message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct MessageJournalEntry {
+#[serde(deny_unknown_fields)]
+pub struct MessageJournalEntry {
     pub sequence: u64,
     pub block_number: u64,
     pub block_hash: B256,
@@ -41,6 +45,55 @@ pub(crate) struct MessageJournalEntry {
     pub delayed_messages_read: u64,
     pub fingerprint: ArbMessageFingerprint,
     pub source: ArbEngineInputSource,
+}
+
+/// Result of validating a journal without opening it for writes or repairing its crash tail.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageJournalInspection {
+    pub anchor: MessageJournalAnchor,
+    pub entries: Vec<MessageJournalEntry>,
+    pub watermark: MessageJournalAnchor,
+    pub complete_byte_offset: u64,
+    pub has_incomplete_tail: bool,
+}
+
+impl MessageJournalInspection {
+    /// Returns the complete identity at `sequence`, including the anchor identity.
+    pub fn identity(&self, sequence: u64) -> Option<MessageJournalAnchor> {
+        if sequence == self.anchor.sequence {
+            return Some(self.anchor);
+        }
+        self.entry(sequence).map(|entry| MessageJournalAnchor {
+            sequence: entry.sequence,
+            block_number: entry.block_number,
+            block_hash: entry.block_hash,
+        })
+    }
+
+    /// Returns the retained full message identity at `sequence`.
+    pub fn entry(&self, sequence: u64) -> Option<MessageJournalEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.sequence == sequence)
+            .copied()
+    }
+
+    fn sequence_for_target(&self, block_number: u64, block_hash: B256) -> eyre::Result<u64> {
+        if block_number == self.anchor.block_number && block_hash == self.anchor.block_hash {
+            return Ok(self.anchor.sequence);
+        }
+        self.entries
+            .iter()
+            .find(|entry| entry.block_number == block_number && entry.block_hash == block_hash)
+            .map(|entry| entry.sequence)
+            .ok_or_else(|| {
+                eyre!(
+                    "journal has no identity for recovery target block {block_number} ({block_hash:#x}); retained identities span blocks {} through {}",
+                    self.anchor.block_number,
+                    self.watermark.block_number,
+                )
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -86,6 +139,12 @@ impl MessageJournal {
 
     pub(crate) fn unresolved_divergence_path(&self) -> PathBuf {
         self.path.with_file_name(DIVERGENCE_MARKER_FILE)
+    }
+
+    pub(crate) fn recovery_marker_exists(&self) -> bool {
+        self.path
+            .with_file_name("arb-message-recovery.json")
+            .exists()
     }
 
     pub(crate) fn write_divergence_marker(
@@ -409,6 +468,178 @@ impl MessageJournal {
     }
 }
 
+/// Return the message-journal path within `datadir`.
+pub fn message_journal_path(datadir: &Path) -> PathBuf {
+    MessageJournal::path_in(datadir)
+}
+
+/// Return the startup-blocking divergence-marker path within `datadir`.
+pub fn divergence_marker_path(datadir: &Path) -> PathBuf {
+    MessageJournal::divergence_path_in(datadir)
+}
+
+/// Inspect and fully validate the complete journal prefix without mutating any artifact.
+///
+/// A final record without a newline is reported as an incomplete crash tail and deliberately left
+/// byte-for-byte unchanged. Corruption in any complete record is fatal.
+pub fn inspect_message_journal(
+    datadir: &Path,
+    genesis_block: u64,
+) -> eyre::Result<MessageJournalInspection> {
+    let path = MessageJournal::path_in(datadir);
+    let file = File::open(&path)
+        .wrap_err_with(|| format!("open message journal read-only {}", path.display()))?;
+    let file_len = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut complete_byte_offset = 0u64;
+    let mut records = Vec::new();
+    let mut has_incomplete_tail = false;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            has_incomplete_tail = true;
+            break;
+        }
+        complete_byte_offset += read as u64;
+        records.push(
+            serde_json::from_slice::<DiskRecord>(&line).wrap_err_with(|| {
+                format!(
+                    "invalid complete message-journal record ending at byte {complete_byte_offset}"
+                )
+            })?,
+        );
+    }
+    ensure!(
+        complete_byte_offset <= file_len,
+        "message-journal complete offset exceeds file length"
+    );
+
+    let Some(DiskRecord::Header { version, anchor }) = records.first().copied() else {
+        return Err(eyre!("message journal is missing its header record"));
+    };
+    ensure!(
+        version == JOURNAL_VERSION,
+        "unsupported message journal version {version}"
+    );
+    ensure_journal_mapping(anchor.sequence, anchor.block_number, genesis_block)?;
+
+    let mut entries = BTreeMap::new();
+    let mut previous = anchor;
+    for record in records.into_iter().skip(1) {
+        let DiskRecord::Message { version, entry } = record else {
+            return Err(eyre!("message journal contains a second header"));
+        };
+        ensure!(
+            version == JOURNAL_VERSION,
+            "unsupported message journal version {version}"
+        );
+        ensure_journal_mapping(entry.sequence, entry.block_number, genesis_block)?;
+        if let Some(existing) = entries.get(&entry.sequence).copied() {
+            validate_promotion(existing, entry)?;
+        } else {
+            let expected_sequence = previous
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| eyre!("message journal sequence overflow"))?;
+            let expected_block = previous
+                .block_number
+                .checked_add(1)
+                .ok_or_else(|| eyre!("message journal block-number overflow"))?;
+            ensure!(
+                entry.sequence == expected_sequence,
+                "message journal sequence gap: expected {expected_sequence}, got {}",
+                entry.sequence
+            );
+            ensure!(
+                entry.block_number == expected_block,
+                "message journal block gap: expected {expected_block}, got {}",
+                entry.block_number
+            );
+            ensure!(
+                entry.parent_hash == previous.block_hash,
+                "message journal parent mismatch at sequence {}: expected {:#x}, got {:#x}",
+                entry.sequence,
+                previous.block_hash,
+                entry.parent_hash
+            );
+            previous = MessageJournalAnchor {
+                sequence: entry.sequence,
+                block_number: entry.block_number,
+                block_hash: entry.block_hash,
+            };
+        }
+        entries.insert(entry.sequence, entry);
+    }
+
+    let entries = entries.into_values().collect::<Vec<_>>();
+    let watermark = entries
+        .last()
+        .map(|entry| MessageJournalAnchor {
+            sequence: entry.sequence,
+            block_number: entry.block_number,
+            block_hash: entry.block_hash,
+        })
+        .unwrap_or(anchor);
+    Ok(MessageJournalInspection {
+        anchor,
+        entries,
+        watermark,
+        complete_byte_offset,
+        has_incomplete_tail,
+    })
+}
+
+/// Durably replace the journal with its exact complete prefix through `block_number`/`block_hash`.
+///
+/// This is recovery's sole journal-repair operation. It also removes an inspected incomplete tail,
+/// but only after the caller has frozen recovery evidence.
+pub fn rewrite_journal_to_identity_at(
+    datadir: &Path,
+    genesis_block: u64,
+    block_number: u64,
+    block_hash: B256,
+) -> eyre::Result<MessageJournalInspection> {
+    let inspection = inspect_message_journal(datadir, genesis_block)?;
+    let target_sequence = inspection.sequence_for_target(block_number, block_hash)?;
+    let entries = inspection
+        .entries
+        .iter()
+        .copied()
+        .filter(|entry| entry.sequence <= target_sequence)
+        .map(|entry| (entry.sequence, entry))
+        .collect();
+    let path = MessageJournal::path_in(datadir);
+    let mut journal = MessageJournal {
+        path,
+        anchor: inspection.anchor,
+        entries,
+        append_operations: 0,
+    };
+    let entries = journal.entries.clone();
+    journal.rewrite(inspection.anchor, entries, "recovery")?;
+    inspect_message_journal(datadir, genesis_block)
+}
+
+fn ensure_journal_mapping(
+    sequence: u64,
+    block_number: u64,
+    genesis_block: u64,
+) -> eyre::Result<()> {
+    let expected = genesis_block
+        .checked_add(sequence)
+        .ok_or_else(|| eyre!("journal genesis/sequence mapping overflows u64"))?;
+    ensure!(
+        block_number == expected,
+        "incoherent message journal mapping: genesis block {genesis_block} + sequence {sequence} = {expected}, got block {block_number}"
+    );
+    Ok(())
+}
+
 /// Validate that an existing journal can be truncated to this canonical block identity.
 pub fn validate_journal_target_at(
     datadir: &Path,
@@ -498,7 +729,7 @@ mod tests {
         MessageJournalAnchor {
             sequence: 10,
             block_number: 110,
-            block_hash: B256::repeat_byte(0x10),
+            block_hash: B256::with_last_byte(10),
         }
     }
 
@@ -551,6 +782,47 @@ mod tests {
         let reopened = MessageJournal::open(path.clone())?;
         assert_eq!(reopened.watermark(), anchor());
         assert_eq!(std::fs::metadata(path)?.len(), good_len);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_inspection_reports_but_does_not_repair_incomplete_tail() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = MessageJournal::path_in(dir.path());
+        let mut journal = MessageJournal::create(path.clone(), anchor())?;
+        journal.append_durable(&[entry(11, ArbEngineInputSource::L1)])?;
+        let complete_len = std::fs::metadata(&path)?.len();
+        let mut file = OpenOptions::new().append(true).open(&path)?;
+        file.write_all(b"{\"record\":\"message\"")?;
+        file.sync_all()?;
+        let torn_len = std::fs::metadata(&path)?.len();
+
+        let inspection = inspect_message_journal(dir.path(), 100)?;
+        assert!(inspection.has_incomplete_tail);
+        assert_eq!(inspection.complete_byte_offset, complete_len);
+        assert_eq!(inspection.watermark.sequence, 11);
+        assert_eq!(std::fs::metadata(&path)?.len(), torn_len);
+
+        let repaired = rewrite_journal_to_identity_at(
+            dir.path(),
+            100,
+            inspection.watermark.block_number,
+            inspection.watermark.block_hash,
+        )?;
+        assert!(!repaired.has_incomplete_tail);
+        assert_eq!(std::fs::metadata(path)?.len(), complete_len);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_inspection_rejects_incoherent_mapping_without_writing() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = MessageJournal::path_in(dir.path());
+        drop(MessageJournal::create(path.clone(), anchor())?);
+        let before = std::fs::read(&path)?;
+
+        assert!(inspect_message_journal(dir.path(), 101).is_err());
+        assert_eq!(std::fs::read(path)?, before);
         Ok(())
     }
 

@@ -8,6 +8,18 @@ arb-reth node --metrics 127.0.0.1:9001 ...
 
 The endpoint includes reth engine-tree, persistence, state-root, and RPC metrics. With `--feed-url`, arb-reth also records the live sequencer path. Telemetry deliberately drops a sample instead of blocking the feed reader or block producer.
 
+## Recovery readiness
+
+`reth_arb_reth_recovery_ready` is one unlabeled 0/1 gauge registered in every node mode. It is `1`
+on normal exact-parity startup. It remains `0` for the entire
+`arb-message-recovery.json` quarantine, including offline repair and authoritative L1
+rederivation, and changes to `1` only after the final marker unlink and parent-directory fsync.
+The same production gate releases Feed, replay-file input, ordinary HTTP/WS RPC, and MEV IPC
+publication, so this gauge does not race a parallel test or service-ready state.
+
+The gauge reports crash-recovery quarantine only. It does not define trading readiness and does
+not change the ten `arb_reth.ingress` metric names or scheduler semantics below.
+
 ## Ingress scheduling and frontiers
 
 The source-independent `arb_reth.ingress` metrics are registered in feed-enabled, replay-only, and

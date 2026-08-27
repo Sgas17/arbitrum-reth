@@ -38,9 +38,35 @@ arb-reth node \
 
 `--l1-rpc` starts the catch-up loop. The node records L1-verified durable boundaries in `arb-l1-resume.json` under the datadir and resumes from that checkpoint by default.
 
+When no chain, chain-info/genesis pair, or snapshot head supplies the chain specification,
+`--l1-rpc` also bootstraps genesis from the L1 Initialize message. That path requires an explicit
+`--datadir` so local divergence/recovery markers and stopped storage are classified before the
+parent endpoint is contacted.
+
 The node also maintains `arb-message-journal.ndjson` under the datadir. A pre-existing non-genesis database without this journal requires `--init-message-journal-at-tip` once, after independently validating its current tip. Remove the flag after that successful startup; repeated use is rejected. New genesis databases create the journal automatically.
 
-Startup refuses when the durable database tip is ahead of the journal or while `arb-message-divergence.json` exists. This includes an unclean shutdown where asynchronous database persistence outran the last journal fsync. Keep the node stopped and use `arb-reth rewind` to the journal watermark or the block before the confirmed divergence; successful recovery clears the marker.
+`arb-message-divergence.json` always blocks startup and still requires explicit `arb-reth rewind`.
+The node never deletes or forgives that marker automatically.
+
+An unclean shutdown can instead leave the durable database ahead of the last complete journal
+identity. When the exact suffix is inside the active unwind-safe history window, startup freezes the
+chain, parent-chain, deployment, journal, old-tip, resume, pruning, and changeset evidence in
+`arb-message-recovery.json`; heals only supported cross-store crash tails; unwinds to the journal
+identity; repairs the journal and resume sidecars in that order; and rederives the removed suffix
+from L1. The marker remains until the rederived old-frontier hash and state root match and the
+current durable database and journal frontiers are exactly equal. A crash during any phase resumes
+the same frozen transaction. Rederivation runs in a disposable internal worker; only after that
+process exits and releases every writable storage handle does the parent reopen MDBX, static files,
+and RocksDB for the final proof and normal node launch.
+
+Automatic recovery requires fsync, L1 derivation, and both configured L1 execution and beacon
+inputs. While its marker exists, do not use `--no-fsync`, `--no-l1-derive`, `--l1-start-block`,
+`--l1-start-delayed`, or `--l1-end-block`. The configured parent execution endpoint must retain the
+same chain ID and genesis hash. Feed and replay input, ordinary HTTP/WS RPC, and the MEV IPC socket
+remain unavailable until durable finalization. An out-of-window suffix, missing history, a deeper
+Reth consistency unwind, a missing/corrupt journal, or any identity mismatch remains quarantined
+and requires snapshot re-import or explicit operator diagnosis; startup never manufactures a
+journal anchor.
 
 Journal compaction only discards an L1-verified prefix. A feed-only node cannot compact its journal, so `--no-l1-derive` is intended for bounded replay/debug runs rather than unattended operation.
 

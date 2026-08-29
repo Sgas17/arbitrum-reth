@@ -2,7 +2,10 @@
 #![allow(missing_docs)]
 
 mod tests {
-    use arb_reth_engine::{ArbEngineDriver, ArbEngineInput, ArbEngineTuning};
+    use arb_reth_engine::{
+        ArbEngineDriver, ArbEngineInput, ArbEngineTuning, JournalDirectory, MessageJournalAnchor,
+        initialize_journal_v2,
+    };
     use arb_reth_evm::ArbEvmConfig;
 
     use std::sync::Arc;
@@ -16,6 +19,7 @@ mod tests {
     use reth_provider::providers::BlockchainProvider;
     use reth_provider::test_utils::create_test_provider_factory_with_node_types;
     use reth_provider::{BlockNumReader, HeaderProvider};
+    use reth_storage_api::StoragePath;
     use reth_tasks::Runtime;
 
     use arb_reth_node::ArbNode;
@@ -109,9 +113,26 @@ mod tests {
             header
         };
         let restart_factory = factory.clone();
+        let journal_datadir = factory
+            .provider()
+            .expect("provider for journal path")
+            .storage_path()
+            .parent()
+            .expect("database has datadir parent")
+            .to_path_buf();
+        let journal_directory =
+            JournalDirectory::open(&journal_datadir).expect("open pinned journal datadir");
+        initialize_journal_v2(
+            &journal_directory,
+            MessageJournalAnchor {
+                sequence: 0,
+                block_number: genesis_tip.number,
+                block_hash: genesis_tip.hash(),
+            },
+        )
+        .expect("initialize v2 journal at genesis");
         let provider = BlockchainProvider::new(factory.clone()).expect("BlockchainProvider::new");
         let canonical = provider.canonical_in_memory_state();
-        let l1_verified_tip = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut driver = ArbEngineDriver::<TestNodeTypes>::spawn(
             factory,
             provider,
@@ -123,9 +144,8 @@ mod tests {
             Runtime::test(),
             tuning,
             None,
-            false,
-            l1_verified_tip.clone(),
             None,
+            journal_directory.clone(),
         )
         .expect("spawn native payload driver");
 
@@ -186,30 +206,18 @@ mod tests {
         })
         .await
         .expect("overlap blocks must become durable");
-        let append_operations_before = driver.message_journal_append_operations();
-        let suffix = driver
+        let error = driver
             .reconcile_applied_l1_chunk(&l1_overlap, |_, _| {})
             .await
-            .expect("bulk overlap reconciliation");
+            .expect_err("Phase A rejects canonical L1 reconciliation");
         assert!(
-            suffix.is_empty(),
-            "the complete L1 chunk is applied overlap"
-        );
-        assert_eq!(
-            driver.message_journal_append_operations() - append_operations_before,
-            1,
-            "multiple durable promotions must share one journal append operation",
-        );
-        assert_eq!(
-            l1_verified_tip.load(std::sync::atomic::Ordering::Acquire),
-            3,
-            "the same append must durably publish every promoted overlap",
+            error
+                .downcast_ref::<arb_reth_engine::CanonicalL1PhaseUnavailable>()
+                .is_some(),
+            "Phase A must return the typed canonical-L1 closure error: {error:?}",
         );
 
         driver.shutdown().await.expect("shut down replay driver");
-        driver
-            .flush_durable_message_journal()
-            .expect("flush message journal through durable tip");
         drop(driver);
 
         let restart_tip = restart_factory
@@ -232,9 +240,8 @@ mod tests {
             Runtime::test(),
             ArbEngineTuning::reth_defaults(),
             None,
-            false,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
             None,
+            journal_directory,
         )
         .expect("journal watermark must match restart tip");
         restart_driver

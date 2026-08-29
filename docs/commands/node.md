@@ -2,13 +2,19 @@
 
 Runs the node, opens the database, derives L2 messages from L1, and optionally serves HTTP JSON-RPC.
 
+> **Phase-A closure:** this binary is a non-deployable storage/lifecycle test artifact. It always
+> reports `trading_permitted = false` and `phase_complete = false`. Exact DB/journal classification
+> does not authorize service; Phase B must add canonical-L1/recovery authority before a node may
+> launch normally.
+
 ## Inputs
 
 - `--datadir`: node database directory.
 - `--l1-rpc`: archive-capable L1 execution endpoint. Required for L1 derivation.
 - `--l1-beacon`: beacon API endpoint. Required when the selected range contains blob batches.
 - One boot mode:
-  - `--snapshot-head <blocks.stream>` for a datadir created by `snapshot import --blocks`.
+  - `--snapshot-head <blocks.stream> --snapshot-trust-descriptor <descriptor>` for the exact
+    allowlisted Robinhood full snapshot.
   - `--chain-info <chaininfo.json> --genesis <genesis.json>` for an Orbit chain booted from genesis.
   - `--chain <chain-config.json>` for a chain-config boot.
 
@@ -18,6 +24,7 @@ For a snapshot-seeded database:
 arb-reth node \
   --datadir /data/arb1 \
   --snapshot-head /data/head.stream \
+  --snapshot-trust-descriptor /tmp/robinhood-snapshot-trust-v1.json \
   --l1-rpc https://your-archive-rpc.example \
   --l1-beacon https://your-beacon-api.example \
   --http --http.port 8545
@@ -36,39 +43,34 @@ arb-reth node \
 
 ## L1 derivation
 
-`--l1-rpc` starts the catch-up loop. The node records L1-verified durable boundaries in `arb-l1-resume.json` under the datadir and resumes from that checkpoint by default.
+Phase A has no L1 checkpoint producer or reader and cannot establish an L1-verified frontier. If a
+later authorized phase starts derivation, it must rederive from batch 0 or use an explicit
+`--l1-start-block`/`--l1-start-delayed` pair. Existing `arb-l1-resume.json` final or temporary files
+reject Phase-A startup.
 
 When no chain, chain-info/genesis pair, or snapshot head supplies the chain specification,
 `--l1-rpc` also bootstraps genesis from the L1 Initialize message. That path requires an explicit
 `--datadir` so local divergence/recovery markers and stopped storage are classified before the
 parent endpoint is contacted.
 
-The node also maintains `arb-message-journal.ndjson` under the datadir. A pre-existing non-genesis database without this journal requires `--init-message-journal-at-tip` once, after independently validating its current tip. Remove the flag after that successful startup; repeated use is rejected. New genesis databases create the journal automatically.
+The only message authority is the v2 lineage named
+`arb-message-journal-v2-g00000000000000000000.log`, paired with the exact 8192-byte
+`arb-node-lifecycle-v1.bin`. The offline `arb-reth journal-v2-init` command creates both once from
+an exact configured genesis or the compile-time-allowlisted completed Robinhood snapshot. The node
+does not create either artifact and Clap rejects removed v1/trusted-tip bootstrap flags.
 
-`arb-message-divergence.json` always blocks startup and still requires explicit `arb-reth rewind`.
-The node never deletes or forgives that marker automatically.
+`arb-message-divergence.json` always blocks startup. Phase-A `rewind` is unavailable, and the node
+never deletes or forgives that marker automatically.
 
-An unclean shutdown can instead leave the durable database ahead of the last complete journal
-identity. When the exact suffix is inside the active unwind-safe history window, startup freezes the
-chain, parent-chain, deployment, journal, old-tip, resume, pruning, and changeset evidence in
-`arb-message-recovery.json`; heals only supported cross-store crash tails; unwinds to the journal
-identity; repairs the journal and resume sidecars in that order; and rederives the removed suffix
-from L1. The marker remains until the rederived old-frontier hash and state root match and the
-current durable database and journal frontiers are exactly equal. A crash during any phase resumes
-the same frozen transaction. Rederivation runs in a disposable internal worker; only after that
-process exits and releases every writable storage handle does the parent reopen MDBX, static files,
-and RocksDB for the final proof and normal node launch.
+An unclean lifecycle always freezes evidence before mutable storage opens. Exact `DB==J` remains
+closed. A supported exact `DB>J` suffix of at most 1024 identities may be unwound by a disposable
+worker to J, followed by worker exit and a fresh parent reopen, but the result also remains closed.
+`J>DB`, identity mismatch, unsupported storage/pruning, or larger distance requires a fresh
+snapshot or operator diagnosis. Phase A never rederives a repaired suffix or clears quarantine into
+ordinary service.
 
-Automatic recovery requires fsync, L1 derivation, and both configured L1 execution and beacon
-inputs. While its marker exists, do not use `--no-fsync`, `--no-l1-derive`, `--l1-start-block`,
-`--l1-start-delayed`, or `--l1-end-block`. The configured parent execution endpoint must retain the
-same chain ID and genesis hash. Feed and replay input, ordinary HTTP/WS RPC, and the MEV IPC socket
-remain unavailable until durable finalization. An out-of-window suffix, missing history, a deeper
-Reth consistency unwind, a missing/corrupt journal, or any identity mismatch remains quarantined
-and requires snapshot re-import or explicit operator diagnosis; startup never manufactures a
-journal anchor.
-
-Journal compaction only discards an L1-verified prefix. A feed-only node cannot compact its journal, so `--no-l1-derive` is intended for bounded replay/debug runs rather than unattended operation.
+Without canonical L1 authority, journal compaction preserves every identity. Admission permanently
+stops before 110,000 retained identities.
 
 Use `--l1-start-block` and `--l1-start-delayed` only when the supplied values describe the existing L2 tip. `--l1-end-block` caps derivation at an inclusive L1 height. `--l1-getlogs-range` should match the provider's `eth_getLogs` span limit. `--l1-prefetch` controls concurrent batch resolution.
 
@@ -166,7 +168,9 @@ run concurrent payload jobs without first reviewing Reth's cache and sparse-trie
 - `--persistence-threshold`: number of canonical blocks before a persistence batch.
 - `--memory-buffer-target`: recent blocks retained in memory before flushing.
 - `--persistence-backpressure`: maximum unpersisted gap before block production stalls.
-- `--no-fsync`: bulk-sync durability tradeoff. A crash can lose a recently produced suffix, which derivation can reproduce.
+
+There is no durability-bypass option. All supported journal and lifecycle transitions use the
+frozen synchronization protocol.
 
 Start with the defaults unless a benchmark or recovery plan justifies changing them.
 

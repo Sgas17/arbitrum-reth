@@ -2,6 +2,11 @@
 
 Robinhood Chain is an Orbit chain with chain ID `4663`, rooted on Ethereum mainnet. `arb-reth` boots it from Robinhood's `chaininfo.json` and genesis files, then derives batches from L1. It can follow the public sequencer feed while it catches up.
 
+> **Phase-A closure:** the current binary is a non-deployable storage/lifecycle test artifact. It
+> cannot launch normal service, derive canonical L1 authority, publish a verified tip, resume from a
+> checkpoint, or permit trading. The commands below describe inputs for later phases, not an
+> authorization to operate Phase A.
+
 This is an operator recipe for the current mainnet configuration. Keep credentials out of shell history, repository files, and process listings.
 
 ## Bootstrap files
@@ -37,9 +42,13 @@ export GENESIS="$HOME/rh/config/robinhood-genesis.json"
 
 The canonical RPC is `https://rpc.mainnet.chain.robinhood.com`. It is useful for parity checks, not for L1 derivation.
 
-## Start the node
+## Node inputs for a later authorized phase
 
-The command below creates the datadir when absent and resumes from its stored L1 checkpoint on later starts.
+Phase A neither creates a journal during node startup nor resumes from a stored L1 checkpoint. A
+datadir must first pass the exact allowlisted full-snapshot import and one-shot `journal-v2-init`
+flow documented in the [snapshot command](../commands/snapshot.md). Even then, Phase A classifies
+the v2 journal/lifecycle and remains closed rather than authorizing service. The command shape below
+is retained only to document non-authority tuning for the later phase that enables service.
 
 ```sh
 "$ARB_RETH/target/release/arb-reth" node \
@@ -70,34 +79,15 @@ The feed and L1 derivation may run together. The feed improves time at the tip, 
 
 ## Check progress
 
-The local RPC reports the produced tip:
-
-```sh
-curl -fsS \
-  -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
-  http://127.0.0.1:8547
-```
-
-At the tip, compare the local and canonical block hashes and state roots only at a height both endpoints serve. The feed can place the local node slightly ahead of the canonical RPC, which is not a divergence.
+Phase A exposes no service-ready state, so there is no operational sync progress or parity procedure.
+Only fixture/local-storage validation and the constant closed-state metrics are meaningful until a
+separately authorized phase implements canonical-L1 authority and service readiness.
 
 ## Recover from a confirmed divergence
 
-Stop the node before modifying the datadir. If `N` is the first divergent L2 block, retain `N - 1` and re-derive the suffix after fixing the state-transition bug:
-
-```sh
-"$ARB_RETH/target/release/arb-reth" rewind \
-  --datadir "$DATADIR" \
-  --chain-info "$CHAIN_INFO" \
-  --genesis "$GENESIS" \
-  --diverged-at N
-```
-
-Run the same `node` command again afterwards. Start with `rewind --dry-run` when the target has not been independently verified.
-
-Normally the node resumes from `arb-l1-resume.json`. If a rewind leaves no usable checkpoint and
-reports an L1 boundary, pass that boundary with `--l1-start-block`. The node recovers the matching
-delayed-message cursor from the durable L2 tip header. `--l1-start-delayed` is only needed to
-override that value during manual recovery.
+Phase A has no manual divergence rewind, `arb-l1-resume.json` producer/reader, or repaired-suffix
+rederivation. Stop and use a fresh approved snapshot or operator diagnosis. An explicit
+`--l1-start-block`/`--l1-start-delayed` pair is only an in-memory derivation start; it cannot create
+canonical authority or bypass Phase-A closure.
 
 See the [node command](../commands/node.md), [observability guide](../observability/README.md), and [rewind command](../commands/rewind.md) for option details.

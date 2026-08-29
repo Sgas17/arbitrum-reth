@@ -26,8 +26,10 @@ alloy-evm = "0.38"
 alloy-genesis = { version = "2", default-features = false }
 alloy-trie = { version = "0.9", default-features = false }
 eyre = "0.6.12"
+libc = "=0.2.189"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = "=0.10.9"
 
 # reth node types + storage surface
 reth-node-types = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }

@@ -7,7 +7,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use alloy_primitives::{U256, address};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use jsonrpsee::core::client::ClientT as _;
-use reth_chainspec::MAINNET;
+use reth_chainspec::{EthChainSpec as _, MAINNET};
 use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
 use reth_tasks::Runtime;
 
@@ -36,9 +36,6 @@ async fn rpc_serves_eth_queries() {
     m1.sequence_number = 1;
     let mut m2 = feed_msg.clone();
     m2.sequence_number = 2;
-    tx.send(ArbEngineInput::feed(m1, None)).await.unwrap();
-    tx.send(ArbEngineInput::feed(m2, None)).await.unwrap();
-    drop(tx);
 
     let datadir = reth_db::test_utils::tempdir_path();
     let db = reth_db::test_utils::create_test_rw_db_with_datadir(&datadir);
@@ -57,17 +54,31 @@ async fn rpc_serves_eth_queries() {
 
     let node_builder_with_components = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
+    let journal_directory = arb_reth_engine::JournalDirectory::open(
+        data_dir.db().parent().expect("datadir owns db directory"),
+    )
+    .expect("open pinned test datadir");
+    arb_reth_engine::initialize_journal_v2(
+        &journal_directory,
+        arb_reth_engine::MessageJournalAnchor {
+            sequence: 0,
+            block_number: 0,
+            block_hash: MAINNET.genesis_hash(),
+        },
+    )
+    .expect("initialize v2 test journal");
+
     let rpc_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
     let tx_log_stream = ArbTxLogBroadcaster::new();
     let mut tx_events = tx_log_stream.subscribe();
     let launcher = ArbLauncher {
+        journal_directory,
         ctx: reth_node_builder::LaunchContext::new(task_executor.clone(), data_dir),
+        terminal_signal: arb_reth_node::launcher::TerminalSignalObserver::for_test_runtime(),
         chain_id: arb_reth_node::ARB_ONE_CHAIN_ID,
         genesis_block: 0,
         tuning: arb_reth_node::ArbEngineTuning::reth_defaults(),
         prune_config: None,
-        init_message_journal_at_tip: false,
-        l1_verified_tip: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         feed_messages: feed_rx,
         l1_messages: l1_rx,
         feed_latency: None,
@@ -77,18 +88,30 @@ async fn rpc_serves_eth_queries() {
         recovery: None,
     };
 
-    let handle = launcher
+    let mut handle = launcher
         .launch_node(node_builder_with_components)
         .await
         .expect("launch must succeed");
 
-    let rpc_handle = handle.rpc_handle.expect("RPC server should be running");
+    let rpc_handle = handle
+        .rpc_handle
+        .take()
+        .expect("RPC server should be running");
     let http_url = rpc_handle.http_url().expect("HTTP URL must be present");
 
     let client = jsonrpsee::http_client::HttpClientBuilder::default()
         .build(&http_url)
         .expect("build http client");
 
+    let hot_path = arb_reth_engine::AuthorityHotPathGuard::activate();
+    assert!(
+        std::panic::catch_unwind(|| {
+            arb_reth_engine::assert_authority_operation_allowed("tripwire-self-test")
+        })
+        .is_err(),
+        "authority hot-path tripwire did not reject a prohibited operation"
+    );
+    tx.send(ArbEngineInput::feed(m1, None)).await.unwrap();
     // The custom frontier method sees the exact state directly after the first deposit, before
     // that provisional block has a root or the second feed message has become canonical.
     let first_deposit = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -101,6 +124,9 @@ async fn rpc_serves_eth_queries() {
     })
     .await
     .expect("first deposit frontier");
+    drop(hot_path);
+    tx.send(ArbEngineInput::feed(m2, None)).await.unwrap();
+    drop(tx);
     let simulation: serde_json::Value = client
         .request(
             "arb_simulateAtFrontier",
@@ -227,4 +253,11 @@ async fn rpc_serves_eth_queries() {
     );
 
     drop(rpc_handle);
+    unsafe extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    // This RPC-only fixture uses an Ethereum parent header that cannot satisfy Arbitrum terminal
+    // persistence. After all RPC assertions, match the process boundary of that fail-closed state
+    // instead of relying on engine/journal destructors to authorize shutdown.
+    unsafe { _exit(0) }
 }

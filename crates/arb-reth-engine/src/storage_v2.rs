@@ -106,6 +106,7 @@ pub(crate) fn spawn_persistence<N>(
     factory: ProviderFactory<N>,
     pruner: PrunerWithFactory<ProviderFactory<N>>,
     sync_metrics_tx: MetricEventsSender,
+    journal: crate::message_journal::PersistenceObserver,
 ) -> (PersistenceHandle<ArbPrimitives>, PersistenceProxyGuard)
 where
     N: ProviderNodeTypes<Primitives = ArbPrimitives>,
@@ -128,6 +129,13 @@ where
         while let Ok(action) = receiver.recv() {
             match action {
                 PersistenceAction::SaveBlocks(input, response) => {
+                    let persisted = input
+                        .persist_rest_blocks()
+                        .iter()
+                        .map(|block: &ExecutedBlock<ArbPrimitives>| {
+                            block.recovered_block().num_hash()
+                        })
+                        .collect::<Vec<_>>();
                     let input =
                         match prepare_storage_v2_batch(&factory, input, &mut preimages, &frontiers)
                         {
@@ -138,6 +146,9 @@ where
                                     %err,
                                     "failed to prepare Storage V2 persistence batch",
                                 );
+                                journal.failed(format!(
+                                    "failed to prepare Storage V2 persistence batch: {err}"
+                                ));
                                 // Dropping the response sender makes the engine tree surface the
                                 // failure instead of persisting an unwind-unsafe batch.
                                 break;
@@ -146,27 +157,42 @@ where
 
                     let (delegate_tx, delegate_rx) = crossbeam_channel::bounded(1);
                     if delegate.save_blocks(input, delegate_tx).is_err() {
+                        journal.failed("Reth persistence service rejected SaveBlocks");
                         break;
                     }
                     let Ok(result) = delegate_rx.recv() else {
+                        journal.failed("Reth persistence SaveBlocks response was dropped");
                         break;
                     };
                     frontiers.update(&result);
-                    let _ = response.send(result);
+                    if !persisted.is_empty() {
+                        journal.saved(&persisted, result.last_block);
+                    }
+                    if response.send(result).is_err() {
+                        journal.failed("engine dropped the successful SaveBlocks response");
+                        break;
+                    }
                 }
                 PersistenceAction::RemoveBlocksAbove(block, response) => {
                     let (delegate_tx, delegate_rx) = crossbeam_channel::bounded(1);
                     if delegate.remove_blocks_above(block, delegate_tx).is_err() {
+                        journal.failed("Reth persistence service rejected RemoveBlocksAbove");
                         break;
                     }
                     let Ok(result) = delegate_rx.recv() else {
+                        journal.failed("Reth persistence RemoveBlocksAbove response was dropped");
                         break;
                     };
                     frontiers.update(&result);
-                    let _ = response.send(result);
+                    journal.removed(result.last_block);
+                    if response.send(result).is_err() {
+                        journal.failed("engine dropped the successful RemoveBlocksAbove response");
+                        break;
+                    }
                 }
                 action => {
                     if delegate.send_action(action).is_err() {
+                        journal.failed("Reth persistence service rejected an action");
                         break;
                     }
                 }
@@ -1115,8 +1141,12 @@ mod tests {
         let pruner =
             Pruner::new_with_factory(factory.clone(), vec![], 5, 0, None, finished_exex_height_rx);
         let (metrics_tx, _metrics_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (persistence, persistence_guard) =
-            spawn_persistence(factory.clone(), pruner, metrics_tx);
+        let (persistence, persistence_guard) = spawn_persistence(
+            factory.clone(),
+            pruner,
+            metrics_tx,
+            crate::message_journal::test_persistence_observer(),
+        );
 
         let address = address!("0000000000000000000000000000000000001234");
         let slot_a = U256::from(0x42);
@@ -1382,8 +1412,12 @@ mod tests {
         let pruner =
             Pruner::new_with_factory(factory.clone(), vec![], 5, 0, None, finished_exex_height_rx);
         let (metrics_tx, _metrics_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (persistence, persistence_guard) =
-            spawn_persistence(factory.clone(), pruner, metrics_tx);
+        let (persistence, persistence_guard) = spawn_persistence(
+            factory.clone(),
+            pruner,
+            metrics_tx,
+            crate::message_journal::test_persistence_observer(),
+        );
 
         let (response_tx, response_rx) = crossbeam_channel::bounded(1);
         persistence.save_blocks(

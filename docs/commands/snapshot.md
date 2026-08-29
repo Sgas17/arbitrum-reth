@@ -1,73 +1,46 @@
 # `arb-reth snapshot`
 
-Snapshot tools convert an Arbitrum One Nitro snapshot into a Storage V2 reth datadir and inspect its hashed state.
-
-The required inputs depend on the ArbOS version encoded in the snapshot-head header:
-
-- The canonical Nitro-genesis snapshot predates ArbOS 20 and requires the Classic Export preimage workflow below.
-- ArbOS 20 and newer snapshots can be imported directly from the Nitro state and block streams. Legacy destructive storage wipes are no longer possible, so inherited snapshot slots do not need plaintext preimages for forward sync.
-- Other pre-ArbOS 20 snapshots are rejected for now. Supporting one safely requires a complete plaintext slot-preimage set for that exact snapshot.
+Snapshot tools convert streams into a Storage V2 reth datadir and inspect hashed state. In Phase A,
+only one exact compile-time-allowlisted Robinhood full snapshot may produce authority-completion
+evidence. Older state-only/Nitro-genesis conversion tools do not write Phase-A completion and cannot
+be used to initialize or launch a Phase-A datadir.
 
 ## Import workflow
 
-The Nitro-genesis conversion needs both official source snapshots:
-
-- The [Arbitrum One Classic Export](https://snapshot-explorer.arbitrum.io/?chain=Arbitrum+One&dir=Classic+Export) provides plaintext storage-slot keys.
-- The [Nitro genesis Pebble snapshot](https://snapshot.arbitrum.io/arb1/nitro-genesis-pebble-path.tar) provides the canonical hashed state and head header.
-
-Start with a new output directory. The commands below intentionally use the same `--out` path.
-
-### Nitro genesis: build slot preimages
-
-Extract the Classic Export, then point `--classic-state` at the directory containing its `index.json` file:
+The approved import requires all four exact external inputs: full snapshot stream, Robinhood
+`chaininfo.json`, Robinhood `genesis.json`, and the descriptor whose exact bytes are allowlisted in
+the binary. The target must be fresh. Import streams forward once, authenticates exact length and
+SHA-256 while consuming it, validates the reopened head/hash/state root, and only then writes the
+288-byte `arb-snapshot-completion-v1.bin` record.
 
 ```sh
-arb-reth snapshot build-preimages \
-  --classic-state /data/classic-export/state/<block> \
-  --out /data/arb1
+arb-reth snapshot import-full \
+  --stream /data/robinhood-full-snapshot.stream \
+  --out /data/robinhood \
+  --chain-info /data/robinhood-chaininfo.json \
+  --genesis /data/robinhood-genesis.json \
+  --snapshot-trust-descriptor /tmp/robinhood-snapshot-trust-v1.json
 ```
 
-This creates a validated preimage store and completion manifest under `/data/arb1/db/preimage`.
+Interrupted or failed import targets are not resumable. Discard the target and start from a fresh
+directory. The detached `snapshot finalize` path is disabled and cannot manufacture completion.
 
-### Export state and the snapshot head
-
-Build the `reth-export` helper from `crates/arb-reth-genesis/go-exporter`, using a Nitro checkout so it links against Nitro's geth fork. Run it against the extracted Nitro genesis database:
+After successful import, stop all writers and run the one-shot combined v2 journal/lifecycle
+initializer against the same exact inputs:
 
 ```sh
-reth-export --mode state /data/nitro/l2chaindata > /data/genesis-state.stream
-reth-export --mode blocks /data/nitro/l2chaindata > /data/head-block.stream
+arb-reth journal-v2-init \
+  --datadir /data/robinhood \
+  --chain-info /data/robinhood-chaininfo.json \
+  --genesis /data/robinhood-genesis.json \
+  --snapshot-trust-descriptor /tmp/robinhood-snapshot-trust-v1.json
 ```
 
-The default blocks range is the database head, which is the record required by the importer and later by `node --snapshot-head`.
+The command exclusively creates lineage 0 and the exact lifecycle A/B file. Any pre-existing journal
+or lifecycle artifact refuses the whole command; interrupted combined initialization requires a
+fresh target/snapshot rather than resume, replacement, migration, or trusted-tip fallback.
 
-### Import and verify
-
-```sh
-arb-reth snapshot import \
-  --state /data/genesis-state.stream \
-  --blocks /data/head-block.stream \
-  --out /data/arb1 \
-  --expect 0x7f2bfc4481d02bfcfc606ebb949384ef78d03a0f30a2dc9cccd652eb80926ae1
-```
-
-- `--state` is the Nitro state stream to import.
-- `--blocks` is required. It supplies the canonical snapshot-head header and stage checkpoints.
-- `--expect` is required. The importer verifies the computed root and snapshot identity.
-- `--out` must be fresh except for the preimage sidecar created for a Nitro-genesis import.
-
-If an import fails after creating database files, discard the entire output directory and restart from step 1. The importer refuses to continue in a partially written target.
-
-A successful import writes `snapshot-import.json` only after the state root, snapshot head, launch check, and static-file layout all pass. The node refuses to boot a new-format snapshot datadir without this completion manifest.
-
-Use `/data/head-block.stream` with `node --snapshot-head` when starting the converted datadir. On its first start, also pass `--init-message-journal-at-tip` to anchor the new message journal at the import-validated tip, then remove that one-shot flag.
-
-## Storage V2 preimages
-
-The Nitro state stream contains hashed storage keys, but Storage V2 changesets use plain slot keys. Before ArbOS 20, those plain keys are required to record reversible storage wipes. The canonical Classic Export supplies the complete set for Nitro genesis.
-
-Keep `db/preimage`, including its manifest, with a Nitro-genesis datadir permanently. Include it when moving or backing up the database. It is not temporary conversion data. The node adds newly observed slot preimages while syncing, while the Classic Export supplies the historical set present at genesis.
-
-An ArbOS 20 or newer snapshot does not need this sidecar. The importer still verifies that the supplied state root and snapshot-head header agree before creating the database.
+Phase A remains `trading_permitted = false` and `phase_complete = false` after successful setup.
 
 ## Read
 

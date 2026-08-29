@@ -180,6 +180,13 @@ impl<R: Read> SnapshotStream<R> {
         &self.manifest
     }
 
+    /// Return the underlying reader after the caller has consumed the stream.
+    ///
+    /// Importers use this to consume and authenticate any bytes buffered after the end marker.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
     /// Hand a record back, so the next [`Self::next_record`] returns it again.
     ///
     /// Sections are only delimited by the record that follows them, so a per-section reader has to

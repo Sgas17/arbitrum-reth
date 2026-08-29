@@ -6,18 +6,8 @@
 //! derived blocks execute through the same path the driver uses. It follows the L1 head
 //! once caught up.
 //!
-//! ## Resuming
-//!
-//! `start_block` / `start_delayed_count` are the L1 block and `delayedMessagesRead` the resume
-//! point was built from, and `start_l2_block` is the L2 block that point sits after. As the runtime
-//! consumes each L1 window it records an [`L1ResumeCheckpoint`](crate::resume), once the window's
-//! blocks are durable, so a later restart resumes from the last checkpoint instead of Nitro
-//! genesis. On a resume whose checkpoint predates the durable tip (persistence outran the last
-//! written checkpoint), the first re-derived blocks reproduce ones already on disk. They are
-//! numbered absolutely from `start_l2_block` and forwarded to the driver so its durable message
-//! journal can verify the overlap rather than assuming database presence implies L1 agreement. The
-//! very first sync of a genesis snapshot has no checkpoint yet, so the caller supplies the genesis
-//! start point.
+//! Phase A deliberately has no resume-checkpoint producer. Callers provide a genesis or explicit
+//! start point; already-persisted overlap is forwarded to the engine's v2 authority comparison.
 //!
 //! ## ArbOS version across upgrades
 //!
@@ -29,12 +19,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -47,8 +32,6 @@ use arb_reth_l1::{BeaconClient, DelayedInboxReader, DeliveredBatch, SequencerInb
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
-
-use crate::resume::{L1ResumeCheckpoint, L1ResumeLog};
 
 const RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -98,7 +81,7 @@ impl L1SyncError {
         }
     }
 
-    /// Whether restarting from the latest durable checkpoint is safe and useful.
+    /// Whether restarting the current in-memory derivation attempt is safe and useful.
     pub const fn is_retryable(&self) -> bool {
         matches!(self, Self::Provider { .. })
     }
@@ -181,16 +164,16 @@ pub struct L1SyncConfig {
     pub sequencer_inbox: Address,
     /// `Bridge` contract address (delayed-inbox metadata source).
     pub bridge: Address,
-    /// First L1 block to derive from (the resume point's batch boundary).
+    /// First L1 block to derive from (the configured batch boundary).
     pub start_block: u64,
     /// Last L1 block to derive (inclusive). `None` follows the head indefinitely.
     pub end_block: Option<u64>,
     /// Delayed cursor before `start_block` (the L2 tip's `delayedMessagesRead`).
     pub start_delayed_count: u64,
-    /// Absolute L2 block number that `start_block` resumes *after*: the block preceding the first
+    /// Absolute L2 block number that `start_block` begins *after*: the block preceding the first
     /// message derived from `start_block`. Derived messages are numbered `start_l2_block + 1, +2,
-    /// …` so already-present blocks can be recognized and skipped. For a genesis start this is the
-    /// Nitro genesis block; for a checkpoint resume it is the checkpoint's `l2_block`.
+    /// …` so already-present blocks can be recognized and checked. This is either the Nitro genesis
+    /// block or the durable tip paired with an explicit operator start override.
     pub start_l2_block: u64,
     /// Current durable L2 tip captured for progress/restart bookkeeping. Re-derived messages at or
     /// below it are still forwarded so the engine journal can verify persisted feed history.
@@ -200,14 +183,6 @@ pub struct L1SyncConfig {
     /// sequence-reconciliation expects. Absolute block numbers only equal the index when this is 0
     /// (the testnode), so it MUST be set for a chain whose genesis is not block 0.
     pub genesis_block: u64,
-    /// Where to persist the [`L1ResumeCheckpoint`] as sync advances (`None` disables checkpointing).
-    pub checkpoint_path: Option<PathBuf>,
-    /// The production recovery readiness state. Checkpoints remain queued while false so the
-    /// marker-frozen resume artifact cannot race final reopened-storage validation.
-    pub checkpoint_writes_ready: Arc<AtomicBool>,
-    /// Highest L2 block whose L1 authority the engine has fsynced to its message journal.
-    /// Checkpoints may never advance beyond this frontier even when the feed persisted farther.
-    pub l1_verified_tip: Arc<AtomicU64>,
     /// L1 blocks per `derive_range` call (bounds `getLogs` range per request).
     pub batch_window: u64,
     /// Backward-scan window for delayed-message coverage.
@@ -224,7 +199,7 @@ pub struct L1SyncConfig {
 
 impl L1SyncConfig {
     /// Mainnet defaults: Arbitrum One `SequencerInbox`/`Bridge`, 1k-block windows, 8
-    /// confirmations, 12s polling. `l1_rpc` and the resume point must still be set.
+    /// confirmations, 12s polling. `l1_rpc` and the derivation start must still be set.
     pub fn mainnet(l1_rpc: String, start_block: u64, start_delayed_count: u64) -> Self {
         Self {
             l1_rpc,
@@ -237,9 +212,6 @@ impl L1SyncConfig {
             start_l2_block: 0,
             db_tip_l2: 0,
             genesis_block: 0,
-            checkpoint_path: None,
-            checkpoint_writes_ready: Arc::new(AtomicBool::new(true)),
-            l1_verified_tip: Arc::new(AtomicU64::new(0)),
             batch_window: 1_000,
             delayed_window: DEFAULT_DELAYED_WINDOW,
             confirmations: 8,
@@ -252,40 +224,25 @@ impl L1SyncConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SyncProgress {
     persisted_l2: u64,
-    checkpoint_l1: u64,
-    checkpoint_l2: u64,
+    start_l1: u64,
+    start_l2: u64,
 }
 
 fn progress(cfg: &L1SyncConfig, persisted_l2: u64) -> SyncProgress {
-    let checkpoint = cfg
-        .checkpoint_path
-        .as_deref()
-        .and_then(L1ResumeLog::load)
-        .and_then(|log| log.resume_for(persisted_l2));
     SyncProgress {
         persisted_l2,
-        checkpoint_l1: checkpoint.map_or(cfg.start_block, |cp| cp.l1_block),
-        checkpoint_l2: checkpoint.map_or(cfg.start_l2_block, |cp| cp.l2_block),
+        start_l1: cfg.start_block,
+        start_l2: cfg.start_l2_block,
     }
 }
 
-/// Build the next attempt from the newest checkpoint that is safe for the current durable DB tip.
+/// Build the next attempt from the immutable configured start and current durable DB tip.
 ///
-/// Re-derivation between that checkpoint and `persisted_l2` is required: `run_l1_sync` numbers the
+/// Re-derivation between that start and `persisted_l2` is required: `run_l1_sync` numbers the
 /// messages absolutely and the driver compares them with its persisted message journal.
-fn resume_config(base: &L1SyncConfig, persisted_l2: u64) -> L1SyncConfig {
+fn retry_config(base: &L1SyncConfig, persisted_l2: u64) -> L1SyncConfig {
     let mut next = base.clone();
     next.db_tip_l2 = persisted_l2;
-    if let Some(cp) = base
-        .checkpoint_path
-        .as_deref()
-        .and_then(L1ResumeLog::load)
-        .and_then(|log| log.resume_for(persisted_l2))
-    {
-        next.start_block = cp.l1_block;
-        next.start_delayed_count = cp.delayed_count;
-        next.start_l2_block = cp.l2_block;
-    }
     next
 }
 
@@ -341,8 +298,9 @@ where
 
 /// Supervise L1 derivation for the lifetime of the node.
 ///
-/// Retryable execution RPC and beacon failures restart from the latest durable checkpoint with
-/// unlimited exponential backoff. Deterministic decode/derivation errors are returned immediately.
+/// Retryable execution RPC and beacon failures restart from the configured derivation start with
+/// the latest durable overlap frontier and unlimited exponential backoff. Deterministic
+/// decode/derivation errors are returned immediately.
 /// Only one `run_l1_sync` attempt exists at a time, and `shutdown` cancels both active work and
 /// backoff waits.
 pub async fn supervise_l1_sync<F, S>(
@@ -385,13 +343,13 @@ where
     loop {
         let attempt_start = progress(&base_cfg, persisted_tip());
         let cfg = if first_attempt {
-            // Preserve the caller-selected initial resume point, especially an explicit
-            // --l1-start-block override. Checkpoints take over only after that attempt fails.
+            // Preserve the caller-selected start, especially an explicit --l1-start-block
+            // override. Retries use this same immutable start; no resume artifact is produced.
             let mut cfg = base_cfg.clone();
             cfg.db_tip_l2 = attempt_start.persisted_l2;
             cfg
         } else {
-            resume_config(&base_cfg, attempt_start.persisted_l2)
+            retry_config(&base_cfg, attempt_start.persisted_l2)
         };
         first_attempt = false;
         let result = tokio::select! {
@@ -418,7 +376,7 @@ where
                     },
                     retry_ms = delay.as_millis() as u64,
                     made_progress,
-                    "transient L1 provider failure; restarting from durable checkpoint",
+                    "transient L1 provider failure; restarting from configured derivation start",
                 );
                 if !retry_delay_or_shutdown(delay, shutdown.as_mut()).await {
                     return Ok(());
@@ -433,8 +391,8 @@ where
 /// `None`). Returns when the range is exhausted or the channel closes.
 ///
 /// `persisted_tip` reports the current durable L2 tip (the persisted DB head, NOT the in-memory
-/// canonical head); it gates checkpoint writes so a resume point is only recorded once its blocks
-/// are on disk. It is polled once per consumed window, so it must be cheap.
+/// canonical head) for overlap and retry progress. Phase A records no resume artifact. It is polled
+/// once per consumed window, so it must be cheap.
 pub async fn run_l1_sync<F>(
     cfg: L1SyncConfig,
     feed_tx: Sender<BroadcastFeedMessage>,
@@ -471,21 +429,11 @@ where
     let mut spawn_cursor = cfg.start_block;
     let mut safe_head: u64 = 0;
 
-    // Absolute L2 numbering + resume bookkeeping. `next_l2` is the block number the next derived
-    // message produces. Persisted overlap is deliberately forwarded for journal verification.
+    // Absolute L2 numbering + configured-start overlap bookkeeping. `next_l2` is the block number
+    // the next derived message produces. Persisted overlap is deliberately forwarded for journal
+    // verification.
     let mut next_l2 = cfg.start_l2_block + 1;
     let genesis_block = cfg.genesis_block;
-    // Window boundaries awaiting durability before they can be appended to the resume log.
-    // Ascending in both `l1_block` and `l2_block`; drained front-to-back as `persisted_tip` rises.
-    let mut pending_ckpt: VecDeque<L1ResumeCheckpoint> = VecDeque::new();
-    // The persisted resume log, seeded from the existing file so `record`'s history survives across
-    // restarts (and the rewind tool can find an old-enough boundary).
-    let mut resume_log = cfg
-        .checkpoint_path
-        .as_deref()
-        .and_then(L1ResumeLog::load)
-        .unwrap_or_default();
-
     // In-flight `resolve_batches` tasks, kept in ascending window order (FIFO). Each is
     // independent of the delayed cursor, so up to `prefetch` run concurrently, overlapping
     // their `getLogs`/blob RPC latency; we consume them in order and run the delayed tail.
@@ -508,7 +456,7 @@ where
 
     // A ready empty window: an L1 range known (via the batchCount gate below) to contain no batches,
     // so it needs no `getLogs`/payload fetch. It flows through the same consume path as a real empty
-    // window (advances the cursor + checkpoints), collapsing barren stretches into one step.
+    // window (advances the cursor + in-memory progress), collapsing barren stretches into one step.
     let spawn_empty = || {
         tokio::spawn(async {
             Ok::<Vec<(DeliveredBatch, Vec<u8>)>, arb_reth_l1::L1Error>(Vec::new())
@@ -664,79 +612,11 @@ where
         delayed = derived.next_delayed_count;
         consume_cursor = to + 1;
 
-        // Queue this window boundary and flush any whose L2 blocks are now durable. Appending only
-        // persisted boundaries keeps the log recoverable: after a crash the DB tip is always at or
-        // beyond the last-logged `l2_block`.
-        if cfg.checkpoint_path.is_some() {
-            pending_ckpt.push_back(L1ResumeCheckpoint {
-                l1_block: consume_cursor,
-                delayed_count: delayed,
-                l2_block: next_l2 - 1,
-            });
-            maybe_write_checkpoint_if_ready(
-                &cfg.checkpoint_writes_ready,
-                cfg.checkpoint_path.as_deref(),
-                &mut resume_log,
-                &mut pending_ckpt,
-                persisted_tip(),
-                cfg.l1_verified_tip.load(Ordering::Acquire),
-            );
-        }
+        let _ = persisted_tip();
     }
 
     tracing::info!(target: "arb-reth::l1-sync", final_block = consume_cursor.saturating_sub(1), "L1 sync reached end block");
     Ok(())
-}
-
-fn maybe_write_checkpoint_if_ready(
-    ready: &AtomicBool,
-    path: Option<&std::path::Path>,
-    log: &mut L1ResumeLog,
-    pending: &mut VecDeque<L1ResumeCheckpoint>,
-    persisted: u64,
-    l1_verified: u64,
-) {
-    if ready.load(Ordering::Acquire) {
-        maybe_write_checkpoint(path, log, pending, persisted, l1_verified);
-    }
-}
-
-/// Append every durable window boundary to the resume log and rewrite it.
-///
-/// Moves each queued boundary with `l2_block <= persisted` (they are ascending) into the in-memory
-/// log, then rewrites the whole (bounded) log once. A save failure is logged, not fatal: the
-/// boundaries stay in the in-memory log, so the next window's save re-persists them, with no
-/// re-queue (which would double-record).
-fn maybe_write_checkpoint(
-    path: Option<&std::path::Path>,
-    log: &mut L1ResumeLog,
-    pending: &mut VecDeque<L1ResumeCheckpoint>,
-    persisted: u64,
-    l1_verified: u64,
-) {
-    let Some(path) = path else { return };
-    let checkpointable = persisted.min(l1_verified);
-    let mut newest: Option<L1ResumeCheckpoint> = None;
-    while pending
-        .front()
-        .is_some_and(|cp| cp.l2_block <= checkpointable)
-    {
-        let cp = pending.pop_front().unwrap();
-        log.record(cp);
-        newest = Some(cp);
-    }
-    let Some(newest) = newest else { return };
-    match log.save(path) {
-        Ok(()) => tracing::debug!(
-            target: "arb-reth::l1-sync",
-            l1_block = newest.l1_block, delayed = newest.delayed_count, l2_block = newest.l2_block,
-            "wrote L1 resume checkpoint",
-        ),
-        Err(e) => tracing::warn!(
-            target: "arb-reth::l1-sync", err = %e,
-            "failed to write L1 resume log; will retry on the next window",
-        ),
-    }
 }
 
 #[cfg(test)]
@@ -750,20 +630,12 @@ mod tests {
     };
     use std::thread;
 
-    fn cp(l1_block: u64, l2_block: u64) -> L1ResumeCheckpoint {
-        L1ResumeCheckpoint {
-            l1_block,
-            delayed_count: 0,
-            l2_block,
-        }
-    }
-
     /// Covers the variants that reach the caller directly rather than through `L1SyncError::l1`,
     /// which `only_provider_errors_are_retryable_and_their_details_are_redacted` already exercises.
     ///
     /// The node now stops on any non-retryable failure instead of parking, so this predicate is
-    /// what decides between "restart from the last checkpoint" and "give up". Widening it would
-    /// turn a terminal failure back into an endless retry against a tip that can never advance.
+    /// what decides between "retry from the configured start" and "give up". Widening it would turn
+    /// a terminal failure back into an endless retry against a tip that can never advance.
     #[test]
     fn url_and_prefetch_failures_are_terminal() {
         assert!(L1SyncError::provider("read batches").is_retryable());
@@ -889,84 +761,6 @@ mod tests {
         cfg
     }
 
-    /// The gate only appends boundaries whose L2 blocks are durable, always advances the log's
-    /// newest entry to the FURTHEST such boundary, and leaves not-yet-persisted boundaries queued.
-    #[test]
-    fn checkpoint_gate_appends_durable_boundaries() {
-        let dir = reth_db::test_utils::tempdir_path();
-        let path = L1ResumeLog::path_in(&dir);
-        let mut log = L1ResumeLog::default();
-        let mut pending: VecDeque<L1ResumeCheckpoint> = [cp(100, 10), cp(200, 20), cp(300, 30)]
-            .into_iter()
-            .collect();
-
-        // Nothing persisted past block 5 → no boundary is safe to append yet.
-        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 5, 5);
-        assert_eq!(L1ResumeLog::load(&path), None);
-        assert_eq!(pending.len(), 3, "no boundary consumed");
-
-        // Persistence at 20 cannot release block 20 while L1 verification is only at 10.
-        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 20, 10);
-        let loaded = L1ResumeLog::load(&path).expect("log written");
-        assert_eq!(loaded.resume_for(u64::MAX), Some(cp(100, 10)));
-        assert_eq!(pending.len(), 2, "unverified boundaries stay queued");
-
-        // Once verification reaches 20, its boundary becomes checkpointable; 30 stays queued.
-        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 20, 20);
-        let loaded = L1ResumeLog::load(&path).expect("log rewritten");
-        assert_eq!(loaded.resume_for(u64::MAX), Some(cp(200, 20)));
-        assert_eq!(loaded.checkpoints, vec![cp(100, 10), cp(200, 20)]);
-        assert_eq!(pending, [cp(300, 30)].into_iter().collect::<VecDeque<_>>());
-
-        // Durable tip past 30 → final boundary flushes.
-        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 99, 99);
-        assert_eq!(
-            L1ResumeLog::load(&path).unwrap().resume_for(u64::MAX),
-            Some(cp(300, 30))
-        );
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn recovery_readiness_blocks_checkpoint_rewrite_without_consuming_boundaries() {
-        let dir = reth_db::test_utils::tempdir_path();
-        let path = L1ResumeLog::path_in(&dir);
-        let ready = AtomicBool::new(false);
-        let mut log = L1ResumeLog::default();
-        let mut pending = [cp(100, 10)].into_iter().collect::<VecDeque<_>>();
-
-        maybe_write_checkpoint_if_ready(&ready, Some(&path), &mut log, &mut pending, 10, 10);
-        assert_eq!(L1ResumeLog::load(&path), None);
-        assert_eq!(pending, [cp(100, 10)].into_iter().collect::<VecDeque<_>>());
-
-        ready.store(true, Ordering::Release);
-        maybe_write_checkpoint_if_ready(&ready, Some(&path), &mut log, &mut pending, 10, 10);
-        assert_eq!(L1ResumeLog::load(&path).unwrap().checkpoints, [cp(100, 10)]);
-        assert!(pending.is_empty());
-    }
-
-    /// An empty window (no new blocks) still advances `l1_block` at the same `l2_block`, so resume
-    /// skips barren L1 ranges instead of re-scanning them.
-    #[test]
-    fn checkpoint_gate_advances_l1_over_empty_windows() {
-        let dir = reth_db::test_utils::tempdir_path();
-        let path = L1ResumeLog::path_in(&dir);
-        let mut log = L1ResumeLog::default();
-        // Two windows produced block 10; the next two windows held no batches (l2 stays 10).
-        let mut pending: VecDeque<L1ResumeCheckpoint> = [cp(100, 10), cp(200, 10), cp(300, 10)]
-            .into_iter()
-            .collect();
-
-        maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 10, 10);
-        let loaded = L1ResumeLog::load(&path).expect("log written");
-        assert_eq!(
-            loaded.checkpoints,
-            vec![cp(300, 10)],
-            "l1_block advances past empty ranges while l2_block is unchanged",
-        );
-        assert!(pending.is_empty());
-    }
-
     #[test]
     fn retry_backoff_resets_after_progress_and_caps() {
         let mut backoff = RetryBackoff::new(Duration::from_millis(100), Duration::from_millis(500));
@@ -1012,36 +806,6 @@ mod tests {
                 .to_string()
                 .contains("missing SequencerBatchData event")
         );
-    }
-
-    #[test]
-    fn restart_uses_durable_checkpoint_and_redelivers_prefix_for_verification() {
-        let dir = reth_db::test_utils::tempdir_path();
-        let path = L1ResumeLog::path_in(&dir);
-        let checkpoint = L1ResumeCheckpoint {
-            l1_block: 200,
-            delayed_count: 7,
-            l2_block: 11,
-        };
-        let mut log = L1ResumeLog::default();
-        log.record(checkpoint);
-        log.save(&path).unwrap();
-
-        let mut base = L1SyncConfig::mainnet("http://127.0.0.1:1".into(), 100, 0);
-        base.start_l2_block = 10;
-        base.db_tip_l2 = 10;
-        base.checkpoint_path = Some(path);
-
-        let restarted = resume_config(&base, 12);
-        assert_eq!(restarted.start_block, 200);
-        assert_eq!(restarted.start_delayed_count, 7);
-        assert_eq!(restarted.start_l2_block, 11);
-        assert_eq!(restarted.db_tip_l2, 12);
-
-        // Block 12 is deliberately re-delivered so the engine can compare it with its durable
-        // journal before accepting block 13 as new history.
-        let delivered: Vec<u64> = (restarted.start_l2_block + 1..=13).collect();
-        assert_eq!(delivered, vec![12, 13]);
     }
 
     #[tokio::test]

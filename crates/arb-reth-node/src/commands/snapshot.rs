@@ -88,8 +88,9 @@ use reth_trie_db::{
 // Boot-wiring: write head header + checkpoints so ProviderFactory opens at the block.
 use alloy_consensus::Header;
 use alloy_rlp::Decodable;
-use arb_reth_engine::{DIVERGENCE_MARKER_FILE, MESSAGE_JOURNAL_FILE};
-use arb_reth_sync::resume::RESUME_FILE_NAME;
+use arb_reth_engine::{
+    DIVERGENCE_MARKER_FILE, LIFECYCLE_FILE, MESSAGE_JOURNAL_PREFIX, MESSAGE_JOURNAL_V1_FILE,
+};
 use arb_revm::ArbSpecId;
 
 use crate::recovery::RECOVERY_MARKER_FILE;
@@ -137,17 +138,7 @@ type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;
 
 /// Number of preimages sorted and inserted in one auxiliary MDBX transaction.
 const PREIMAGE_BATCH_SIZE: usize = 250_000;
-
-pub(crate) const SNAPSHOT_IMPORT_MANIFEST_FILE: &str = "snapshot-import.json";
-const SNAPSHOT_IMPORT_MANIFEST_VERSION: u64 = 1;
-
-#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
-struct SnapshotImportManifest {
-    version: u64,
-    block_number: u64,
-    block_hash: B256,
-    state_root: B256,
-}
+const RESUME_FILE_NAME: &str = "arb-l1-resume.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SnapshotPreimagePolicy {
@@ -522,8 +513,6 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     for path in [&db_path, &static_files_path, &rocksdb_path] {
         sync_directory(path)?;
     }
-    write_snapshot_import_manifest(&args.out, &head)?;
-
     Ok(())
 }
 
@@ -560,82 +549,22 @@ fn validate_snapshot_identity(
     Ok(SnapshotPreimagePolicy::CanonicalGenesisRequired)
 }
 
-pub(crate) fn write_snapshot_import_manifest(
-    out: &Path,
-    head: &(u64, B256, Header),
-) -> eyre::Result<()> {
-    let manifest = SnapshotImportManifest {
-        version: SNAPSHOT_IMPORT_MANIFEST_VERSION,
-        block_number: head.0,
-        block_hash: head.1,
-        state_root: head.2.state_root,
-    };
-    validate_snapshot_import_manifest(manifest, head)?;
-
-    let path = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    serde_json::to_writer_pretty(&mut file, &manifest)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    sync_directory(out)?;
-    Ok(())
-}
-
-fn validate_snapshot_import_manifest(
-    manifest: SnapshotImportManifest,
-    head: &(u64, B256, Header),
-) -> eyre::Result<()> {
-    if manifest.version != SNAPSHOT_IMPORT_MANIFEST_VERSION {
-        eyre::bail!(
-            "unsupported snapshot import manifest version {}, expected {SNAPSHOT_IMPORT_MANIFEST_VERSION}",
-            manifest.version,
-        );
-    }
-    if manifest.block_number != head.0
-        || manifest.block_hash != head.1
-        || manifest.state_root != head.2.state_root
-    {
-        eyre::bail!("snapshot import manifest does not match the supplied head stream");
-    }
-    if head.2.number != head.0 || head.2.hash_slow() != head.1 {
-        eyre::bail!("snapshot head stream contains an invalid number or block hash");
-    }
-    Ok(())
-}
-
 /// Refuse to launch a new-format snapshot datadir unless its import completed successfully.
 pub(crate) fn validate_snapshot_import_for_launch(
-    out: &Path,
+    directory: &arb_reth_engine::JournalDirectory,
     head: &(u64, B256, Header),
+    trust_descriptor: &Path,
 ) -> eyre::Result<()> {
-    let preimage_path = out.join("db/preimage");
-    let import_manifest_path = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
-    if !import_manifest_path.is_file() && !preimage_path.join(MANIFEST_FILE).is_file() {
-        // Older imports predate completion manifests. Preserve their existing launch behavior.
-        return Ok(());
-    }
-
-    let manifest: SnapshotImportManifest =
-        serde_json::from_reader(File::open(&import_manifest_path).map_err(|error| {
-            eyre::eyre!(
-                "snapshot import is incomplete: missing completion manifest at {}: {error}",
-                import_manifest_path.display()
-            )
-        })?)?;
-    validate_snapshot_import_manifest(manifest, head)?;
-
-    let preimage_policy = validate_snapshot_identity(head.2.state_root, head)?;
-    if preimage_policy.requires_preimages() {
-        if !preimage_path.join("mdbx.dat").is_file() {
-            eyre::bail!(
-                "snapshot slot-preimage database is missing at {}",
-                preimage_path.display()
-            );
-        }
-        read_preimage_manifest(&preimage_path)?;
+    let trust = crate::snapshot_trust::load_approved_descriptor(trust_descriptor)?;
+    let completion = crate::snapshot_trust::read_completion(directory)?;
+    if completion != trust
+        || head.0 != trust.head_number
+        || head.1 != trust.head_hash
+        || head.2.state_root != trust.head_state_root
+        || head.2.number != head.0
+        || head.2.hash_slow() != head.1
+    {
+        eyre::bail!("snapshot launch identity does not match frozen completion evidence");
     }
     Ok(())
 }
@@ -657,12 +586,19 @@ pub(crate) fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if [
-                MESSAGE_JOURNAL_FILE,
+                MESSAGE_JOURNAL_V1_FILE,
                 DIVERGENCE_MARKER_FILE,
                 RECOVERY_MARKER_FILE,
             ]
             .iter()
             .any(|prefix| name == *prefix || name.starts_with(&format!("{prefix}.")))
+                || name.starts_with(MESSAGE_JOURNAL_PREFIX)
+                || name == LIFECYCLE_FILE
+                || name.starts_with(&format!("{LIFECYCLE_FILE}."))
+                || name == "snapshot-import.json"
+                || name.starts_with("snapshot-import.json.")
+                || name == crate::snapshot_trust::SNAPSHOT_COMPLETION_FILE
+                || name.starts_with("arb-snapshot-completion-v1.bin.")
             {
                 eyre::bail!(
                     "snapshot import requires a fresh target; stale message authority metadata exists at {}",
@@ -672,13 +608,6 @@ pub(crate) fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
         }
     }
 
-    let import_manifest = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
-    if import_manifest.exists() {
-        eyre::bail!(
-            "snapshot import requires a fresh target; completion manifest already exists at {}",
-            import_manifest.display()
-        );
-    }
     let db_path = out.join("db");
     if db_path.exists() {
         for entry in std::fs::read_dir(&db_path)? {
@@ -1682,10 +1611,10 @@ mod tests {
         std::fs::remove_file(resume_tmp_path)?;
 
         for artifact in [
-            MESSAGE_JOURNAL_FILE.to_string(),
-            format!("{MESSAGE_JOURNAL_FILE}.truncate.tmp"),
-            format!("{MESSAGE_JOURNAL_FILE}.compact.tmp"),
-            format!("{MESSAGE_JOURNAL_FILE}.recovery.tmp"),
+            MESSAGE_JOURNAL_V1_FILE.to_string(),
+            format!("{MESSAGE_JOURNAL_PREFIX}0.bin"),
+            format!("{MESSAGE_JOURNAL_PREFIX}0.bin.compact.tmp"),
+            format!("{MESSAGE_JOURNAL_PREFIX}0.bin.recovery.tmp"),
             DIVERGENCE_MARKER_FILE.to_string(),
             RECOVERY_MARKER_FILE.to_string(),
             format!("{RECOVERY_MARKER_FILE}.tmp"),
@@ -1721,7 +1650,7 @@ mod tests {
     fn snapshot_import_entry_points_reject_authority_before_opening_inputs() -> eyre::Result<()> {
         let ordinary = tempfile::tempdir()?;
         std::fs::write(
-            ordinary.path().join(MESSAGE_JOURNAL_FILE),
+            ordinary.path().join(MESSAGE_JOURNAL_V1_FILE),
             b"stale authority",
         )?;
         let ordinary_args = SnapshotImportArgs::try_parse_from([
@@ -1756,6 +1685,8 @@ mod tests {
             "missing-chaininfo.json",
             "--genesis",
             "missing-genesis.json",
+            "--snapshot-trust-descriptor",
+            "missing-snapshot-trust.json",
         ])?;
         let error = super::super::snapshot_full::import_full(full_args).unwrap_err();
         assert!(
@@ -1891,43 +1822,6 @@ mod tests {
             validate_snapshot_identity(post_arbos_twenty.2.state_root, &post_arbos_twenty).unwrap(),
             SnapshotPreimagePolicy::NotRequired
         );
-    }
-
-    #[test]
-    fn new_snapshot_format_requires_a_matching_completion_manifest() -> eyre::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let preimage_path = temp.path().join("db/preimage");
-        std::fs::create_dir_all(&preimage_path)?;
-        drop(SlotPreimages::open(&preimage_path)?);
-        write_preimage_manifest(&preimage_path, canonical_test_manifest())?;
-        let head = canonical_test_head();
-
-        let error = validate_snapshot_import_for_launch(temp.path(), &head).unwrap_err();
-        assert!(error.to_string().contains("snapshot import is incomplete"));
-
-        write_snapshot_import_manifest(temp.path(), &head)?;
-        validate_snapshot_import_for_launch(temp.path(), &head)?;
-
-        let mut altered_header = head.2.clone();
-        altered_header.timestamp += 1;
-        let altered = (head.0, altered_header.hash_slow(), altered_header);
-        assert!(validate_snapshot_import_for_launch(temp.path(), &altered).is_err());
-
-        let post_temp = tempfile::tempdir()?;
-        let mut post_header = Header {
-            number: 500_000_000,
-            state_root: b256!("2222222222222222222222222222222222222222222222222222222222222222"),
-            ..Default::default()
-        };
-        ArbHeaderInfo {
-            arbos_format_version: 20,
-            ..Default::default()
-        }
-        .update_header(&mut post_header);
-        let post_head = (post_header.number, post_header.hash_slow(), post_header);
-        write_snapshot_import_manifest(post_temp.path(), &post_head)?;
-        validate_snapshot_import_for_launch(post_temp.path(), &post_head)?;
-        Ok(())
     }
 
     #[test]

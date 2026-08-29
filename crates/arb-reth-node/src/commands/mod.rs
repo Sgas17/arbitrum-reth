@@ -4,6 +4,7 @@
 
 pub mod dump_blocks;
 pub mod genesis;
+pub mod journal_init;
 pub mod node;
 pub mod rewind;
 pub mod snapshot;

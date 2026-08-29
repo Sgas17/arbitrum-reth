@@ -13,7 +13,7 @@ use core::{future::Future, pin::Pin};
 use std::net::SocketAddr;
 
 use crate::{
-    metrics::{FeedLatencyTracker, IngressMetrics},
+    metrics::{FeedLatencyTracker, IngressMetrics, register_phase_a_metrics},
     recovery::{RecoveryGate, RecoveryRuntime},
 };
 use alloy_consensus::Header;
@@ -54,6 +54,139 @@ use arb_reth_engine::{
 };
 
 const MAX_MESSAGE_BATCH: usize = 64;
+pub(crate) const TERMINAL_PREPARE_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+#[derive(Clone, Copy)]
+enum CapturedTerminalDeadline {
+    Ready(tokio::time::Instant),
+    Overflow,
+}
+
+struct TerminalSignalState {
+    captured: std::sync::Mutex<Option<CapturedTerminalDeadline>>,
+    first_signal: tokio::sync::watch::Sender<bool>,
+    allow_unowned_shutdown: bool,
+}
+
+/// Sole writer for the executable's first graceful process signal.
+pub struct TerminalSignalOwner {
+    state: std::sync::Arc<TerminalSignalState>,
+}
+
+/// Read-only first-signal deadline shared with the engine-driver shutdown boundary.
+#[derive(Clone)]
+pub struct TerminalSignalObserver {
+    state: std::sync::Arc<TerminalSignalState>,
+}
+
+/// Create the production first-signal owner and its read-only observer.
+pub fn terminal_signal_channel() -> (TerminalSignalOwner, TerminalSignalObserver) {
+    let (first_signal, _) = tokio::sync::watch::channel(false);
+    let state = std::sync::Arc::new(TerminalSignalState {
+        captured: std::sync::Mutex::new(None),
+        first_signal,
+        allow_unowned_shutdown: false,
+    });
+    (
+        TerminalSignalOwner {
+            state: state.clone(),
+        },
+        TerminalSignalObserver { state },
+    )
+}
+
+impl TerminalSignalOwner {
+    /// Capture exactly the first signal instant. Later signals cannot replace its deadline.
+    pub fn capture_first(&self) -> bool {
+        self.capture_first_with(tokio::time::Instant::now, TERMINAL_PREPARE_DEADLINE)
+    }
+
+    #[cfg(test)]
+    fn capture_first_with_duration(
+        &self,
+        signal_at: tokio::time::Instant,
+        duration: std::time::Duration,
+    ) -> bool {
+        self.capture_first_with(|| signal_at, duration)
+    }
+
+    fn capture_first_with(
+        &self,
+        signal_at: impl FnOnce() -> tokio::time::Instant,
+        duration: std::time::Duration,
+    ) -> bool {
+        let mut captured = self
+            .state
+            .captured
+            .lock()
+            .expect("terminal signal state lock poisoned");
+        if captured.is_some() {
+            return false;
+        }
+        let signal_at = signal_at();
+        *captured = Some(match signal_at.checked_add(duration) {
+            Some(deadline) => CapturedTerminalDeadline::Ready(deadline),
+            None => CapturedTerminalDeadline::Overflow,
+        });
+        self.state.first_signal.send_replace(true);
+        true
+    }
+}
+
+impl TerminalSignalObserver {
+    fn with_open_intake<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let captured = self
+            .state
+            .captured
+            .lock()
+            .expect("terminal signal state lock poisoned");
+        captured.is_none().then(action)
+    }
+
+    async fn wait_for_first_signal(&self) {
+        let mut first_signal = self.state.first_signal.subscribe();
+        while !*first_signal.borrow_and_update() {
+            first_signal
+                .changed()
+                .await
+                .expect("terminal signal owner state remains live");
+        }
+    }
+
+    fn deadline_after_runtime_shutdown(&self) -> eyre::Result<tokio::time::Instant> {
+        match *self
+            .state
+            .captured
+            .lock()
+            .expect("terminal signal state lock poisoned")
+        {
+            Some(CapturedTerminalDeadline::Ready(deadline)) => Ok(deadline),
+            Some(CapturedTerminalDeadline::Overflow) => {
+                Err(eyre!("terminal preparation deadline overflow"))
+            }
+            None if self.state.allow_unowned_shutdown => tokio::time::Instant::now()
+                .checked_add(TERMINAL_PREPARE_DEADLINE)
+                .ok_or_else(|| eyre!("test terminal preparation deadline overflow")),
+            None => Err(eyre!(
+                "runtime shutdown was not authorized by the executable signal owner"
+            )),
+        }
+    }
+
+    /// Direct launcher tests do not install the process executable's signal boundary.
+    #[doc(hidden)]
+    pub fn for_test_runtime() -> Self {
+        let (first_signal, _) = tokio::sync::watch::channel(false);
+        Self {
+            state: std::sync::Arc::new(TerminalSignalState {
+                captured: std::sync::Mutex::new(None),
+                first_signal,
+                allow_unowned_shutdown: true,
+            }),
+        }
+    }
+}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -147,9 +280,6 @@ impl DriverTestControl {
         let control = Self::pause_after_input(sequence);
         control
             .selected_batch_pauses
-            .store(2, std::sync::atomic::Ordering::Relaxed);
-        control
-            .closure_pauses
             .store(1, std::sync::atomic::Ordering::Relaxed);
         control
     }
@@ -187,16 +317,6 @@ impl DriverTestControl {
         control
     }
 
-    fn pause_next_sampler_capture(&self) {
-        self.sampler_capture_pauses
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn pause_next_post_batch_frontier(&self) {
-        self.post_batch_frontier_pauses
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
     async fn pause_if_requested(&self, sequence: u64) {
         if self.pause_after_input_sequence == Some(sequence) {
             self.input_paused.notify_one();
@@ -217,16 +337,6 @@ impl DriverTestControl {
             self.selected_batch_paused.notify_one();
             self.resume_selected_batch.notified().await;
         }
-    }
-
-    fn pause_next_selected_batch(&self) {
-        self.selected_batch_pauses
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn pause_next_wait_for_head(&self) {
-        self.wait_for_head_pauses
-            .store(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn pause_before_wait_for_head_if_requested(&self) {
@@ -337,6 +447,13 @@ struct SchedulerReceivePause {
     resume: tokio::sync::Notify,
 }
 
+struct TerminalOutcome {
+    result: eyre::Result<()>,
+    deadline: tokio::time::Instant,
+}
+
+type ServiceShutdownResult = Result<(), String>;
+
 /// Handle returned by `ArbLauncher` after the node has been launched.
 ///
 /// Generic over the provider type `P` so the concrete `BlockchainProvider<...>` type flows
@@ -344,7 +461,9 @@ struct SchedulerReceivePause {
 pub struct ArbNodeHandle<P> {
     /// The blockchain provider: cloneable and queryable.
     pub provider: P,
-    exit_rx: oneshot::Receiver<eyre::Result<()>>,
+    terminal_rx: oneshot::Receiver<tokio::time::Instant>,
+    services_stopped_tx: Option<oneshot::Sender<ServiceShutdownResult>>,
+    exit_rx: oneshot::Receiver<TerminalOutcome>,
     /// Running RPC server handle. Dropping this shuts down the HTTP server.
     pub rpc_handle: Option<RpcServerHandle>,
     /// Source-independent ingress metrics shared with live-feed followers.
@@ -358,7 +477,65 @@ pub struct ArbNodeHandle<P> {
 impl<P> ArbNodeHandle<P> {
     /// Wait for the driver task to exit, returning its result.
     pub async fn wait_for_node_exit(self) -> eyre::Result<()> {
-        self.exit_rx.await?
+        self.wait_for_node_exit_after_services(async { Ok(()) })
+            .await
+            .map(drop)
+    }
+
+    pub(crate) async fn wait_for_node_exit_after_services<F>(
+        mut self,
+        stop_services: F,
+    ) -> eyre::Result<tokio::time::Instant>
+    where
+        F: Future<Output = eyre::Result<()>>,
+    {
+        let deadline = self
+            .terminal_rx
+            .await
+            .wrap_err("engine driver dropped before terminal service coordination")?;
+        // Explicitly stop accepting user RPC before joining producers or asking the engine to
+        // persist. Reth's public wrapper exposes stop (but no separate join); any stop failure is
+        // terminal and therefore cannot acknowledge the persistence/CLEAN sequence.
+        let rpc_result = self
+            .rpc_handle
+            .take()
+            .map(RpcServerHandle::stop)
+            .transpose()
+            .map_err(|error| eyre!("failed to stop user RPC before terminal persistence: {error}"));
+        let service_result = if let Err(error) = rpc_result {
+            Err(error)
+        } else if tokio::time::Instant::now() >= deadline {
+            Err(eyre!(
+                "terminal deadline expired before Feed/L1/MEV tasks could stop"
+            ))
+        } else {
+            tokio::time::timeout_at(deadline, stop_services)
+                .await
+                .map_err(|_| eyre!("terminal deadline expired waiting for Feed/L1/MEV tasks"))?
+        };
+        let acknowledgement = service_result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let acknowledgement_result = self
+            .services_stopped_tx
+            .take()
+            .expect("terminal service acknowledgement exists")
+            .send(acknowledgement)
+            .map_err(|_| eyre!("engine driver dropped before service acknowledgement"));
+        service_result?;
+        acknowledgement_result?;
+
+        let outcome = tokio::time::timeout_at(deadline, self.exit_rx)
+            .await
+            .map_err(|_| eyre!("terminal deadline expired waiting for engine driver"))?
+            .wrap_err("engine driver dropped before reporting terminal outcome")?;
+        ensure!(
+            outcome.deadline == deadline,
+            "engine driver changed the terminal deadline"
+        );
+        outcome.result?;
+        Ok(deadline)
     }
 
     /// Returns the HTTP URL of the running RPC server, or `None` if RPC was not enabled.
@@ -376,6 +553,8 @@ impl<P> ArbNodeHandle<P> {
 pub struct ArbLauncher {
     /// Base launch context: task executor + data directory.
     pub ctx: LaunchContext,
+    /// Immutable deadline captured by the executable at the first graceful process signal.
+    pub terminal_signal: TerminalSignalObserver,
     /// Arbitrum chain id (42161 = mainnet, 421614 = Sepolia).
     pub chain_id: u64,
     /// L2 genesis block number (`GenesisBlockNum`): message index 0 is the init/genesis block, so a
@@ -384,14 +563,12 @@ pub struct ArbLauncher {
     pub genesis_block: u64,
     /// Engine-tree persistence tuning (batch/buffer/backpressure knobs).
     pub tuning: ArbEngineTuning,
+    /// One pinned datadir descriptor shared by lifecycle and journal authority operations.
+    pub journal_directory: arb_reth_engine::JournalDirectory,
     /// Optional history-pruning configuration from `--prune.*` / `--full`. `None` keeps the node
     /// an archive node. A configured mode is applied to both the provider factory and the
     /// engine-tree persistence pruner so static-file writes follow the same segment policy.
     pub prune_config: Option<reth_config::PruneConfig>,
-    /// One-shot operator acknowledgement that a pre-journal durable tip is a trusted anchor.
-    pub init_message_journal_at_tip: bool,
-    /// Highest block whose L1 authority is durable in the message journal.
-    pub l1_verified_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Live-feed and replay messages. These may be ahead of the local canonical cursor when the
     /// relay's bounded backlog begins after the database tip.
     pub feed_messages: tokio::sync::mpsc::Receiver<ArbEngineInput>,
@@ -432,10 +609,16 @@ enum DriverAction<G> {
     Batch(Option<SelectedBatch>),
 }
 
+enum BatchDisposition {
+    Completed,
+    RecoveryComplete,
+}
+
 /// Deterministic, work-conserving bounded-fair arbitration over the two bounded driver channels.
 struct IngressScheduler {
     feed_messages: tokio::sync::mpsc::Receiver<ArbEngineInput>,
     l1_messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    terminal_signal: TerminalSignalObserver,
     feed_pending: Option<ArbEngineInput>,
     l1_pending: Option<ArbEngineInput>,
     feed_open: bool,
@@ -453,12 +636,14 @@ impl IngressScheduler {
     fn new(
         feed_messages: tokio::sync::mpsc::Receiver<ArbEngineInput>,
         l1_messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+        terminal_signal: TerminalSignalObserver,
         metrics: IngressMetrics,
         feed_latency: Option<FeedLatencyTracker>,
     ) -> Self {
         let scheduler = Self {
             feed_messages,
             l1_messages,
+            terminal_signal,
             feed_pending: None,
             l1_pending: None,
             feed_open: true,
@@ -606,7 +791,8 @@ impl IngressScheduler {
 
     async fn next_batch(&mut self, next_sequence: u64) -> Option<SelectedBatch> {
         loop {
-            let _observed_closure = self.try_fill_heads();
+            let terminal_signal = self.terminal_signal.clone();
+            let _observed_closure = terminal_signal.with_open_intake(|| self.try_fill_heads())?;
             #[cfg(test)]
             if _observed_closure && let Some(control) = self.test_control.as_ref() {
                 control.pause_closure_if_requested().await;
@@ -620,65 +806,72 @@ impl IngressScheduler {
                 continue;
             }
 
-            let gap_closer = matches!(
-                (&self.feed_pending, &self.l1_pending),
-                (Some(feed), Some(l1))
-                    if l1.sequence_number() == next_sequence
-                        && feed.sequence_number() > next_sequence
-            );
-            let source = if gap_closer {
-                ArbEngineInputSource::L1
-            } else {
-                match (self.feed_pending.is_some(), self.l1_pending.is_some()) {
-                    (true, true) => self.owed,
-                    (true, false) => ArbEngineInputSource::Feed,
-                    (false, true) => ArbEngineInputSource::L1,
-                    (false, false) => unreachable!(),
-                }
-            };
-            let kind = if gap_closer {
-                BatchKind::GapCloser
-            } else {
-                BatchKind::Ordinary
-            };
-            let first = match source {
-                ArbEngineInputSource::Feed => self.feed_pending.take().unwrap(),
-                ArbEngineInputSource::L1 => self.l1_pending.take().unwrap(),
-            };
-            let mut inputs = Vec::with_capacity(MAX_MESSAGE_BATCH);
-            inputs.push(first);
+            // Selection and first-signal capture share one short, synchronous mutex boundary.
+            // Whichever acquires it first defines whether this batch was selected before
+            // `t_signal`; capture cannot interleave with head removal or same-source draining.
+            let terminal_signal = self.terminal_signal.clone();
+            let selected = terminal_signal.with_open_intake(|| {
+                let gap_closer = matches!(
+                    (&self.feed_pending, &self.l1_pending),
+                    (Some(feed), Some(l1))
+                        if l1.sequence_number() == next_sequence
+                            && feed.sequence_number() > next_sequence
+                );
+                let source = if gap_closer {
+                    ArbEngineInputSource::L1
+                } else {
+                    match (self.feed_pending.is_some(), self.l1_pending.is_some()) {
+                        (true, true) => self.owed,
+                        (true, false) => ArbEngineInputSource::Feed,
+                        (false, true) => ArbEngineInputSource::L1,
+                        (false, false) => unreachable!(),
+                    }
+                };
+                let kind = if gap_closer {
+                    BatchKind::GapCloser
+                } else {
+                    BatchKind::Ordinary
+                };
+                let first = match source {
+                    ArbEngineInputSource::Feed => self.feed_pending.take().unwrap(),
+                    ArbEngineInputSource::L1 => self.l1_pending.take().unwrap(),
+                };
+                let mut inputs = Vec::with_capacity(MAX_MESSAGE_BATCH);
+                inputs.push(first);
 
-            if kind == BatchKind::Ordinary {
-                while inputs.len() < MAX_MESSAGE_BATCH {
-                    let next = match source {
-                        ArbEngineInputSource::Feed => self.feed_messages.try_recv(),
-                        ArbEngineInputSource::L1 => {
-                            self.l1_messages.try_recv().map(ArbEngineInput::l1)
-                        }
-                    };
-                    match next {
-                        Ok(input) => {
-                            self.record_dequeue(&input);
-                            inputs.push(input);
-                        }
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                            match source {
-                                ArbEngineInputSource::Feed => self.feed_open = false,
-                                ArbEngineInputSource::L1 => self.l1_open = false,
+                if kind == BatchKind::Ordinary {
+                    while inputs.len() < MAX_MESSAGE_BATCH {
+                        let next = match source {
+                            ArbEngineInputSource::Feed => self.feed_messages.try_recv(),
+                            ArbEngineInputSource::L1 => {
+                                self.l1_messages.try_recv().map(ArbEngineInput::l1)
                             }
-                            self.publish_queue_depths();
-                            break;
+                        };
+                        match next {
+                            Ok(input) => {
+                                self.record_dequeue(&input);
+                                inputs.push(input);
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                match source {
+                                    ArbEngineInputSource::Feed => self.feed_open = false,
+                                    ArbEngineInputSource::L1 => self.l1_open = false,
+                                }
+                                self.publish_queue_depths();
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            self.publish_queue_depths();
-            return Some(SelectedBatch {
-                source,
-                inputs,
-                kind,
+                self.publish_queue_depths();
+                SelectedBatch {
+                    source,
+                    inputs,
+                    kind,
+                }
             });
+            return selected;
         }
     }
 
@@ -722,7 +915,6 @@ fn record_applied_executed_tip(metrics: &IngressMetrics, genesis_block: u64, seq
 
 async fn run_frontier_sampler<E, R>(
     metrics: IngressMetrics,
-    verified_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
     initial_durable_tip: u64,
     cancel: oneshot::Receiver<()>,
     mut read_durable_tip: R,
@@ -748,7 +940,6 @@ async fn run_frontier_sampler<E, R>(
             _ = &mut cancel => break,
             _ = interval.tick() => {
                 let durable_read = read_durable_tip();
-                let verified = verified_tip.load(std::sync::atomic::Ordering::Acquire);
                 let captured_executed = metrics.executed_tip();
                 #[cfg(test)]
                 if let Some(control) = test_control.as_ref() {
@@ -757,7 +948,6 @@ async fn run_frontier_sampler<E, R>(
                 match metrics.refresh_frontiers(
                     &mut durable_tip,
                     durable_read,
-                    verified,
                     captured_executed,
                 ) {
                     Ok(()) => {
@@ -765,7 +955,9 @@ async fn run_frontier_sampler<E, R>(
                     }
                     Err(error) => {
                         consecutive_read_failures = consecutive_read_failures.saturating_add(1);
-                        if consecutive_read_failures == 1 || consecutive_read_failures % 60 == 0 {
+                        if consecutive_read_failures == 1
+                            || consecutive_read_failures.is_multiple_of(60)
+                        {
                             tracing::warn!(
                                 target: "arb-reth::metrics",
                                 %error,
@@ -877,12 +1069,12 @@ impl ArbLauncher {
     {
         let Self {
             ctx,
+            terminal_signal,
             chain_id,
             genesis_block,
             tuning,
+            journal_directory,
             prune_config,
-            init_message_journal_at_tip,
-            l1_verified_tip,
             feed_messages,
             l1_messages,
             feed_latency,
@@ -947,6 +1139,7 @@ impl ArbLauncher {
         // Install reth's Prometheus recorder before any feed metric handles are initialized, and
         // serve it when `--metrics <addr>` is configured.
         let ctx = ctx.with_prometheus_server().await?;
+        register_phase_a_metrics();
         recovery_gate.register_metric();
         let ingress_metrics = IngressMetrics::new();
 
@@ -993,6 +1186,7 @@ impl ArbLauncher {
                     .unwrap_or_default(),
             );
         let task_executor: TaskExecutor = ctx.task_executor().clone();
+        let driver_failure_runtime = task_executor.clone();
         let head = ctx.head();
 
         // Clone the in-memory state from the provider so the tree updates the same instance that
@@ -1002,6 +1196,28 @@ impl ArbLauncher {
         let genesis_tip: SealedHeader<Header> =
             HeaderProvider::sealed_header(&provider, head.number)?
                 .ok_or_else(|| eyre!("missing head header at block {}", head.number))?;
+
+        #[cfg(test)]
+        {
+            let has_journal = journal_directory
+                .entry_names()?
+                .iter()
+                .any(|name| name.starts_with(arb_reth_engine::MESSAGE_JOURNAL_PREFIX));
+            if !has_journal {
+                let sequence = genesis_tip
+                    .number
+                    .checked_sub(genesis_block)
+                    .ok_or_else(|| eyre!("test head precedes configured genesis"))?;
+                arb_reth_engine::initialize_journal_v2(
+                    &journal_directory,
+                    arb_reth_engine::MessageJournalAnchor {
+                        sequence,
+                        block_number: genesis_tip.number,
+                        block_hash: genesis_tip.hash(),
+                    },
+                )?;
+            }
+        }
 
         // `arb_evm_config` (hoisted from the RPC block below): also drives the engine tree.
         let arb_evm_config: arb_reth_evm::ArbEvmConfig =
@@ -1023,9 +1239,8 @@ impl ArbLauncher {
             task_executor.clone(),
             tuning,
             prune_config.map(reth_prune::PrunerBuilder::new),
-            init_message_journal_at_tip,
-            l1_verified_tip.clone(),
             tx_log_stream,
+            journal_directory,
         )?;
         #[cfg(test)]
         let engine_lifecycle_probe = driver.lifecycle_probe();
@@ -1033,18 +1248,12 @@ impl ArbLauncher {
 
         let initial_executed_tip = driver.as_ref().expect("driver initialized").tip().number;
         let initial_durable_tip = provider.last_block_number()?;
-        let initial_verified_tip = l1_verified_tip.load(std::sync::atomic::Ordering::Acquire);
-        ingress_metrics.initialize_frontiers(
-            initial_executed_tip,
-            initial_durable_tip,
-            initial_verified_tip,
-        );
+        ingress_metrics.initialize_frontiers(initial_executed_tip, initial_durable_tip);
 
         let (sampler_cancel_tx, sampler_cancel_rx) = oneshot::channel::<()>();
         let (sampler_done_tx, sampler_done_rx) = oneshot::channel::<()>();
         let sampler_provider = provider.clone();
         let sampler_metrics = ingress_metrics.clone();
-        let sampler_verified_tip = l1_verified_tip.clone();
         #[cfg(test)]
         let sampler_test_control = driver_test_control.clone();
         #[cfg(test)]
@@ -1052,7 +1261,6 @@ impl ArbLauncher {
         task_executor.spawn_task(async move {
             run_frontier_sampler(
                 sampler_metrics,
-                sampler_verified_tip,
                 initial_durable_tip,
                 sampler_cancel_rx,
                 || {
@@ -1074,10 +1282,14 @@ impl ArbLauncher {
             let _ = sampler_done_tx.send(());
         });
 
-        let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
+        let (terminal_tx, terminal_rx) = oneshot::channel::<tokio::time::Instant>();
+        let (services_stopped_tx, services_stopped_rx) =
+            oneshot::channel::<ServiceShutdownResult>();
+        let (exit_tx, exit_rx) = oneshot::channel::<TerminalOutcome>();
         let mut scheduler = IngressScheduler::new(
             feed_messages,
             l1_messages,
+            terminal_signal.clone(),
             ingress_metrics.clone(),
             feed_latency.clone(),
         );
@@ -1098,8 +1310,9 @@ impl ArbLauncher {
             |shutdown| async move {
             let mut shutdown = Box::pin(shutdown);
             let mut shutdown_guard = None;
+            let mut terminal_deadline = None;
             let recovery = recovery;
-            let res: eyre::Result<()> = async {
+            let mut res: eyre::Result<()> = async {
                 // Bench accounting: separate time spent WAITING for the next derived feed
                 // message (L1-fetch-bound) from time spent in advance() (compute/persist-bound).
                 // Emitted every 1000 blocks at target "arb-reth::bench"; harmless at info off.
@@ -1109,25 +1322,43 @@ impl ArbLauncher {
                 let mut bench_wall = std::time::Instant::now();
                 loop {
                     let __r = std::time::Instant::now();
-                    let selected = match next_driver_action(
-                        shutdown.as_mut(),
-                        &mut scheduler,
-                        driver
-                            .as_ref()
-                            .expect("driver exists while selecting work")
-                            .next_sequence(),
-                    )
-                    .await
-                    {
-                        DriverAction::Shutdown(guard) => {
-                            shutdown_guard = Some(guard);
+                    let first_signal = terminal_signal.wait_for_first_signal();
+                    tokio::pin!(first_signal);
+                    let selected = tokio::select! {
+                        biased;
+                        _ = &mut first_signal => {
+                            let deadline = terminal_signal.deadline_after_runtime_shutdown()?;
+                            terminal_deadline = Some(deadline);
+                            shutdown_guard = Some(
+                                tokio::time::timeout_at(deadline, shutdown.as_mut())
+                                    .await
+                                    .map_err(|_| {
+                                        eyre!("terminal deadline expired waiting for runtime shutdown")
+                                    })?
+                            );
                             None
                         }
-                        DriverAction::Batch(selected) => selected,
+                        action = next_driver_action(
+                            shutdown.as_mut(),
+                            &mut scheduler,
+                            driver
+                                .as_ref()
+                                .expect("driver exists while selecting work")
+                                .next_sequence(),
+                        ) => match action {
+                            DriverAction::Shutdown(guard) => {
+                                shutdown_guard = Some(guard);
+                                terminal_deadline =
+                                    Some(terminal_signal.deadline_after_runtime_shutdown()?);
+                                None
+                            }
+                            DriverAction::Batch(selected) => selected,
+                        }
                     };
                     let Some(SelectedBatch { source, inputs: batch, kind }) = selected else {
                         break;
                     };
+                    let settle_batch = async {
                     #[cfg(test)]
                     lifecycle_observations
                         .selected_batches
@@ -1286,7 +1517,7 @@ impl ArbLauncher {
                         crate::recovery::recovery_failpoint(
                             "recovery_worker_quiesced_before_process_exit",
                         );
-                        return Ok(())
+                        return Ok::<_, eyre::Report>(BatchDisposition::RecoveryComplete)
                     }
                     scheduler.complete_batch(source, kind);
                     #[cfg(test)]
@@ -1319,62 +1550,158 @@ impl ArbLauncher {
                             bench_n = 0;
                             bench_wall = std::time::Instant::now();
                     }
-
+                    Ok::<_, eyre::Report>(BatchDisposition::Completed)
+                    };
+                    tokio::pin!(settle_batch);
+                    let first_signal = terminal_signal.wait_for_first_signal();
+                    tokio::pin!(first_signal);
+                    let disposition = tokio::select! {
+                        biased;
+                        _ = &mut first_signal => {
+                            let deadline = terminal_signal.deadline_after_runtime_shutdown()?;
+                            terminal_deadline = Some(deadline);
+                            let result = tokio::time::timeout_at(deadline, &mut settle_batch)
+                                .await
+                                .map_err(|_| {
+                                    eyre!("terminal deadline expired settling selected driver batch")
+                                })?;
+                            shutdown_guard = Some(
+                                tokio::time::timeout_at(deadline, shutdown.as_mut())
+                                    .await
+                                    .map_err(|_| {
+                                        eyre!("terminal deadline expired waiting for runtime shutdown")
+                                    })?
+                            );
+                            result
+                        }
+                        guard = shutdown.as_mut() => {
+                            let deadline = terminal_signal.deadline_after_runtime_shutdown()?;
+                            shutdown_guard = Some(guard);
+                            terminal_deadline = Some(deadline);
+                            tokio::time::timeout_at(deadline, &mut settle_batch)
+                                .await
+                                .map_err(|_| {
+                                    eyre!("terminal deadline expired settling selected driver batch")
+                                })?
+                        }
+                        result = &mut settle_batch => result,
+                    }?;
+                    match disposition {
+                        BatchDisposition::Completed if terminal_deadline.is_some() => break,
+                        BatchDisposition::Completed => {}
+                        BatchDisposition::RecoveryComplete => return Ok(()),
+                    }
                 }
                 Ok(())
             }
             .await;
-            let _ = sampler_cancel_tx.send(());
-            let _ = sampler_done_rx.await;
-            #[cfg(test)]
-            lifecycle_observations
-                .sampler_stops
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            #[cfg(test)]
-            if let Some(control) = driver_test_control.as_ref() {
-                control.pause_before_terminal_lifecycle().await;
-            }
-            // Flush and terminate the engine tree on both normal channel closure and fail-closed
-            // driver errors. Dropping the guard requests termination, but awaiting shutdown here
-            // also settles persistence before the node reports its terminal result.
-            let (shutdown_result, journal_result) = if let Some(driver) = driver.as_mut() {
-                (
-                    driver.shutdown().await,
-                    driver.flush_durable_message_journal(),
-                )
-            } else {
-                (Ok(()), Ok(()))
-            };
-            let res = match (res, shutdown_result, journal_result) {
-                (Ok(()), Ok(()), journal_result) => journal_result,
-                (Ok(()), Err(shutdown_error), Ok(())) => Err(shutdown_error),
-                (Ok(()), Err(shutdown_error), Err(journal_error)) => {
+            if res.is_err() && shutdown_guard.is_none() {
+                // An internal driver failure is not a CLEAN authorization, but it still has to
+                // close every runtime service so the node owner can join them in terminal order.
+                // The missing executable-owned signal deadline below keeps lifecycle RUNNING.
+                if driver_failure_runtime
+                    .initiate_graceful_shutdown()
+                    .is_err()
+                {
                     tracing::error!(
-                        target: "arb-reth::journal",
-                        %journal_error,
-                        "failed to flush message journal after engine shutdown failure",
+                        target: "arb-reth::engine",
+                        "failed to initiate cleanup shutdown after driver failure",
                     );
-                    Err(shutdown_error)
                 }
-                (Err(driver_error), shutdown_result, journal_result) => {
+            }
+            let terminal_deadline = match terminal_deadline {
+                Some(deadline) => deadline,
+                None => match terminal_signal.deadline_after_runtime_shutdown() {
+                    Ok(deadline) => deadline,
+                    Err(error) => {
+                        if res.is_ok() {
+                            res = Err(error);
+                        }
+                        tokio::time::Instant::now()
+                            .checked_add(TERMINAL_PREPARE_DEADLINE)
+                            .unwrap_or_else(tokio::time::Instant::now)
+                    }
+                },
+            };
+            let sampler_result = tokio::time::timeout_at(terminal_deadline, async {
+                let _ = sampler_cancel_tx.send(());
+                // `spawn_task` also drops the sampler future on global shutdown. Either an
+                // explicit acknowledgement or sender closure therefore proves it has stopped.
+                let _ = sampler_done_rx.await;
+                #[cfg(test)]
+                lifecycle_observations
+                    .sampler_stops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                if let Some(control) = driver_test_control.as_ref() {
+                    control.pause_before_terminal_lifecycle().await;
+                }
+                Ok::<_, eyre::Report>(())
+            })
+            .await
+            .map_err(|_| eyre!("terminal deadline expired waiting for frontier sampler"))
+            .and_then(|result| result);
+            if let Err(error) = sampler_result {
+                if res.is_ok() {
+                    res = Err(error);
+                } else {
+                    tracing::error!(
+                        target: "arb-reth::engine",
+                        %error,
+                        "frontier sampler shutdown also failed after driver failure",
+                    );
+                }
+            }
+
+            let service_result = if terminal_tx.send(terminal_deadline).is_err() {
+                Err(eyre!("node terminal coordinator dropped before service shutdown"))
+            } else {
+                tokio::time::timeout_at(terminal_deadline, services_stopped_rx)
+                    .await
+                    .map_err(|_| {
+                        eyre!("terminal deadline expired waiting for Feed/L1/MEV acknowledgement")
+                    })
+                    .and_then(|result| {
+                        result.wrap_err("node terminal coordinator dropped before service shutdown")
+                    })
+                    .and_then(|result| result.map_err(eyre::Report::msg))
+            };
+
+            // The node command owns Feed/L1/MEV. It must acknowledge that every service joined
+            // before the driver may request engine termination/persist-to-head.
+            let shutdown_result = match service_result {
+                Ok(()) if res.is_err() => Ok(()),
+                Ok(()) if tokio::time::Instant::now() < terminal_deadline => {
+                    if let Some(owned_driver) = driver.take() {
+                        let result = owned_driver.shutdown_until(terminal_deadline).await;
+                        drop(owned_driver);
+                        result
+                    } else {
+                        Ok(())
+                    }
+                }
+                Ok(()) => Err(eyre!(
+                    "terminal deadline expired before engine persist-to-head"
+                )),
+                Err(error) => Err(error),
+            };
+            let res = match (res, shutdown_result) {
+                (Ok(()), shutdown_result) => shutdown_result,
+                (Err(driver_error), shutdown_result) => {
                     if let Err(shutdown_error) = shutdown_result {
                         tracing::error!(
                             target: "arb-reth::engine",
                             %shutdown_error,
-                            "engine shutdown also failed after driver failure",
-                        );
-                    }
-                    if let Err(journal_error) = journal_result {
-                        tracing::error!(
-                            target: "arb-reth::journal",
-                            %journal_error,
-                            "failed to flush message journal after driver failure",
+                            "terminal shutdown also failed after driver failure",
                         );
                     }
                     Err(driver_error)
                 }
             };
-            let _ = exit_tx.send(res); // ignore error if receiver was dropped
+            let _ = exit_tx.send(TerminalOutcome {
+                result: res,
+                deadline: terminal_deadline,
+            }); // ignore error if receiver was dropped
             drop(shutdown_guard);
         });
 
@@ -1456,6 +1783,8 @@ impl ArbLauncher {
 
         Ok(ArbNodeHandle {
             provider,
+            terminal_rx,
+            services_stopped_tx: Some(services_stopped_tx),
             exit_rx,
             rpc_handle,
             ingress_metrics,
@@ -1475,7 +1804,6 @@ mod tests {
     use alloy_primitives::{B256, U256, address};
     use arb_revm::arbos_init::ArbosInitConfig;
     use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
-    use reth_chainspec::MAINNET;
     use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
     use reth_node_core::args::PruningArgs;
     use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
@@ -1483,6 +1811,87 @@ mod tests {
     use reth_tasks::Runtime;
 
     use crate::ArbNode;
+
+    #[tokio::test]
+    async fn first_terminal_signal_owns_one_exact_checked_deadline() {
+        let (owner, observer) = terminal_signal_channel();
+        let first_signal = observer.wait_for_first_signal();
+        tokio::pin!(first_signal);
+        let signal_at = tokio::time::Instant::now();
+        let expected = signal_at.checked_add(TERMINAL_PREPARE_DEADLINE).unwrap();
+
+        assert!(owner.capture_first_with_duration(signal_at, TERMINAL_PREPARE_DEADLINE,));
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_signal)
+            .await
+            .expect("first signal must directly close driver intake");
+        assert_eq!(
+            observer.deadline_after_runtime_shutdown().unwrap(),
+            expected
+        );
+
+        let repeated_at = signal_at
+            .checked_add(std::time::Duration::from_secs(7))
+            .unwrap();
+        assert!(!owner.capture_first_with_duration(repeated_at, TERMINAL_PREPARE_DEADLINE,));
+        assert_eq!(
+            observer.deadline_after_runtime_shutdown().unwrap(),
+            expected,
+            "a second signal during terminal PREPARING must not reset the deadline"
+        );
+    }
+
+    #[test]
+    fn signal_capture_and_batch_selection_share_one_linearization_boundary() {
+        let (owner, observer) = terminal_signal_channel();
+        let selection_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_selection = Arc::new(std::sync::Barrier::new(2));
+        let selector = {
+            let observer = observer.clone();
+            let selection_entered = selection_entered.clone();
+            let release_selection = release_selection.clone();
+            std::thread::spawn(move || {
+                observer.with_open_intake(|| {
+                    selection_entered.wait();
+                    release_selection.wait();
+                    7
+                })
+            })
+        };
+        selection_entered.wait();
+
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let capture = std::thread::spawn(move || captured_tx.send(owner.capture_first()).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            matches!(
+                captured_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "signal capture interleaved with the synchronous selection boundary"
+        );
+
+        release_selection.wait();
+        assert_eq!(selector.join().unwrap(), Some(7));
+        capture.join().unwrap();
+        assert!(captured_rx.recv().unwrap());
+        assert!(observer.deadline_after_runtime_shutdown().is_ok());
+    }
+
+    #[test]
+    fn terminal_signal_checked_add_failure_never_produces_a_deadline() {
+        let (owner, observer) = terminal_signal_channel();
+        assert!(owner.capture_first_with_duration(
+            tokio::time::Instant::now(),
+            std::time::Duration::MAX,
+        ));
+        assert!(
+            observer
+                .deadline_after_runtime_shutdown()
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+    }
 
     fn scheduler_input(source: ArbEngineInputSource, sequence: u64) -> ArbEngineInput {
         let message = BroadcastFeedMessage {
@@ -1519,7 +1928,13 @@ mod tests {
         }
         drop(feed_tx);
         drop(l1_tx);
-        IngressScheduler::new(feed_rx, l1_rx, IngressMetrics::new(), None)
+        IngressScheduler::new(
+            feed_rx,
+            l1_rx,
+            TerminalSignalObserver::for_test_runtime(),
+            IngressMetrics::new(),
+            None,
+        )
     }
 
     fn production_test_chain_spec() -> Arc<reth_chainspec::ChainSpec> {
@@ -1608,6 +2023,14 @@ mod tests {
         );
     }
 
+    fn exit_isolated_error_phase() -> ! {
+        unsafe extern "C" {
+            fn _exit(status: i32) -> !;
+        }
+        // An error before CLEAN intentionally leaves engine/journal resources for process exit.
+        unsafe { _exit(0) }
+    }
+
     fn production_metrics_addr() -> std::net::SocketAddr {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
@@ -1668,7 +2091,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut scheduler = IngressScheduler::new(feed_rx, l1_rx, IngressMetrics::new(), None);
+        let mut scheduler = IngressScheduler::new(
+            feed_rx,
+            l1_rx,
+            TerminalSignalObserver::for_test_runtime(),
+            IngressMetrics::new(),
+            None,
+        );
         let l1 = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             scheduler.next_batch(1_000),
@@ -1782,7 +2211,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut scheduler = IngressScheduler::new(feed_rx, l1_rx, IngressMetrics::new(), None);
+        let mut scheduler = IngressScheduler::new(
+            feed_rx,
+            l1_rx,
+            TerminalSignalObserver::for_test_runtime(),
+            IngressMetrics::new(),
+            None,
+        );
         let shutdown = std::future::ready(());
         tokio::pin!(shutdown);
 
@@ -1796,11 +2231,39 @@ mod tests {
         assert_eq!(scheduler.l1_messages.len(), 1);
     }
 
+    #[tokio::test]
+    async fn captured_signal_closes_ready_scheduler_before_batch_selection() {
+        let (owner, observer) = terminal_signal_channel();
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
+        feed_tx
+            .send(scheduler_input(ArbEngineInputSource::Feed, 1))
+            .await
+            .unwrap();
+        l1_tx
+            .send(
+                scheduler_input(ArbEngineInputSource::L1, 1)
+                    .message()
+                    .clone(),
+            )
+            .await
+            .unwrap();
+        let mut scheduler =
+            IngressScheduler::new(feed_rx, l1_rx, observer, IngressMetrics::new(), None);
+        assert!(owner.capture_first());
+
+        assert!(scheduler.next_batch(1).await.is_none());
+        assert!(scheduler.feed_pending.is_none());
+        assert!(scheduler.l1_pending.is_none());
+        assert_eq!(scheduler.feed_messages.len(), 1);
+        assert_eq!(scheduler.l1_messages.len(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn shutdown_during_in_flight_production_batch_finishes_only_that_batch() {
+    async fn shutdown_during_selected_batch_enforces_terminal_order_and_deadline() {
         const PHASE_ENV: &str = "ITE104_SHUTDOWN_TEST_PHASE";
         const TEST_NAME: &str =
-            "launcher::tests::shutdown_during_in_flight_production_batch_finishes_only_that_batch";
+            "launcher::tests::shutdown_during_selected_batch_enforces_terminal_order_and_deadline";
         let Some(phase) = std::env::var_os(PHASE_ENV) else {
             let completion_datadir =
                 tempfile::tempdir().expect("create completion metrics datadir");
@@ -1813,6 +2276,16 @@ mod tests {
             let shutdown_datadir = tempfile::tempdir().expect("create shutdown durability datadir");
             run_isolated_test_phase(TEST_NAME, PHASE_ENV, "shutdown", shutdown_datadir.path());
             run_isolated_test_phase(TEST_NAME, PHASE_ENV, "restart", shutdown_datadir.path());
+            let timeout_datadir = tempfile::tempdir().expect("create shutdown timeout datadir");
+            run_isolated_test_phase(TEST_NAME, PHASE_ENV, "timeout", timeout_datadir.path());
+            let service_failure_datadir =
+                tempfile::tempdir().expect("create service failure datadir");
+            run_isolated_test_phase(
+                TEST_NAME,
+                PHASE_ENV,
+                "service-failure",
+                service_failure_datadir.path(),
+            );
             return;
         };
         let phase = phase.to_str().expect("shutdown test phase is UTF-8");
@@ -1846,13 +2319,16 @@ mod tests {
             let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
             drop((feed_tx, l1_tx));
             let handle = ArbLauncher {
+                journal_directory: arb_reth_engine::JournalDirectory::open(
+                    data_dir.db().parent().expect("datadir owns db directory"),
+                )
+                .expect("open pinned test datadir"),
                 ctx: LaunchContext::new(runtime, data_dir),
+                terminal_signal: TerminalSignalObserver::for_test_runtime(),
                 chain_id: 412346,
                 genesis_block: 0,
                 tuning: ArbEngineTuning::reth_defaults(),
                 prune_config: None,
-                init_message_journal_at_tip: false,
-                l1_verified_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 feed_messages: feed_rx,
                 l1_messages: l1_rx,
                 feed_latency: None,
@@ -1872,7 +2348,16 @@ mod tests {
                 .expect("restarted driver must shut down cleanly");
             return;
         }
-        assert!(matches!(phase, "completion" | "shutdown"));
+        assert!(matches!(
+            phase,
+            "completion" | "shutdown" | "timeout" | "service-failure"
+        ));
+        let (signal_owner, terminal_signal) = if matches!(phase, "shutdown" | "timeout") {
+            let (owner, observer) = terminal_signal_channel();
+            (Some(owner), observer)
+        } else {
+            (None, TerminalSignalObserver::for_test_runtime())
+        };
 
         let metrics_addr = production_metrics_addr();
         let mut config = config;
@@ -1887,18 +2372,22 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let control = Arc::new(DriverTestControl::pause_after_input_and_completion(
-            2,
-            phase == "shutdown",
-        ));
+        let control = Arc::new(if phase == "service-failure" {
+            DriverTestControl::new()
+        } else {
+            DriverTestControl::pause_after_input_and_completion(2, phase == "shutdown")
+        });
         let launcher = ArbLauncher {
+            journal_directory: arb_reth_engine::JournalDirectory::open(
+                data_dir.db().parent().expect("datadir owns db directory"),
+            )
+            .expect("open pinned test datadir"),
             ctx: LaunchContext::new(runtime.clone(), data_dir),
+            terminal_signal,
             chain_id: 412346,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
-            init_message_journal_at_tip: false,
-            l1_verified_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,
@@ -1919,6 +2408,54 @@ mod tests {
         let task_manager = runtime
             .take_task_manager_handle()
             .expect("shutdown test runtime owns its task manager");
+
+        if phase == "service-failure" {
+            drop((feed_tx, l1_tx));
+            let clean_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let clean_observation = clean_called.clone();
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                crate::commands::node::complete_terminal_shutdown(
+                    handle,
+                    async { Err(eyre!("injected Feed service join failure")) },
+                    move |_| {
+                        clean_observation.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Ok(())
+                    },
+                ),
+            )
+            .await
+            .expect("service failure must terminate promptly")
+            .expect_err("service failure must return nonzero");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected Feed service join failure")
+            );
+            assert!(!clean_called.load(std::sync::atomic::Ordering::Relaxed));
+            drop((provider, metrics));
+            drop(
+                runtime
+                    .initiate_graceful_shutdown()
+                    .expect("stop service failure runtime"),
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(10), task_manager)
+                .await
+                .expect("service failure runtime tasks must stop")
+                .expect("join service failure task manager")
+                .expect("service failure task manager must not panic");
+            assert_eq!(
+                engine_lifecycle.shutdown_calls(),
+                0,
+                "service join failure must prevent engine persist-to-head"
+            );
+            assert_eq!(
+                engine_lifecycle.journal_stop_calls(),
+                0,
+                "service join failure must leave the journal and lifecycle unclean"
+            );
+            exit_isolated_error_phase();
+        }
 
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -1990,6 +2527,14 @@ mod tests {
         }
 
         let shutdown_seen = runtime.on_shutdown_signal().clone();
+        let signal_at = tokio::time::Instant::now();
+        let signal_deadline = signal_at.checked_add(TERMINAL_PREPARE_DEADLINE).unwrap();
+        assert!(
+            signal_owner
+                .as_ref()
+                .expect("signal phases own the executable deadline")
+                .capture_first_with_duration(signal_at, TERMINAL_PREPARE_DEADLINE)
+        );
         drop(
             runtime
                 .initiate_graceful_shutdown()
@@ -1998,6 +2543,63 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(3), shutdown_seen)
             .await
             .expect("shutdown signal must be active before releasing the batch");
+        if phase == "timeout" {
+            let clean_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let clean_observation = clean_called.clone();
+            let services_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let service_observation = services_started.clone();
+            let started = std::time::Instant::now();
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                crate::commands::node::complete_terminal_shutdown(
+                    handle,
+                    async move {
+                        service_observation.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Ok(())
+                    },
+                    move |_| {
+                        clean_observation.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Ok(())
+                    },
+                ),
+            )
+            .await
+            .expect("the original 15-second terminal deadline must fire")
+            .expect_err("expired selected batch must return nonzero");
+            assert!(
+                error.to_string().contains("terminal deadline expired"),
+                "unexpected timeout error: {error:?}"
+            );
+            assert!(
+                started.elapsed() >= std::time::Duration::from_secs(14),
+                "the held selected batch must consume the original terminal deadline"
+            );
+            assert!(!services_started.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(!clean_called.load(std::sync::atomic::Ordering::Relaxed));
+            assert_eq!(
+                observations
+                    .selected_batches
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "no post-signal batch may start"
+            );
+            assert_eq!(
+                observations
+                    .completed_batches
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "the selected batch held past its deadline cannot complete"
+            );
+            assert_eq!(engine_lifecycle.shutdown_calls(), 0);
+            assert_eq!(engine_lifecycle.journal_stop_calls(), 0);
+            drop((feed_tx, l1_tx, provider, metrics));
+            tokio::time::timeout(std::time::Duration::from_secs(10), task_manager)
+                .await
+                .expect("deadline failure must release runtime tasks")
+                .expect("join deadline failure task manager")
+                .expect("deadline failure task manager must not panic");
+            exit_isolated_error_phase();
+        }
         control.resume_input.notify_one();
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -2036,15 +2638,58 @@ mod tests {
             "engine shutdown must not start before the selected batch and sampler finish",
         );
         assert_eq!(
-            engine_lifecycle.journal_flush_calls(),
-            3,
-            "only the three apply-path durability checks may precede terminal lifecycle",
+            engine_lifecycle.journal_stop_calls(),
+            0,
+            "journal stop must not run before terminal lifecycle",
         );
         control.resume_terminal.notify_one();
-        handle
-            .wait_for_node_exit()
-            .await
-            .expect("selected in-flight batch must finish before shutdown");
+        let terminal_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service_order = terminal_order.clone();
+        let service_engine_lifecycle = engine_lifecycle.clone();
+        let clean_order = terminal_order.clone();
+        let clean_engine_lifecycle = engine_lifecycle.clone();
+        crate::commands::node::complete_terminal_shutdown(
+            handle,
+            async move {
+                for service in ["Feed", "L1", "MEV"] {
+                    let order = service_order.clone();
+                    tokio::spawn(async move {
+                        order
+                            .lock()
+                            .expect("terminal order lock poisoned")
+                            .push(service);
+                    })
+                    .await
+                    .map_err(|error| eyre!("instrumented {service} task failed: {error}"))?;
+                    assert_eq!(
+                        service_engine_lifecycle.shutdown_calls(),
+                        0,
+                        "engine persist-to-head began before {service} joined"
+                    );
+                }
+                Ok(())
+            },
+            move |deadline| {
+                assert!(tokio::time::Instant::now() < deadline);
+                assert_eq!(deadline, signal_deadline);
+                assert_eq!(clean_engine_lifecycle.shutdown_calls(), 1);
+                assert_eq!(clean_engine_lifecycle.journal_stop_calls(), 1);
+                clean_order
+                    .lock()
+                    .expect("terminal order lock poisoned")
+                    .push("CLEAN");
+                Ok(())
+            },
+        )
+        .await
+        .expect("selected in-flight batch must finish before shutdown");
+        assert_eq!(
+            terminal_order
+                .lock()
+                .expect("terminal order lock poisoned")
+                .as_slice(),
+            ["Feed", "L1", "MEV", "CLEAN"]
+        );
 
         assert_eq!(provider.best_block_number().unwrap(), 3);
         assert_eq!(
@@ -2072,9 +2717,9 @@ mod tests {
             "the actual engine shutdown method must run exactly once",
         );
         assert_eq!(
-            engine_lifecycle.journal_flush_calls(),
-            4,
-            "three apply-path checks plus exactly one terminal journal flush must run",
+            engine_lifecycle.journal_stop_calls(),
+            1,
+            "exactly one terminal asynchronous-journal stop barrier must run",
         );
         drop((feed_tx, l1_tx));
         drop(provider);
@@ -2085,16 +2730,17 @@ mod tests {
             .expect("shutdown test task manager must not panic");
         drop(runtime);
 
-        let journal = std::fs::read_to_string(datadir.join("arb-message-journal.ndjson"))
-            .expect("reopen durable message journal after runtime termination");
+        let directory = arb_reth_engine::JournalDirectory::open(&datadir)
+            .expect("reopen pinned shutdown test datadir");
+        let journal = arb_reth_engine::inspect_message_journal(&directory, 0)
+            .expect("reopen durable v2 message journal after runtime termination");
         let last = journal
-            .lines()
+            .entries
             .last()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .expect("journal contains its final selected-batch entry");
-        assert_eq!(last["entry"]["sequence"], 3);
-        assert_eq!(last["entry"]["block_number"], 3);
-        assert_eq!(last["entry"]["source"], "feed");
+        assert_eq!(last.sequence, 3);
+        assert_eq!(last.block_number, 3);
+        assert_eq!(last.source, ArbEngineInputSource::Feed);
         drop(metrics);
     }
 
@@ -2129,13 +2775,16 @@ mod tests {
         let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
         let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
         let handle = ArbLauncher {
+            journal_directory: arb_reth_engine::JournalDirectory::open(
+                data_dir.db().parent().expect("datadir owns db directory"),
+            )
+            .expect("open pinned test datadir"),
             ctx: LaunchContext::new(runtime.clone(), data_dir),
+            terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
-            init_message_journal_at_tip: false,
-            l1_verified_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,
@@ -2171,7 +2820,11 @@ mod tests {
             "unexpected terminal error: {error:?}",
         );
         assert_eq!(lifecycle.shutdown_calls(), 1);
-        assert_eq!(lifecycle.journal_flush_calls(), 1);
+        assert_eq!(
+            lifecycle.journal_stop_calls(),
+            0,
+            "payload-service failure must leave the journal/lifecycle unclean"
+        );
         drop((feed_tx, l1_tx));
         tokio::time::timeout(std::time::Duration::from_secs(10), task_manager)
             .await
@@ -2197,7 +2850,13 @@ mod tests {
     async fn cancelled_arbitration_retains_prefetched_scheduler_head_exactly_once() {
         let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
         let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
-        let mut scheduler = IngressScheduler::new(feed_rx, l1_rx, IngressMetrics::new(), None);
+        let mut scheduler = IngressScheduler::new(
+            feed_rx,
+            l1_rx,
+            TerminalSignalObserver::for_test_runtime(),
+            IngressMetrics::new(),
+            None,
+        );
         let receive_pause = Arc::new(SchedulerReceivePause {
             head_received: tokio::sync::Notify::new(),
             resume: tokio::sync::Notify::new(),
@@ -2240,21 +2899,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn production_prometheus_tracks_dynamic_ingress_and_frontier_values() {
-        const PHASE_ENV: &str = "ITE104_DYNAMIC_METRICS_TEST_PHASE";
+        const PHASE_ENV: &str = "ITE106A_DYNAMIC_METRICS_TEST_PHASE";
         const TEST_NAME: &str =
             "launcher::tests::production_prometheus_tracks_dynamic_ingress_and_frontier_values";
-        let Some(phase) = std::env::var_os(PHASE_ENV) else {
+        if std::env::var_os(PHASE_ENV).is_none() {
             let datadir = tempfile::tempdir().expect("create dynamic metrics datadir");
-            run_isolated_test_phase(TEST_NAME, PHASE_ENV, "closure-first", datadir.path());
-            let datadir = tempfile::tempdir().expect("create L1-first dynamic metrics datadir");
-            run_isolated_test_phase(TEST_NAME, PHASE_ENV, "l1-first", datadir.path());
+            run_isolated_test_phase(TEST_NAME, PHASE_ENV, "run", datadir.path());
             return;
-        };
-        let l1_first = match phase.to_str().expect("dynamic metrics phase is UTF-8") {
-            "closure-first" => false,
-            "l1-first" => true,
-            phase => panic!("unknown dynamic metrics phase {phase}"),
-        };
+        }
 
         let runtime = Runtime::test();
         let chain_spec = production_test_chain_spec();
@@ -2283,7 +2935,7 @@ mod tests {
         let data_dir =
             maybe_path.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
         let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(4);
-        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(3);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
         for sequence in 1..=3 {
             let mut message = deposit_message();
             message.sequence_number = sequence;
@@ -2292,21 +2944,18 @@ mod tests {
                 .await
                 .unwrap();
         }
-        for sequence in 1..=2 {
-            let mut message = deposit_message();
-            message.sequence_number = sequence;
-            l1_tx.send(message).await.unwrap();
-        }
         let control = Arc::new(DriverTestControl::pause_for_dynamic_metrics(2));
-        let verified = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let handle = ArbLauncher {
+            journal_directory: arb_reth_engine::JournalDirectory::open(
+                data_dir.db().parent().expect("datadir owns db directory"),
+            )
+            .expect("open pinned test datadir"),
             ctx: LaunchContext::new(runtime, data_dir),
+            terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
-            init_message_journal_at_tip: false,
-            l1_verified_tip: verified,
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,
@@ -2331,9 +2980,9 @@ mod tests {
             metrics_addr,
             &[
                 ("feed_dequeued_total", 3.0),
-                ("l1_dequeued_total", 1.0),
+                ("l1_dequeued_total", 0.0),
                 ("feed_queue_depth", 0.0),
-                ("l1_queue_depth", 2.0),
+                ("l1_queue_depth", 0.0),
                 ("executed_tip", 0.0),
                 ("last_feed_frame_timestamp_seconds", 0.0),
             ],
@@ -2360,49 +3009,27 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
         assert!(
             crate::feed::data_frame_text(
-                tokio_tungstenite::tungstenite::Message::Text("duplicate".into()),
+                tokio_tungstenite::tungstenite::Message::Text("accepted".into()),
                 &ingress_metrics,
             )
             .is_ok()
         );
-        let duplicate = scrape_metrics(metrics_addr).await;
-        let duplicate_timestamp = ingress_metric(&duplicate, "last_feed_frame_timestamp_seconds");
-        assert!(duplicate_timestamp > malformed_timestamp);
-        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-        assert_eq!(
-            crate::feed::data_frame_text(
-                tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()),
-                &ingress_metrics,
-            )
-            .unwrap(),
-            None,
-        );
-        let control_frame = scrape_metrics(metrics_addr).await;
-        assert_eq!(
-            ingress_metric(&control_frame, "last_feed_frame_timestamp_seconds"),
-            duplicate_timestamp,
+        let accepted = scrape_metrics(metrics_addr).await;
+        assert!(
+            ingress_metric(&accepted, "last_feed_frame_timestamp_seconds") > malformed_timestamp
         );
 
         ingress_metrics.pause_next_frame_before_max();
         let older_metrics = ingress_metrics.clone();
-        let older_before_max = std::thread::spawn(move || {
-            crate::feed::data_frame_text(
-                tokio_tungstenite::tungstenite::Message::Text("older-before-max".into()),
-                &older_metrics,
-            )
-        });
+        let older_before_max = std::thread::spawn(move || older_metrics.record_feed_frame());
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             ingress_metrics.wait_frame_before_max_paused(),
         )
         .await
-        .expect("older frame writer must pause before its atomic maximum");
+        .expect("older frame publication must pause before atomic maximum");
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-        crate::feed::data_frame_text(
-            tokio_tungstenite::tungstenite::Message::Text("newer-before-max".into()),
-            &ingress_metrics,
-        )
-        .expect("newer frame is valid text");
+        ingress_metrics.record_feed_frame();
         let newer_before_max = ingress_metric(
             &scrape_metrics(metrics_addr).await,
             "last_feed_frame_timestamp_seconds",
@@ -2410,37 +3037,26 @@ mod tests {
         ingress_metrics.resume_frame_before_max();
         older_before_max
             .join()
-            .expect("older frame writer must not panic")
-            .expect("older frame is valid text");
+            .expect("older frame publication must not panic");
         assert_eq!(
             ingress_metric(
                 &scrape_metrics(metrics_addr).await,
                 "last_feed_frame_timestamp_seconds",
             ),
             newer_before_max,
-            "an older writer resuming before atomic max must not regress the gauge",
         );
 
         ingress_metrics.pause_next_frame_after_max();
         let older_metrics = ingress_metrics.clone();
-        let older_after_max = std::thread::spawn(move || {
-            crate::feed::data_frame_text(
-                tokio_tungstenite::tungstenite::Message::Text("older-after-max".into()),
-                &older_metrics,
-            )
-        });
+        let older_after_max = std::thread::spawn(move || older_metrics.record_feed_frame());
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             ingress_metrics.wait_frame_after_max_paused(),
         )
         .await
-        .expect("older frame writer must pause after its atomic maximum");
+        .expect("older frame publication must pause after atomic maximum");
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-        crate::feed::data_frame_text(
-            tokio_tungstenite::tungstenite::Message::Text("newer-after-max".into()),
-            &ingress_metrics,
-        )
-        .expect("newer frame is valid text");
+        ingress_metrics.record_feed_frame();
         let newer_after_max = ingress_metric(
             &scrape_metrics(metrics_addr).await,
             "last_feed_frame_timestamp_seconds",
@@ -2448,15 +3064,13 @@ mod tests {
         ingress_metrics.resume_frame_after_max();
         older_after_max
             .join()
-            .expect("older frame writer must not panic")
-            .expect("older frame is valid text");
+            .expect("older frame publication must not panic");
         assert_eq!(
             ingress_metric(
                 &scrape_metrics(metrics_addr).await,
                 "last_feed_frame_timestamp_seconds",
             ),
             newer_after_max,
-            "an older writer resuming before gauge publication must recheck the atomic maximum",
         );
 
         control.resume_selected_batch.notify_one();
@@ -2466,154 +3080,11 @@ mod tests {
         )
         .await
         .expect("Feed batch must pause after its second production input");
-        wait_for_ingress_metrics(
-            metrics_addr,
-            &[
-                ("executed_tip", 1.0),
-                ("l1_verified_tip", 0.0),
-                ("verification_distance", 1.0),
-            ],
-        )
-        .await;
-
+        wait_for_ingress_metrics(metrics_addr, &[("executed_tip", 1.0)]).await;
         control.resume_input.notify_one();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            control.selected_batch_paused.notified(),
-        )
-        .await
-        .expect("L1 overlap batch must pause after production selection");
-        wait_for_ingress_metrics(
-            metrics_addr,
-            &[
-                ("feed_dequeued_total", 3.0),
-                ("l1_dequeued_total", 2.0),
-                ("feed_queue_depth", 0.0),
-                ("l1_queue_depth", 0.0),
-                ("executed_tip", 3.0),
-                ("durable_tip", 3.0),
-                ("l1_verified_tip", 0.0),
-                ("verification_distance", 3.0),
-            ],
-        )
-        .await;
-        control.pause_next_wait_for_head();
-        control.resume_selected_batch.notify_one();
-        wait_for_ingress_metrics(
-            metrics_addr,
-            &[
-                ("executed_tip", 3.0),
-                ("durable_tip", 3.0),
-                ("l1_verified_tip", 2.0),
-                ("verification_distance", 1.0),
-            ],
-        )
-        .await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            control.wait_for_head_paused.notified(),
-        )
-        .await
-        .expect("scheduler must park before receiving the final L1 item or Feed closure");
+        wait_for_ingress_metrics(metrics_addr, &[("executed_tip", 3.0)]).await;
 
-        let mut final_overlap = deposit_message();
-        final_overlap.sequence_number = 3;
-        l1_tx.send(final_overlap).await.unwrap();
-        if l1_first {
-            control.pause_next_selected_batch();
-            control.resume_wait_for_head.notify_one();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                control.selected_batch_paused.notified(),
-            )
-            .await
-            .expect("ready final L1 item must pause after selection before Feed closure");
-            wait_for_ingress_metrics(
-                metrics_addr,
-                &[
-                    ("feed_dequeued_total", 3.0),
-                    ("l1_dequeued_total", 3.0),
-                    ("feed_queue_depth", 0.0),
-                    ("l1_queue_depth", 0.0),
-                ],
-            )
-            .await;
-            drop(feed_tx);
-            control.resume_selected_batch.notify_one();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                control.closure_paused.notified(),
-            )
-            .await
-            .expect("Feed closure must be observed after the selected L1 batch completes");
-            let closure = wait_for_ingress_metrics(
-                metrics_addr,
-                &[
-                    ("feed_dequeued_total", 3.0),
-                    ("l1_dequeued_total", 3.0),
-                    ("feed_queue_depth", 0.0),
-                    ("l1_queue_depth", 0.0),
-                    ("executed_tip", 3.0),
-                    ("l1_verified_tip", 3.0),
-                ],
-            )
-            .await;
-            assert_eq!(ingress_metric(&closure, "verification_distance"), 0.0);
-            control.resume_closure.notify_one();
-        } else {
-            drop(feed_tx);
-            control.resume_wait_for_head.notify_one();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                control.closure_paused.notified(),
-            )
-            .await
-            .expect("Feed closure must pause before the pending L1 head enters service");
-            let closure = wait_for_ingress_metrics(
-                metrics_addr,
-                &[
-                    ("feed_queue_depth", 0.0),
-                    ("l1_queue_depth", 1.0),
-                    ("l1_dequeued_total", 2.0),
-                ],
-            )
-            .await;
-            assert_eq!(ingress_metric(&closure, "feed_dequeued_total"), 3.0);
-            control.pause_next_selected_batch();
-            control.resume_closure.notify_one();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                control.selected_batch_paused.notified(),
-            )
-            .await
-            .expect("final L1 batch must pause after production selection");
-            wait_for_ingress_metrics(
-                metrics_addr,
-                &[
-                    ("feed_dequeued_total", 3.0),
-                    ("l1_dequeued_total", 3.0),
-                    ("feed_queue_depth", 0.0),
-                    ("l1_queue_depth", 0.0),
-                ],
-            )
-            .await;
-            control.resume_selected_batch.notify_one();
-        }
-        wait_for_ingress_metrics(
-            metrics_addr,
-            &[
-                ("feed_dequeued_total", 3.0),
-                ("l1_dequeued_total", 3.0),
-                ("feed_queue_depth", 0.0),
-                ("l1_queue_depth", 0.0),
-                ("executed_tip", 3.0),
-                ("durable_tip", 3.0),
-                ("l1_verified_tip", 3.0),
-                ("verification_distance", 0.0),
-            ],
-        )
-        .await;
-        drop(l1_tx);
+        drop((feed_tx, l1_tx));
         handle
             .wait_for_node_exit()
             .await
@@ -2660,15 +3131,17 @@ mod tests {
         let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
         let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
         let control = Arc::new(DriverTestControl::pause_sampler_after_capture_and_input(2));
-        let verified = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let handle = ArbLauncher {
+            journal_directory: arb_reth_engine::JournalDirectory::open(
+                data_dir.db().parent().expect("datadir owns db directory"),
+            )
+            .expect("open pinned test datadir"),
             ctx: LaunchContext::new(runtime, data_dir),
+            terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
-            init_message_journal_at_tip: false,
-            l1_verified_tip: verified.clone(),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,
@@ -2695,15 +3168,7 @@ mod tests {
             .send(ArbEngineInput::feed(message, None))
             .await
             .unwrap();
-        wait_for_ingress_metrics(
-            metrics_addr,
-            &[
-                ("executed_tip", 1.0),
-                ("l1_verified_tip", 0.0),
-                ("verification_distance", 1.0),
-            ],
-        )
-        .await;
+        wait_for_ingress_metrics(metrics_addr, &[("executed_tip", 1.0)]).await;
 
         control.resume_sampler_capture.notify_one();
         tokio::time::timeout(
@@ -2714,7 +3179,6 @@ mod tests {
         .expect("paused sampler tick must publish");
         let raced = scrape_metrics(metrics_addr).await;
         assert_eq!(ingress_metric(&raced, "executed_tip"), 1.0);
-        assert_eq!(ingress_metric(&raced, "verification_distance"), 1.0);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -2724,9 +3188,7 @@ mod tests {
         .expect("idle sampler tick must continue from current executed frontier");
         let idle = scrape_metrics(metrics_addr).await;
         assert_eq!(ingress_metric(&idle, "executed_tip"), 1.0);
-        assert_eq!(ingress_metric(&idle, "verification_distance"), 1.0);
 
-        ingress_metrics.pause_next_executed_publish();
         let mut second = deposit_message();
         second.sequence_number = 2;
         feed_tx
@@ -2735,31 +3197,31 @@ mod tests {
             .unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            ingress_metrics.wait_executed_publish_paused(),
-        )
-        .await
-        .expect("production callback must pause after loading sampled verified tip zero");
-        verified.store(1, std::sync::atomic::Ordering::Release);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            control.sampler_published.notified(),
-        )
-        .await
-        .expect("sampler must publish verified tip one while callback is paused");
-        control.pause_next_sampler_capture();
-        ingress_metrics.resume_executed_publish();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
             control.input_paused.notified(),
         )
         .await
-        .expect("production batch must pause before its post-batch frontier repair");
-        let verified_race = scrape_metrics(metrics_addr).await;
-        assert_eq!(ingress_metric(&verified_race, "executed_tip"), 2.0);
-        assert_eq!(ingress_metric(&verified_race, "l1_verified_tip"), 1.0);
-        assert_eq!(ingress_metric(&verified_race, "verification_distance"), 1.0);
+        .expect("second production batch must pause after input");
+        wait_for_ingress_metrics(metrics_addr, &[("executed_tip", 2.0)]).await;
         control.resume_input.notify_one();
-        control.resume_sampler_capture.notify_one();
+
+        ingress_metrics.pause_next_executed_publish();
+        let older_metrics = ingress_metrics.clone();
+        let older = std::thread::spawn(move || older_metrics.set_executed_tip(3));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ingress_metrics.wait_executed_publish_paused(),
+        )
+        .await
+        .expect("older executed publication must pause after atomic maximum");
+        ingress_metrics.set_executed_tip(4);
+        ingress_metrics.resume_executed_publish();
+        older
+            .join()
+            .expect("older executed publication must not panic");
+        assert_eq!(
+            ingress_metric(&scrape_metrics(metrics_addr).await, "executed_tip"),
+            4.0,
+        );
 
         drop((feed_tx, l1_tx));
         handle
@@ -2817,13 +3279,16 @@ mod tests {
             }
             drop(l1_tx);
             let handle = ArbLauncher {
+                journal_directory: arb_reth_engine::JournalDirectory::open(
+                    data_dir.db().parent().expect("datadir owns db directory"),
+                )
+                .expect("open pinned test datadir"),
                 ctx: LaunchContext::new(runtime, data_dir),
+                terminal_signal: TerminalSignalObserver::for_test_runtime(),
                 chain_id: 412346,
                 genesis_block: 0,
                 tuning: ArbEngineTuning::reth_defaults(),
                 prune_config: None,
-                init_message_journal_at_tip: false,
-                l1_verified_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 feed_messages: feed_rx,
                 l1_messages: l1_rx,
                 feed_latency: None,
@@ -2848,13 +3313,16 @@ mod tests {
         config.metrics.prometheus = Some(metrics_addr);
         let control = Arc::new(DriverTestControl::pause_sampler_at_start());
         let handle = ArbLauncher {
+            journal_directory: arb_reth_engine::JournalDirectory::open(
+                data_dir.db().parent().expect("datadir owns db directory"),
+            )
+            .expect("open pinned test datadir"),
             ctx: LaunchContext::new(runtime, data_dir),
+            terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
-            init_message_journal_at_tip: false,
-            l1_verified_tip: Arc::new(std::sync::atomic::AtomicU64::new(999)),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,
@@ -2867,78 +3335,21 @@ mod tests {
         .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
         .await
         .expect("launch startup overlap verification node");
-        let ingress_metrics = handle.ingress_metrics.clone();
-        let observations = handle.driver_test_observations.clone();
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
             control.sampler_start_paused.notified(),
         )
         .await
         .expect("sampler must pause before its first periodic publication");
-        wait_for_ingress_metrics(
-            metrics_addr,
-            &[
-                ("executed_tip", 3.0),
-                ("durable_tip", 3.0),
-                ("l1_verified_tip", 3.0),
-                ("verification_distance", 0.0),
-            ],
-        )
-        .await;
-
-        ingress_metrics.set_executed_tip(0);
-        let stale = scrape_metrics(metrics_addr).await;
-        assert_eq!(ingress_metric(&stale, "executed_tip"), 0.0);
-        assert_eq!(ingress_metric(&stale, "verification_distance"), 0.0);
-        control.pause_next_post_batch_frontier();
-        for sequence in 1..=3 {
-            let mut message = deposit_message();
-            message.sequence_number = sequence;
-            l1_tx.send(message).await.unwrap();
-        }
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            control.post_batch_frontier_paused.notified(),
-        )
-        .await
-        .expect("overlap-only batch must pause after post-batch frontier publication");
-        wait_for_ingress_metrics(
-            metrics_addr,
-            &[
-                ("l1_dequeued_total", 3.0),
-                ("executed_tip", 3.0),
-                ("l1_verified_tip", 3.0),
-                ("verification_distance", 0.0),
-            ],
-        )
-        .await;
-        assert_eq!(
-            observations
-                .engine_reconciliation_calls
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1,
-        );
-        assert_eq!(
-            observations
-                .benchmark_executed
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "overlap-only selected L1 batch executes and benchmarks no suffix",
-        );
+        wait_for_ingress_metrics(metrics_addr, &[("executed_tip", 3.0), ("durable_tip", 3.0)])
+            .await;
 
         drop((feed_tx, l1_tx));
-        control.resume_post_batch_frontier.notify_one();
         control.resume_sampler_start.notify_one();
         handle
             .wait_for_node_exit()
             .await
-            .expect("startup overlap verification node exits cleanly");
-        assert_eq!(
-            observations
-                .benchmark_executed
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-        );
+            .expect("startup frontier verification node exits cleanly");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2980,19 +3391,21 @@ mod tests {
             maybe_path.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
         let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
         let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
-        let verified = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let control = Arc::new(DriverTestControl::with_durable_samples([
             Err("injected durable read failure"),
             Ok(9),
         ]));
         let handle = ArbLauncher {
+            journal_directory: arb_reth_engine::JournalDirectory::open(
+                data_dir.db().parent().expect("datadir owns db directory"),
+            )
+            .expect("open pinned test datadir"),
             ctx: LaunchContext::new(runtime, data_dir),
+            terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
-            init_message_journal_at_tip: false,
-            l1_verified_tip: verified.clone(),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,
@@ -3005,7 +3418,6 @@ mod tests {
         .launch_node(NodeBuilder::new(config).with_database(db).node(ArbNode))
         .await
         .expect("launch idle sampler metrics node");
-        verified.store(2, std::sync::atomic::Ordering::Release);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -3013,32 +3425,16 @@ mod tests {
         )
         .await
         .expect("sampler must perform injected failed read");
-        wait_for_ingress_metrics(
-            metrics_addr,
-            &[
-                ("executed_tip", 0.0),
-                ("durable_tip", 0.0),
-                ("l1_verified_tip", 2.0),
-                ("verification_distance", 0.0),
-            ],
-        )
-        .await;
+        wait_for_ingress_metrics(metrics_addr, &[("executed_tip", 0.0), ("durable_tip", 0.0)])
+            .await;
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
             control.durable_sampled.notified(),
         )
         .await
         .expect("sampler must continue to the successful read");
-        wait_for_ingress_metrics(
-            metrics_addr,
-            &[
-                ("executed_tip", 0.0),
-                ("durable_tip", 9.0),
-                ("l1_verified_tip", 2.0),
-                ("verification_distance", 0.0),
-            ],
-        )
-        .await;
+        wait_for_ingress_metrics(metrics_addr, &[("executed_tip", 0.0), ("durable_tip", 9.0)])
+            .await;
         drop((feed_tx, l1_tx));
         handle
             .wait_for_node_exit()
@@ -3091,9 +3487,12 @@ mod tests {
 
         if phase == "seed" {
             let (first_feed_tx, first_feed_rx) = tokio::sync::mpsc::channel(1);
+            first_feed_tx
+                .send(ArbEngineInput::feed(authoritative.clone(), None))
+                .await
+                .unwrap();
             drop(first_feed_tx);
             let (first_l1_tx, first_l1_rx) = tokio::sync::mpsc::channel(1);
-            first_l1_tx.send(authoritative.clone()).await.unwrap();
             drop(first_l1_tx);
             let first_path = reth_node_core::dirs::MaybePlatformPath::<
                 reth_node_core::dirs::DataDirPath,
@@ -3106,16 +3505,21 @@ mod tests {
                 });
             let first_data_dir = first_path
                 .unwrap_or_chain_default(chain_spec.chain(), first_config.datadir.clone());
-            let first_verified = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let first_runtime = Runtime::test();
             let first_handle = ArbLauncher {
+                journal_directory: arb_reth_engine::JournalDirectory::open(
+                    first_data_dir
+                        .db()
+                        .parent()
+                        .expect("datadir owns db directory"),
+                )
+                .expect("open pinned test datadir"),
                 ctx: LaunchContext::new(first_runtime.clone(), first_data_dir),
+                terminal_signal: TerminalSignalObserver::for_test_runtime(),
                 chain_id: 412346,
                 genesis_block: 0,
                 tuning: ArbEngineTuning::reth_defaults(),
                 prune_config: None,
-                init_message_journal_at_tip: false,
-                l1_verified_tip: first_verified.clone(),
                 feed_messages: first_feed_rx,
                 l1_messages: first_l1_rx,
                 feed_latency: None,
@@ -3131,12 +3535,11 @@ mod tests {
                     .node(ArbNode),
             )
             .await
-            .expect("first L1-only launch must succeed");
+            .expect("first Feed launch must succeed");
             first_handle
                 .wait_for_node_exit()
                 .await
-                .expect("first L1-only launch must make its journal durable");
-            assert_eq!(first_verified.load(std::sync::atomic::Ordering::Acquire), 1,);
+                .expect("first Feed launch must make its journal durable");
             let first_task_manager = first_runtime
                 .take_task_manager_handle()
                 .expect("test runtime owns its task manager");
@@ -3158,11 +3561,10 @@ mod tests {
         let metrics_addr = metrics_probe.local_addr().unwrap();
         drop(metrics_probe);
         let (restart_feed_tx, restart_feed_rx) = tokio::sync::mpsc::channel(1);
-        drop(restart_feed_tx);
         let (restart_l1_tx, restart_l1_rx) = tokio::sync::mpsc::channel(1);
         let restart_path = reth_node_core::dirs::MaybePlatformPath::<
             reth_node_core::dirs::DataDirPath,
-        >::from(datadir);
+        >::from(datadir.clone());
         let mut restart_config = NodeConfig::test()
             .with_chain(chain_spec.clone())
             .with_datadir_args(reth_node_core::args::DatadirArgs {
@@ -3172,15 +3574,20 @@ mod tests {
         restart_config.metrics.prometheus = Some(metrics_addr);
         let restart_data_dir = restart_path
             .unwrap_or_chain_default(chain_spec.chain(), restart_config.datadir.clone());
-        let restart_verified = Arc::new(std::sync::atomic::AtomicU64::new(999));
         let restart_handle = ArbLauncher {
+            journal_directory: arb_reth_engine::JournalDirectory::open(
+                restart_data_dir
+                    .db()
+                    .parent()
+                    .expect("datadir owns db directory"),
+            )
+            .expect("open pinned test datadir"),
             ctx: LaunchContext::new(Runtime::test(), restart_data_dir),
+            terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
-            init_message_journal_at_tip: false,
-            l1_verified_tip: restart_verified.clone(),
             feed_messages: restart_feed_rx,
             l1_messages: restart_l1_rx,
             feed_latency: None,
@@ -3198,11 +3605,6 @@ mod tests {
         .await
         .expect("restart over the durable journal must succeed");
         let restart_observations = restart_handle.driver_test_observations.clone();
-        assert_eq!(
-            restart_verified.load(std::sync::atomic::Ordering::Acquire),
-            1,
-            "journal authority must overwrite an invalid higher caller seed",
-        );
 
         let exposition = wait_for_ingress_metrics(
             metrics_addr,
@@ -3213,8 +3615,6 @@ mod tests {
                 ("l1_dequeued_total", 0.0),
                 ("executed_tip", 1.0),
                 ("durable_tip", 1.0),
-                ("l1_verified_tip", 1.0),
-                ("verification_distance", 0.0),
                 ("last_feed_frame_timestamp_seconds", 0.0),
                 ("last_feed_dequeue_timestamp_seconds", 0.0),
             ],
@@ -3227,8 +3627,6 @@ mod tests {
             "reth_arb_reth_ingress_l1_dequeued_total",
             "reth_arb_reth_ingress_executed_tip",
             "reth_arb_reth_ingress_durable_tip",
-            "reth_arb_reth_ingress_l1_verified_tip",
-            "reth_arb_reth_ingress_verification_distance",
             "reth_arb_reth_ingress_last_feed_frame_timestamp_seconds",
             "reth_arb_reth_ingress_last_feed_dequeue_timestamp_seconds",
         ];
@@ -3248,28 +3646,51 @@ mod tests {
             );
         }
 
+        let authority_before = std::fs::read_dir(&datadir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(arb_reth_engine::MESSAGE_JOURNAL_PREFIX)
+            })
+            .map(|entry| {
+                (
+                    entry.file_name(),
+                    std::fs::read(entry.path()).expect("read restart journal authority"),
+                )
+            })
+            .collect::<Vec<_>>();
         restart_l1_tx.send(authoritative).await.unwrap();
-        drop(restart_l1_tx);
-        wait_for_ingress_metrics(
-            metrics_addr,
-            &[
-                ("feed_queue_depth", 0.0),
-                ("l1_queue_depth", 0.0),
-                ("feed_dequeued_total", 0.0),
-                ("l1_dequeued_total", 1.0),
-                ("executed_tip", 1.0),
-                ("durable_tip", 1.0),
-                ("l1_verified_tip", 1.0),
-                ("verification_distance", 0.0),
-                ("last_feed_frame_timestamp_seconds", 0.0),
-                ("last_feed_dequeue_timestamp_seconds", 0.0),
-            ],
-        )
-        .await;
-        restart_handle
+        drop((restart_feed_tx, restart_l1_tx));
+        let error = restart_handle
             .wait_for_node_exit()
             .await
-            .expect("restart overlap verification must succeed");
+            .expect_err("Phase A must reject restart L1 overlap");
+        assert!(
+            error
+                .downcast_ref::<arb_reth_engine::CanonicalL1PhaseUnavailable>()
+                .is_some(),
+            "restart overlap must return typed Phase-A closure: {error:?}",
+        );
+        let authority_after = std::fs::read_dir(&datadir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(arb_reth_engine::MESSAGE_JOURNAL_PREFIX)
+            })
+            .map(|entry| {
+                (
+                    entry.file_name(),
+                    std::fs::read(entry.path()).expect("reread restart journal authority"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(authority_after, authority_before);
         assert_eq!(
             restart_observations
                 .selected_l1_batches
@@ -3282,6 +3703,13 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
         );
+        unsafe extern "C" {
+            fn _exit(status: i32) -> !;
+        }
+        // The verify phase intentionally takes a fail-closed error path that cannot authorize
+        // engine or journal termination. Match production's process-exit boundary after proving
+        // the persisted restart behavior instead of waiting for test-runtime destructor cleanup.
+        unsafe { _exit(0) }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3295,7 +3723,6 @@ mod tests {
             Some("sequencer feed block hash mismatch at sequence 1"),
             false,
             Some(0),
-            0,
             Some(ArbEngineInputSource::Feed),
         )
         .await;
@@ -3317,7 +3744,6 @@ mod tests {
             Some("sequencer feed block hash mismatch at sequence 2"),
             false,
             Some(1),
-            0,
             Some(ArbEngineInputSource::Feed),
         )
         .await;
@@ -3336,7 +3762,6 @@ mod tests {
             Some("feed/L1 message disagreement at applied sequence 1"),
             false,
             Some(1),
-            0,
             Some(ArbEngineInputSource::L1),
         )
         .await;
@@ -3350,10 +3775,9 @@ mod tests {
         assert_driver_result(
             vec![ArbEngineInput::feed(feed.clone(), None)],
             Some((1, vec![feed])),
-            None,
+            Some("canonical L1 authority promotion is unavailable in phase A at sequence 1"),
             false,
-            None,
-            1,
+            Some(1),
             None,
         )
         .await;
@@ -3369,10 +3793,9 @@ mod tests {
         assert_driver_result(
             vec![ArbEngineInput::feed(first.clone(), None)],
             Some((1, vec![first, second])),
-            None,
+            Some("canonical L1 authority promotion is unavailable in phase A at sequence 1"),
             false,
-            None,
-            2,
+            Some(1),
             None,
         )
         .await;
@@ -3389,7 +3812,6 @@ mod tests {
             Some("L1 reconciliation starts after the next executable sequence"),
             false,
             Some(0),
-            0,
             Some(ArbEngineInputSource::L1),
         )
         .await;
@@ -3414,7 +3836,6 @@ mod tests {
             Some("feed/L1 message disagreement at sequence 2"),
             true,
             Some(0),
-            0,
             Some(ArbEngineInputSource::Feed),
         )
         .await;
@@ -3436,7 +3857,6 @@ mod tests {
             Some("sequencer feed block hash mismatch at sequence 2"),
             true,
             Some(1),
-            1,
             Some(ArbEngineInputSource::Feed),
         )
         .await;
@@ -3466,7 +3886,6 @@ mod tests {
             Some("feed/L1 message disagreement at sequence 3"),
             true,
             Some(1),
-            0,
             Some(ArbEngineInputSource::Feed),
         )
         .await;
@@ -3489,7 +3908,6 @@ mod tests {
             Some("L1 overlap starts after the contiguous authority frontier"),
             false,
             Some(4),
-            0,
             Some(ArbEngineInputSource::L1),
         )
         .await;
@@ -3508,7 +3926,15 @@ mod tests {
             }
         }
 
-        assert_driver_result(feed_inputs, Some((3, l1_chunk)), None, false, None, 2, None).await;
+        assert_driver_result(
+            feed_inputs,
+            Some((3, l1_chunk)),
+            Some("canonical L1 authority promotion is unavailable in phase A at sequence 1"),
+            false,
+            Some(3),
+            None,
+        )
+        .await;
     }
 
     fn deposit_message() -> BroadcastFeedMessage {
@@ -3522,9 +3948,31 @@ mod tests {
         expected_error: Option<&str>,
         wait_for_feed_dequeue: bool,
         expected_error_tip: Option<u64>,
-        expected_l1_verified_tip: u64,
         expected_marker_source: Option<ArbEngineInputSource>,
     ) {
+        const ERROR_CHILD: &str = "ARB_RETH_DRIVER_ERROR_TEST_CHILD";
+        let error_child = std::env::var_os(ERROR_CHILD).is_some();
+        if expected_error.is_some() && !error_child {
+            static ERROR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = ERROR_TEST_LOCK.lock().unwrap();
+            let test_name = std::thread::current()
+                .name()
+                .expect("Rust test thread has a name")
+                .to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(ERROR_CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "driver error child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
         let expected_canonical_tip =
             inputs
                 .iter()
@@ -3573,15 +4021,20 @@ mod tests {
             });
         let data_dir =
             maybe_path.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
-        let l1_verified_tip = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let launcher = ArbLauncher {
+            journal_directory: arb_reth_engine::JournalDirectory::open(
+                data_dir.db().parent().expect("datadir owns db directory"),
+            )
+            .expect("open pinned test datadir"),
             ctx: LaunchContext::new(task_executor, data_dir),
+            terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id,
             genesis_block: 0,
-            tuning: ArbEngineTuning::reth_defaults(),
+            tuning: ArbEngineTuning {
+                persistence_threshold: 0,
+                ..ArbEngineTuning::reth_defaults()
+            },
             prune_config: None,
-            init_message_journal_at_tip: false,
-            l1_verified_tip: l1_verified_tip.clone(),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,
@@ -3606,6 +4059,10 @@ mod tests {
                 .expect("database path has parent")
                 .join("arb-message-divergence.json")
         };
+        let authority_directory = arb_reth_engine::JournalDirectory::open(
+            marker_path.parent().expect("marker has datadir parent"),
+        )
+        .expect("open pinned launcher test datadir");
         let result_provider = handle.provider.clone();
         let driver_test_observations = handle.driver_test_observations.clone();
         if let Some(feed_tx) = feed_tx {
@@ -3614,6 +4071,7 @@ mod tests {
                 .expect("launcher must dequeue the feed-ahead input")
                 .expect("feed channel must remain open");
         }
+        let mut authority_before_phase_unavailable = None;
         if let Some((head, messages)) = l1_after_head {
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
@@ -3625,6 +4083,36 @@ mod tests {
             })
             .await
             .expect("feed message must become canonical");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let inspection =
+                        arb_reth_engine::inspect_message_journal(&authority_directory, 0);
+                    if inspection.is_ok_and(|journal| journal.watermark.block_number >= head) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("feed authority must become durable before L1 overlap");
+            authority_before_phase_unavailable = Some(
+                std::fs::read_dir(marker_path.parent().unwrap())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(arb_reth_engine::MESSAGE_JOURNAL_PREFIX)
+                    })
+                    .map(|entry| {
+                        (
+                            entry.file_name(),
+                            std::fs::read(entry.path()).expect("read frozen journal authority"),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
             for message in messages {
                 l1_tx
                     .try_send(message)
@@ -3637,27 +4125,59 @@ mod tests {
         match expected_error {
             Some(expected) => {
                 let error = result.expect_err("fail-closed input must stop the driver");
-                let divergence_sequence = arb_reth_engine::message_divergence_sequence(&error)
-                    .expect("deterministic message failure must identify its sequence");
                 let detail = format!("{error:#}");
                 assert!(detail.contains(expected), "unexpected error: {detail}");
-                let marker: serde_json::Value = serde_json::from_slice(
-                    &std::fs::read(&marker_path).expect("divergence marker must be readable"),
-                )
-                .expect("divergence marker must contain JSON");
-                assert_eq!(
-                    marker["incoming_message"]["sequenceNumber"].as_u64(),
-                    Some(divergence_sequence),
-                    "marker must retain the exact input that caused a buffered failure",
-                );
-                assert_eq!(
-                    marker["incoming_source"].as_str(),
-                    expected_marker_source.map(|source| match source {
-                        ArbEngineInputSource::Feed => "feed",
-                        ArbEngineInputSource::L1 => "l1",
-                    }),
-                    "marker must retain the exact source representation that diverged",
-                );
+                if error
+                    .downcast_ref::<arb_reth_engine::CanonicalL1PhaseUnavailable>()
+                    .is_some()
+                {
+                    assert!(
+                        !marker_path.exists(),
+                        "phase-unavailable closure must not manufacture divergence authority"
+                    );
+                    let after = std::fs::read_dir(marker_path.parent().unwrap())
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(arb_reth_engine::MESSAGE_JOURNAL_PREFIX)
+                        })
+                        .map(|entry| {
+                            (
+                                entry.file_name(),
+                                std::fs::read(entry.path())
+                                    .expect("read post-rejection journal authority"),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        authority_before_phase_unavailable.as_ref(),
+                        Some(&after),
+                        "CanonicalL1PhaseUnavailable mutated journal authority"
+                    );
+                } else {
+                    let divergence_sequence = arb_reth_engine::message_divergence_sequence(&error)
+                        .expect("deterministic message failure must identify its sequence");
+                    let marker: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(&marker_path).expect("divergence marker must be readable"),
+                    )
+                    .expect("divergence marker must contain JSON");
+                    assert_eq!(
+                        marker["incoming_message"]["sequenceNumber"].as_u64(),
+                        Some(divergence_sequence),
+                        "marker must retain the exact input that caused a buffered failure",
+                    );
+                    assert_eq!(
+                        marker["incoming_source"].as_str(),
+                        expected_marker_source.map(|source| match source {
+                            ArbEngineInputSource::Feed => "feed",
+                            ArbEngineInputSource::L1 => "l1",
+                        }),
+                        "marker must retain the exact source representation that diverged",
+                    );
+                }
                 if let Some(expected_tip) = expected_error_tip {
                     assert_eq!(
                         result_provider.best_block_number().unwrap_or_default(),
@@ -3676,12 +4196,8 @@ mod tests {
             }
         }
         assert_eq!(
-            l1_verified_tip.load(std::sync::atomic::Ordering::Acquire),
-            expected_l1_verified_tip,
-        );
-        assert_eq!(
             marker_path.exists(),
-            expected_error.is_some(),
+            expected_marker_source.is_some(),
             "only deterministic message failures create the startup-blocking marker",
         );
         assert_eq!(
@@ -3701,6 +4217,14 @@ mod tests {
                 result_provider.best_block_number().unwrap_or_default(),
                 "overlap-only production work must add zero to benchmark execution accounting",
             );
+        }
+        if error_child {
+            unsafe extern "C" {
+                fn _exit(status: i32) -> !;
+            }
+            // Error cleanup intentionally cannot terminate the engine or journal. Production
+            // resolves that state by process exit; this child gives the test the same boundary.
+            unsafe { _exit(0) }
         }
     }
 
@@ -3778,13 +4302,16 @@ mod tests {
         let node_builder_with_components = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
         let launcher = ArbLauncher {
+            journal_directory: arb_reth_engine::JournalDirectory::open(
+                data_dir.db().parent().expect("datadir owns db directory"),
+            )
+            .expect("open pinned test datadir"),
             ctx: LaunchContext::new(task_executor.clone(), data_dir),
+            terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: Some(prune_config),
-            init_message_journal_at_tip: false,
-            l1_verified_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,
@@ -3848,18 +4375,16 @@ mod tests {
 
     /// Drives the production parent-state provider path as fast as the local CPU can execute it.
     ///
-    /// This is intentionally ignored in normal CI. It feeds sequential deposits directly into the
-    /// real launcher, so every block performs ArbOS execution, engine-tree canonicalization, and
-    /// async Storage V2 persistence. The deep persistence window is deliberate: it creates the
-    /// maximum opportunity for `state_by_block_hash` to observe a persistence handoff.
+    /// It feeds sequential deposits directly into the real launcher, so every block performs ArbOS
+    /// execution, engine-tree canonicalization, and async Storage V2 persistence. The default is a
+    /// bounded CI fixture; `ARB_RACE_BLOCKS` can increase the local stress depth.
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "manual persistence stress test; run with ARB_RACE_BLOCKS=<n>"]
     async fn deep_buffer_persistence_stress() {
         let blocks = std::env::var("ARB_RACE_BLOCKS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|&value| value > 0)
-            .unwrap_or(10_000);
+            .unwrap_or(128);
         let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let json = std::fs::read_to_string(fixtures_dir.join("deposit_message_only.json"))
             .expect("read fixture");
@@ -3878,17 +4403,24 @@ mod tests {
             reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
                 datadir.clone(),
             );
+        let chain_spec = production_test_chain_spec();
         let config = NodeConfig::test()
-            .with_chain(MAINNET.clone())
+            .with_chain(chain_spec.clone())
             .with_datadir_args(reth_node_core::args::DatadirArgs {
                 datadir: maybe_path.clone(),
                 ..Default::default()
             });
-        let data_dir = maybe_path.unwrap_or_chain_default(MAINNET.chain(), config.datadir.clone());
+        let data_dir =
+            maybe_path.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
         let node_builder_with_components = NodeBuilder::new(config).with_database(db).node(ArbNode);
         let launcher = ArbLauncher {
+            journal_directory: arb_reth_engine::JournalDirectory::open(
+                data_dir.db().parent().expect("datadir owns db directory"),
+            )
+            .expect("open pinned test datadir"),
             ctx: LaunchContext::new(task_executor, data_dir),
-            chain_id: crate::ARB_ONE_CHAIN_ID,
+            terminal_signal: TerminalSignalObserver::for_test_runtime(),
+            chain_id: 412346,
             genesis_block: 0,
             tuning: ArbEngineTuning {
                 persistence_threshold: 128,
@@ -3899,8 +4431,6 @@ mod tests {
                 share_sparse_trie_with_payload_builder: false,
             },
             prune_config: None,
-            init_message_journal_at_tip: false,
-            l1_verified_tip: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             feed_messages: feed_rx,
             l1_messages: l1_rx,
             feed_latency: None,

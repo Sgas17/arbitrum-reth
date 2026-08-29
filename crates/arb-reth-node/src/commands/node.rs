@@ -24,31 +24,39 @@ use std::{
     fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicU64},
 };
 
 use crate::feed;
-use crate::launcher::ArbLauncher;
+use crate::launcher::{
+    ArbLauncher, ArbNodeHandle, TerminalSignalObserver, TerminalSignalOwner,
+    terminal_signal_channel,
+};
+use crate::lifecycle::{LifecycleGuard, LifecycleState};
 use crate::metrics::FeedLatencyTracker;
 use crate::mev_tx_logs::MevTxLogIpc;
 use crate::recovery::{
     ParentChainClaim, ParentChainClassification, RECOVERY_WORKER_ENV, RecoveryConfig,
     finalize_recovery_and_release, is_recovery_worker, preflight_before_l1_genesis,
-    prepare_recovery, recovery_failpoint,
+    preflight_ordinary_authority, prepare_recovery, recovery_failpoint,
 };
 use crate::{
-    ARB_ONE_CHAIN_ID, ArbNode, ArbTxLogBroadcaster, L1ResumeLog, arb_chain_spec,
+    ARB_ONE_CHAIN_ID, ArbNode, ArbTxLogBroadcaster, arb_chain_spec,
     arbos_init_from_chain_config_json, arbos_init_from_parsed,
 };
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
+use arb_reth_engine::{
+    JournalDirectory, inspect_message_journal, inspect_stopped_message_journal,
+    recover_stopped_message_journal,
+};
 use arb_reth_l1::{DelayedInboxReader, SequencerInboxReader};
 use arbitrum_alloy_sequencer::init_message::parse_init_message_from_body;
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use clap::Parser;
+use eyre::WrapErr as _;
 use reth_chainspec::{ChainSpec, MAINNET};
-use reth_cli_runner::CliContext;
-use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments, mdbx::SyncMode};
+use reth_cli_runner::{CliContext, CliRunner};
+use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments};
 use reth_node_builder::{LaunchContext, LaunchNode, NodeBuilder, NodeConfig};
 use reth_node_core::{
     args::{DatadirArgs, MetricArgs, PruningArgs},
@@ -56,6 +64,114 @@ use reth_node_core::{
 };
 use reth_provider::{BlockNumReader, HeaderProvider};
 use reth_tracing::tracing::{info, warn};
+
+struct ProcessSignals {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ProcessSignals {
+    fn install() -> std::io::Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn next(&mut self) -> std::io::Result<&'static str> {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    result?;
+                    Ok("SIGINT")
+                }
+                signal = self.terminate.recv() => {
+                    signal.ok_or_else(|| std::io::Error::other("SIGTERM stream closed"))?;
+                    Ok("SIGTERM")
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await?;
+            Ok("SIGINT")
+        }
+    }
+}
+
+async fn own_process_signals(
+    mut signals: ProcessSignals,
+    owner: TerminalSignalOwner,
+    runtime: reth_tasks::Runtime,
+) {
+    loop {
+        let signal = match signals.next().await {
+            Ok(signal) => signal,
+            Err(error) => {
+                reth_tracing::tracing::error!(
+                    target: "arb-reth",
+                    %error,
+                    "process signal owner failed",
+                );
+                return;
+            }
+        };
+        if owner.capture_first() {
+            info!(target: "arb-reth", signal, "received first graceful shutdown signal");
+            if runtime.initiate_graceful_shutdown().is_err() {
+                reth_tracing::tracing::error!(
+                    target: "arb-reth",
+                    "failed to initiate runtime shutdown after process signal",
+                );
+                return;
+            }
+        } else {
+            warn!(
+                target: "arb-reth",
+                signal,
+                "ignoring repeated shutdown signal; the original deadline remains authoritative",
+            );
+        }
+    }
+}
+
+/// Drive the node command to a terminal result without Reth's signal race dropping its owner.
+pub fn run_until_exit(runner: CliRunner, args: NodeArgs) -> eyre::Result<()> {
+    let runtime = runner.runtime();
+    let (signal_owner, signal_observer) = terminal_signal_channel();
+    let command_runtime = runtime.clone();
+    let result = runner.block_on(async move {
+        let signals = ProcessSignals::install()?;
+        let signal_task = tokio::spawn(own_process_signals(
+            signals,
+            signal_owner,
+            command_runtime.clone(),
+        ));
+        let result = run(
+            CliContext {
+                task_executor: command_runtime,
+            },
+            args,
+            signal_observer,
+        )
+        .await;
+        signal_task.abort();
+        let _ = signal_task.await;
+        result
+    });
+
+    if result.is_err() {
+        let _ = runtime.initiate_graceful_shutdown();
+    }
+    let graceful = runtime.graceful_shutdown_with_timeout(std::time::Duration::from_secs(5));
+    if result.is_ok() && !graceful {
+        return Err(eyre::eyre!(
+            "runtime tasks remained live after node terminal completion"
+        ));
+    }
+    result
+}
 
 /// `arb-reth`: standalone no-engine Arbitrum (ArbOS-on-reth) node.
 #[derive(Debug, Parser)]
@@ -109,7 +225,11 @@ pub struct NodeArgs {
     ///
     /// The Arbitrum default is 256 MiB. Reth's generic TreeConfig default is 4 GiB, which makes
     /// its fixed-cache tables needlessly sparse for this serial producer.
-    #[arg(long = "engine.cross-block-cache-size", default_value_t = 256, value_name = "MiB")]
+    #[arg(
+        long = "engine.cross-block-cache-size",
+        default_value_t = 256,
+        value_name = "MiB"
+    )]
     execution_cache_size_mb: usize,
 
     /// Share reth's cross-block execution cache with the serial native payload builder.
@@ -127,15 +247,6 @@ pub struct NodeArgs {
         default_value_t = false
     )]
     share_sparse_trie_with_payload_builder: bool,
-
-    /// Open MDBX in `SafeNoSync` durability mode: skip the per-commit fsync during bulk
-    /// historical sync. Each block still commits to MDBX (so the parent state is visible to the
-    /// child), but the OS flushes lazily, cutting ~50ms fsync latency off every block. Stays
-    /// crash-consistent (MDBX rolls back to the last synced meta page on restart); the only loss
-    /// on a crash is a suffix of recently-produced blocks, which the L1 derivation re-produces.
-    /// Not for a node expected to be durable across power loss without re-sync.
-    #[arg(long = "no-fsync", default_value_t = false)]
-    no_fsync: bool,
 
     /// Arbitrum execution chain id used by the block driver.
     #[arg(long, default_value_t = ARB_ONE_CHAIN_ID)]
@@ -224,10 +335,9 @@ pub struct NodeArgs {
     #[arg(long = "l1-beacon", value_name = "URL")]
     l1_beacon: Option<String>,
 
-    /// First L1 block to derive from. Optional override: normally the resume point comes from the
-    /// persisted `arb-l1-resume.json` checkpoint (updated as the node syncs), or, on the first sync
-    /// of a genesis snapshot, from the chain (batch 0's delivery block). Pass this only to force a
-    /// start block: it must be the batch boundary the current L2 tip was built from.
+    /// First L1 block to derive from. Optional override: without it Phase A re-derives from the
+    /// chain's batch-0 delivery block. Pass this only to force a start block: it must be the batch
+    /// boundary the current L2 tip was built from.
     #[arg(long = "l1-start-block")]
     l1_start_block: Option<u64>,
 
@@ -270,24 +380,26 @@ pub struct NodeArgs {
     #[arg(long = "l1-inbox-deploy-block")]
     l1_inbox_deploy_block: Option<u64>,
 
-    /// L2 block the chain's genesis sits at, the L2-numbering anchor on a no-checkpoint genesis
-    /// sync. Defaults to the Arbitrum One Nitro genesis (22207817) when targeting Arbitrum One, or
-    /// block 0 for a custom deployment (a fresh chain).
+    /// L2 block the chain's genesis sits at, the L2-numbering anchor for genesis-start derivation.
+    /// Defaults to the Arbitrum One Nitro genesis (22207817) when targeting Arbitrum One, or block 0
+    /// for a custom deployment (a fresh chain).
     #[arg(long = "l2-genesis-block")]
     l2_genesis_block: Option<u64>,
 
     /// Boot on a snapshot-imported datadir: path to the `reth-export --mode blocks` head stream
     /// (`H <num> <hash> <headerRLP>`). The node builds its chain spec from that head header so the
-    /// genesis-hash check accepts the imported DB, and resumes from the snapshot's head block.
+    /// genesis-hash check accepts the imported DB and anchors numbering at the snapshot head.
     /// Use with `--datadir <imported-dir>` (do not pass `--chain`).
     #[arg(long = "snapshot-head", value_name = "PATH")]
     snapshot_head: Option<PathBuf>,
 
-    /// One-shot migration for a database created before message journaling: trust the current
-    /// validated tip as the journal anchor. Startup fails if the journal already exists, forcing
-    /// this flag to be removed after one successful use.
-    #[arg(long = "init-message-journal-at-tip")]
-    init_message_journal_at_tip: bool,
+    /// Exact compile-time-allowlisted descriptor required with `--snapshot-head`.
+    #[arg(
+        long = "snapshot-trust-descriptor",
+        value_name = "PATH",
+        requires = "snapshot_head"
+    )]
+    snapshot_trust_descriptor: Option<PathBuf>,
 
     /// History-pruning / full-node configuration: reth's standard `--full` and granular
     /// `--prune.*` flags (e.g. `--prune.account-history.distance <BLOCKS>`,
@@ -395,11 +507,11 @@ fn resolve_rollup_deployment(args: &NodeArgs) -> eyre::Result<RollupDeployment> 
 /// genesis is the classic-state migration block, not an Initialize message.
 /// Reject a malformed `--l1-rpc` before any task is spawned.
 ///
-/// Only the genesis resume path builds a provider up front, and it does so incidentally, to
+/// Only the genesis derivation-start path builds a provider up front, and it does so incidentally, to
 /// resolve batch 0. Without this check, whether an operator gets a clear error or a node that
-/// boots and then silently stops depends on which resume path the flags happened to select. The
-/// sync runtime parses the same string again inside its task, where the failure is not recoverable
-/// and reaches only a log line.
+/// boots and then silently stops depends on which derivation start the flags select. The sync
+/// runtime parses the same string again inside its task, where the failure is not recoverable and
+/// reaches only a log line.
 fn validate_l1_rpc(l1_rpc: &str) -> eyre::Result<()> {
     l1_rpc
         .parse::<url::Url>()
@@ -466,12 +578,39 @@ fn run_recovery_worker_subprocess() -> eyre::Result<()> {
     Ok(())
 }
 
-pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
+pub(crate) async fn complete_terminal_shutdown<P, F, C>(
+    handle: ArbNodeHandle<P>,
+    stop_services: F,
+    mark_clean: C,
+) -> eyre::Result<()>
+where
+    F: std::future::Future<Output = eyre::Result<()>>,
+    C: FnOnce(tokio::time::Instant) -> eyre::Result<()>,
+{
+    let deadline = handle
+        .wait_for_node_exit_after_services(stop_services)
+        .await?;
+    mark_clean(deadline)
+}
+
+pub async fn run(
+    ctx: CliContext,
+    args: NodeArgs,
+    terminal_signal: TerminalSignalObserver,
+) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
+    warn!(
+        target: "arb-reth",
+        trading_permitted = crate::metrics::TRADING_PERMITTED,
+        phase_complete = crate::metrics::PHASE_COMPLETE,
+        "Phase A is a closed test artifact: canonical L1/recovery and admission/runtime phases are incomplete"
+    );
     let feed_sources =
         feed::expand_feed_sources(&args.feed_urls, args.feed_connections, &args.feed_sources)?;
     if args.no_l1_derive && feed_sources.is_empty() {
-        return Err(eyre::eyre!("--no-l1-derive requires at least one --feed-url"));
+        return Err(eyre::eyre!(
+            "--no-l1-derive requires at least one --feed-url"
+        ));
     }
     if args.no_l1_derive {
         warn!(target: "arb-reth", "L1 derivation disabled; feed-only message journal history cannot be compacted");
@@ -484,14 +623,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // --chain-info plus --genesis boots an Orbit chain. The pair supplies both the chain spec and
     // prealloc state, plus the L1 rollup deployment. Accepting either file alone would silently
     // construct a different genesis.
-    let orbit = match orbit_boot_paths(
-        args.chain_info.as_deref(),
-        args.genesis_json.as_deref(),
-    )? {
+    let orbit = match orbit_boot_paths(args.chain_info.as_deref(), args.genesis_json.as_deref())? {
         Some((ci, genesis)) => {
             let ci_json = fs::read(ci).map_err(|e| eyre::eyre!("read chain-info {ci:?}: {e}"))?;
-            let genesis_json = fs::read(genesis)
-                .map_err(|e| eyre::eyre!("read genesis {genesis:?}: {e}"))?;
+            let genesis_json =
+                fs::read(genesis).map_err(|e| eyre::eyre!("read genesis {genesis:?}: {e}"))?;
             let (spec, init, info) = crate::orbit_chain_from_files(&ci_json, &genesis_json)?;
             Some((std::sync::Arc::new(spec), init, info))
         }
@@ -515,6 +651,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // header (so reth's genesis-hash check accepts the DB). Takes precedence over --chain.
     // When --chain is provided the chain id is derived from the JSON so eth_chainId and the
     // driver agree. When not provided, the mainnet placeholder is used with --chain-id.
+    let mut snapshot_launch_head = None;
     let (chain_spec, effective_chain_id) = match (&orbit, &args.snapshot_head, &args.chain_config) {
         (Some((spec, init, info)), _, _) => {
             info!(
@@ -531,13 +668,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         }
         (None, Some(head_path), _) => {
             let (num, hash, header) = crate::read_head_header(head_path)?;
-            let datadir = args.datadir.as_deref().ok_or_else(|| {
-                eyre::eyre!("--snapshot-head requires an explicit --datadir")
-            })?;
-            super::snapshot::validate_snapshot_import_for_launch(
-                datadir,
-                &(num, hash, header.clone()),
-            )?;
+            eyre::ensure!(
+                args.datadir.is_some(),
+                "--snapshot-head requires an explicit --datadir"
+            );
+            snapshot_launch_head = Some((num, hash, header.clone()));
             let delayed_messages_read = u64::from_be_bytes(header.nonce.0);
             info!(
                 target: "arb-reth",
@@ -614,7 +749,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             minimum_pruning_distance = pc.minimum_pruning_distance,
             "history pruning enabled",
         ),
-        None => info!(target: "arb-reth", "archive node (no pruning configured; keeping all history)"),
+        None => {
+            info!(target: "arb-reth", "archive node (no pruning configured; keeping all history)")
+        }
     }
     let datadir_args = match args.datadir.clone() {
         Some(path) => DatadirArgs {
@@ -630,9 +767,58 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             ..Default::default()
         });
     let data_dir = config.datadir();
+    let journal_directory = JournalDirectory::open(data_dir.data_dir())?;
 
-    // Resolve the L1-derivation resume log path before `data_dir` is moved into the launcher.
-    let resume_checkpoint_path = L1ResumeLog::path_in(data_dir.data_dir());
+    // Pin and prove both authority files before any ordinary mutable store or service opens. The
+    // lifecycle binding uses the immutable anchor from the uniquely selected, validated lineage.
+    preflight_ordinary_authority(&journal_directory, snapshot_launch_head.is_some())?;
+    let (journal, journal_recovery_required) =
+        inspect_stopped_message_journal(&journal_directory, rollup.l2_genesis_block)?;
+    let lifecycle_anchor = journal.header.anchor;
+    let mut lifecycle = LifecycleGuard::open_existing(&journal_directory, lifecycle_anchor)?;
+    if journal_recovery_required {
+        eyre::ensure!(
+            lifecycle.selected().state == LifecycleState::RunningUnclean,
+            "recoverable journal transition without RUNNING lifecycle quarantine"
+        );
+        if is_recovery_worker() {
+            recover_stopped_message_journal(&journal_directory, rollup.l2_genesis_block)?;
+            return Ok(());
+        }
+        run_recovery_worker_subprocess()?;
+        let (reopened, still_pending) =
+            inspect_stopped_message_journal(&journal_directory, rollup.l2_genesis_block)?;
+        eyre::ensure!(
+            !still_pending,
+            "journal recovery worker left an unfinished transition"
+        );
+        eyre::ensure!(
+            reopened.header.anchor == journal.header.anchor,
+            "journal recovery changed the immutable anchor"
+        );
+    }
+    drop(journal);
+
+    if let Some(head) = snapshot_launch_head.as_ref() {
+        super::snapshot::validate_snapshot_import_for_launch(
+            &journal_directory,
+            head,
+            args.snapshot_trust_descriptor.as_deref().ok_or_else(|| {
+                eyre::eyre!("--snapshot-head requires --snapshot-trust-descriptor")
+            })?,
+        )?;
+    }
+
+    let lifecycle_evidence = lifecycle.selected().state;
+    match lifecycle_evidence {
+        LifecycleState::Clean => lifecycle.mark_running()?,
+        LifecycleState::Initializing => {
+            return Err(eyre::eyre!(
+                "selected lifecycle state is INITIALIZING; snapshot/operator recovery required"
+            ));
+        }
+        LifecycleState::RunningUnclean => {}
+    }
 
     let parent_chain_claim = orbit
         .as_ref()
@@ -650,6 +836,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         });
     let recovery = prepare_recovery(RecoveryConfig {
         datadir: data_dir.data_dir().to_path_buf(),
+        directory: journal_directory.clone(),
         chain_spec: chain_spec.clone(),
         chain_id: effective_chain_id,
         genesis_block: rollup.l2_genesis_block,
@@ -657,25 +844,32 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         bridge: rollup.bridge,
         deployed_at: rollup.deployed_at,
         parent_chain_claim,
-        snapshot_seeded: args.snapshot_head.is_some(),
+        snapshot_seeded: snapshot_launch_head.is_some(),
         prune_config: prune_config.clone(),
-        no_fsync: args.no_fsync,
         no_l1_derive: args.no_l1_derive,
         l1_rpc: args.l1_rpc.clone(),
         l1_beacon: args.l1_beacon.clone(),
         l1_start_block: args.l1_start_block,
         l1_start_delayed: args.l1_start_delayed,
         l1_end_block: args.l1_end_block,
+        lifecycle_state: lifecycle_evidence,
     })
     .await?;
     let recovery_gate = recovery.gate;
     let mut recovery_runtime = recovery.runtime;
-    if let Some(runtime) = recovery_runtime.as_ref().filter(|_| !is_recovery_worker()) {
+    if is_recovery_worker() && recovery_runtime.is_some() {
+        // The disposable child owns only the stopped DB>J unwind. `prepare_recovery` completed the
+        // repair and durably updated its marker; exiting now releases every storage handle.
+        return Ok(());
+    }
+    if let Some(runtime) = recovery_runtime.as_ref() {
         // Rederivation owns a writable Reth storage epoch. Run it in a disposable process so a
         // successful process exit proves every MDBX/static/Rocks handle and cached writer was
         // dropped before this parent reopens the datadir for the final exact proof.
-        run_recovery_worker_subprocess()?;
-        recovery_failpoint("recovery_worker_exited_before_reopen");
+        if runtime.needs_worker {
+            run_recovery_worker_subprocess()?;
+            recovery_failpoint("recovery_worker_exited_before_reopen");
+        }
         finalize_recovery_and_release(runtime, &recovery_gate)?;
         recovery_runtime = None;
     }
@@ -695,11 +889,8 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     };
 
     let db_path = data_dir.db();
-    info!(target: "arb-reth", path = ?db_path, no_fsync = args.no_fsync, "opening database");
-    let mut db_args = DatabaseArguments::new(ClientVersion::default());
-    if args.no_fsync {
-        db_args = db_args.with_sync_mode(Some(SyncMode::SafeNoSync));
-    }
+    info!(target: "arb-reth", path = ?db_path, "opening database");
+    let db_args = DatabaseArguments::new(ClientVersion::default());
     let db = init_db(db_path, db_args)?;
 
     let node_builder = NodeBuilder::new(config).with_database(db).node(ArbNode);
@@ -714,10 +905,13 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let feed_latency = (!feed_sources.is_empty()).then(FeedLatencyTracker::new);
 
     let rpc_addr = args.http.then(|| (args.http_addr, args.http_port).into());
-    let l1_verified_tip = Arc::new(AtomicU64::new(0));
+    let terminal_journal_directory = journal_directory.clone();
+    let terminal_genesis_block = rollup.l2_genesis_block;
 
     let launcher = ArbLauncher {
+        journal_directory,
         ctx: LaunchContext::new(task_executor.clone(), data_dir),
+        terminal_signal,
         chain_id: effective_chain_id,
         genesis_block: rollup.l2_genesis_block,
         tuning: crate::ArbEngineTuning {
@@ -734,8 +928,6 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             share_sparse_trie_with_payload_builder: args.share_sparse_trie_with_payload_builder,
         },
         prune_config,
-        init_message_journal_at_tip: args.init_message_journal_at_tip,
-        l1_verified_tip: l1_verified_tip.clone(),
         feed_messages: feed_rx,
         l1_messages: l1_rx,
         feed_latency: feed_latency.clone(),
@@ -748,6 +940,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     };
 
     let handle = launcher.launch_node(node_builder).await?;
+    let mut service_tasks = Vec::new();
 
     match handle.http_url() {
         Some(url) => info!(target: "arb-reth", %url, "arb-reth node started; eth_* RPC serving"),
@@ -758,9 +951,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 
     if let Some(ipc) = mev_tx_log_ipc {
         let path = ipc.path().to_owned();
-        task_executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
-            ipc.serve(shutdown).await;
-        });
+        service_tasks.push(task_executor.spawn_with_graceful_shutdown_signal(
+            |shutdown| async move {
+                ipc.serve(shutdown).await;
+            },
+        ));
         info!(target: "arb-reth::mev", path = %path.display(), "MEV transaction-log IPC listening");
     } else if let Some((path, broadcaster)) = args
         .mev_tx_log_ipc
@@ -769,26 +964,28 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         .filter(|_| !recovery_gate.is_ready())
     {
         let gate = recovery_gate.clone();
-        task_executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
-            gate.wait_ready().await;
-            match MevTxLogIpc::bind_with_broadcaster(path.clone(), broadcaster) {
-                Ok(ipc) => {
-                    info!(target: "arb-reth::mev", path = %path.display(), "MEV transaction-log IPC listening after recovery");
-                    ipc.serve(shutdown).await;
+        service_tasks.push(
+            task_executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
+                gate.wait_ready().await;
+                match MevTxLogIpc::bind_with_broadcaster(path.clone(), broadcaster) {
+                    Ok(ipc) => {
+                        info!(target: "arb-reth::mev", path = %path.display(), "MEV transaction-log IPC listening after recovery");
+                        ipc.serve(shutdown).await;
+                    }
+                    Err(error) => reth_tracing::tracing::error!(
+                        target: "arb-reth::mev",
+                        %error,
+                        "failed to bind MEV transaction-log IPC after recovery",
+                    ),
                 }
-                Err(error) => reth_tracing::tracing::error!(
-                    target: "arb-reth::mev",
-                    %error,
-                    "failed to bind MEV transaction-log IPC after recovery",
-                ),
-            }
-        });
+            }),
+        );
     }
 
     if let Some(feed_path) = args.replay_feed {
         let tx = feed_tx.clone();
         let gate = recovery_gate.clone();
-        task_executor.spawn_task(async move {
+        service_tasks.push(task_executor.spawn_task(async move {
             gate.wait_ready().await;
             let content = match fs::read_to_string(&feed_path) {
                 Ok(c) => c,
@@ -831,7 +1028,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             }
             info!(target: "arb-reth", pushed, "replay-feed push complete; node remains up for RPC");
             // tx (clone) is dropped here; the original feed_tx below keeps the channel open.
-        });
+        }));
     }
 
     // Live sequencer-feed followers: all connections race into a bounded coordinator. Only the
@@ -849,12 +1046,13 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             .unwrap_or(feed_genesis_block)
             .saturating_sub(feed_genesis_block)
             + 1;
-        let resume_sequence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(feed_start_seq));
+        let resume_sequence =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(feed_start_seq));
         let (ingress_tx, ingress_rx) = feed::ingress_channel();
         let gate = recovery_gate.clone();
         let coordinator_resume = resume_sequence.clone();
         let coordinator_feed = feed_tx.clone();
-        task_executor.spawn_task(async move {
+        service_tasks.push(task_executor.spawn_task(async move {
             gate.wait_ready().await;
             feed::coordinate(
                 ingress_rx,
@@ -863,16 +1061,16 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                 coordinator_resume,
             )
             .await;
-        });
+        }));
         for source in feed_sources {
             let gate = recovery_gate.clone();
             let ingress_tx = ingress_tx.clone();
             let resume_sequence = resume_sequence.clone();
             let ingress_metrics = handle.ingress_metrics.clone();
-            task_executor.spawn_task(async move {
+            service_tasks.push(task_executor.spawn_task(async move {
                 gate.wait_ready().await;
                 feed::follow(source, ingress_tx, resume_sequence, ingress_metrics).await;
-            });
+            }));
         }
     }
 
@@ -904,65 +1102,35 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             l2_genesis_block,
         } = rollup;
 
-        // The resume log lives in the data directory and is updated as sync advances, so a restart
-        // lifts off where it stopped instead of re-deriving from genesis.
-        let checkpoint_path = resume_checkpoint_path;
-        let resume_log = L1ResumeLog::load(&checkpoint_path);
-
-        // Resolve the L1 derivation resume point: (start_block, start_delayed, start_l2_block).
+        // Resolve the L1 derivation start: (start_block, start_delayed, start_l2_block).
         // `start_l2_block` is the L2 block the start point sits *after*; derived blocks are numbered
-        // from it so already-present ones can be verified. Precedence: an explicit --l1-start-block
-        // override, else the persisted checkpoint, else the genesis-snapshot bootstrap.
+        // from it so already-present ones can be compared with the v2 journal. Phase A accepts an
+        // explicit override or re-derives from genesis; resume artifacts are rejected at startup.
         let (start_block, start_delayed, start_l2_block) = if let Some(b) = args.l1_start_block {
             // Manual override: the operator asserts `b` is the batch boundary the tip was built
             // from, so the next derived block is `db_tip + 1`.
             let delayed = match args.l1_start_delayed {
                 Some(delayed) => delayed,
-                None => header_delayed_messages_read(&handle.provider, db_tip)?.ok_or_else(|| {
-                    eyre::eyre!(
-                        "cannot recover the delayed-message cursor: durable L2 tip header \
-                         {db_tip} is missing; pass --l1-start-delayed explicitly"
-                    )
-                })?,
-            };
-            info!(target: "arb-reth", l1_block = b, delayed, l2_block = db_tip, "L1 resume point: --l1-start-block override");
-            (b, delayed, db_tip)
-        } else if let Some(log) = &resume_log {
-            // Persisted log: resume from the newest boundary at or below the durable tip. Boundaries
-            // are only logged once their blocks are durable, so normally that is the newest entry.
-            // If every boundary is ABOVE the tip (e.g. a `SafeNoSync` power-loss rolled the DB back
-            // further than the log reaches), refuse rather than silently leave a gap.
-            match log.resume_for(db_tip) {
-                Some(cp) => {
-                    info!(
-                        target: "arb-reth",
-                        l1_block = cp.l1_block, delayed = cp.delayed_count, l2_block = cp.l2_block, db_tip,
-                        "L1 resume point: persisted checkpoint",
-                    );
-                    (cp.l1_block, cp.delayed_count, cp.l2_block)
-                }
                 None => {
-                    return Err(eyre::eyre!(
-                        "resume log at {} has no boundary at or below the durable L2 tip ({db_tip}); \
-                         the database was rolled back further than the log reaches; reset the \
-                         datadir and re-sync (or delete the log)",
-                        checkpoint_path.display(),
-                    ));
+                    header_delayed_messages_read(&handle.provider, db_tip)?.ok_or_else(|| {
+                        eyre::eyre!(
+                            "cannot recover the delayed-message cursor: durable L2 tip header \
+                         {db_tip} is missing; pass --l1-start-delayed explicitly"
+                        )
+                    })?
                 }
-            }
+            };
+            info!(target: "arb-reth", l1_block = b, delayed, l2_block = db_tip, "L1 derivation start: --l1-start-block override");
+            (b, delayed, db_tip)
         } else {
-            // No checkpoint: re-derive from Nitro genesis (batch 0), anchoring the L2 numbering at
-            // genesis. For a fresh genesis DB this is the normal bootstrap (nothing is skipped). For
-            // a DB that advanced past genesis but has no checkpoint (a rewound DB, or one synced by
-            // a build predating the resume log) the L1-sync runtime re-derives from genesis and
-            // verifies every durable overlap before producing the new tail. Slower to start than a
-            // checkpoint resume, but always correct and self-healing;
-            // the first window past db_tip writes a fresh checkpoint so later restarts are fast.
+            // Phase A always re-derives from Nitro genesis (batch 0), anchoring L2 numbering at
+            // genesis. For a fresh genesis DB this is the normal bootstrap. For an advanced DB the
+            // L1-sync runtime re-derives every durable overlap; it creates no resume artifact.
             if db_tip != l2_genesis_block {
                 info!(
                     target: "arb-reth", db_tip,
                     genesis = l2_genesis_block,
-                    "no resume checkpoint; re-deriving from genesis and verifying already-present blocks",
+                    "Phase A re-deriving from genesis and verifying already-present blocks",
                 );
             }
             // Resolve batch 0's delivery block on-chain (anchored at the SequencerInbox deploy
@@ -987,7 +1155,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             // The genesis header nonce is Nitro's cumulative delayed-messages-read count. It is
             // normally 1 because block 0 consumes the Initialize message.
             let delayed = args.l1_start_delayed.or(genesis_delayed).unwrap_or(0);
-            info!(target: "arb-reth", batch = 0, l1_block = block, delayed, "L1 resume point: genesis (batch 0)");
+            info!(target: "arb-reth", batch = 0, l1_block = block, delayed, "L1 derivation start: genesis (batch 0)");
             (block, delayed, l2_genesis_block)
         };
 
@@ -1005,39 +1173,36 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         }
         sync_cfg.start_l2_block = start_l2_block;
         sync_cfg.db_tip_l2 = db_tip;
-        // The driver seeds this exclusively from the durable message journal; L1 reconciliation
-        // advances it only after journal authority is published.
-        sync_cfg.l1_verified_tip = l1_verified_tip.clone();
-        sync_cfg.checkpoint_writes_ready = recovery_gate.readiness_atomic();
         // Messages are numbered by message index (block - genesis_block) for the driver's
         // sequence-reconciliation; without this a non-zero genesis (Arbitrum One) mis-numbers every
         // derived block and the driver applies none.
         sync_cfg.genesis_block = l2_genesis_block;
-        sync_cfg.checkpoint_path = Some(checkpoint_path);
 
-        // Read the durable L2 tip on demand so checkpoint writes only advance past blocks that are
-        // actually on disk (`last_block_number`, not the in-memory canonical head).
+        // Read the durable L2 tip on demand for overlap/retry progress. Phase A writes no resume
+        // checkpoint (`last_block_number` is not journal authority or the in-memory canonical head).
         let tip_provider = handle.provider.clone();
         let persisted_tip = move || tip_provider.last_block_number().unwrap_or(0);
 
         let tx = l1_tx.clone();
         let fatal_tx = l1_fatal_tx;
-        task_executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
-            if let Err(e) =
-                crate::supervise_l1_sync(sync_cfg, tx, persisted_tip, shutdown).await
-            {
-                reth_tracing::tracing::error!(
-                    target: "arb-reth",
-                    err = %e,
-                    "L1 sync stopped after a non-retryable failure",
-                );
-                // The supervisor already retried everything it treats as transient, so the chain
-                // cannot advance from here. Report it rather than leaving the node serving a tip
-                // that will never move: to a health check that looks like a live RPC reporting
-                // `eth_syncing: false`, which reads as fully synced.
-                let _ = fatal_tx.send(e);
-            }
-        });
+        service_tasks.push(task_executor.spawn_with_graceful_shutdown_signal(
+            |shutdown| async move {
+                if let Err(e) =
+                    crate::supervise_l1_sync(sync_cfg, tx, persisted_tip, shutdown).await
+                {
+                    reth_tracing::tracing::error!(
+                        target: "arb-reth",
+                        err = %e,
+                        "L1 sync stopped after a non-retryable failure",
+                    );
+                    // The supervisor already retried everything it treats as transient, so the
+                    // chain cannot advance from here. Report it rather than leaving the node serving a tip
+                    // that will never move: to a health check that looks like a live RPC reporting
+                    // `eth_syncing: false`, which reads as fully synced.
+                    let _ = fatal_tx.send(e);
+                }
+            },
+        ));
         info!(target: "arb-reth", start_block, start_delayed, start_l2_block, db_tip, "L1-derivation catch-up started");
     }
 
@@ -1045,13 +1210,50 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let _feed_tx = feed_tx;
     let _l1_tx = l1_tx;
 
-    // Park until the node exits normally, or until L1 derivation gives up. Returning `Err` here
-    // produces a non-zero exit, so a supervisor can restart or alert. When derivation never
-    // started the sender was dropped above, the receiver resolves to `Err(RecvError)`, the pattern
-    // fails to match, and that branch is disabled for the rest of the select.
+    // Park until the node exits normally, or until L1 derivation gives up. A fatal L1 result is
+    // cleanup-only: initiate runtime shutdown, continue driving this same terminal owner through
+    // producer joins, and preserve the original non-zero result. Because no process signal owns a
+    // deadline, that path cannot cross the lifecycle CLEAN preflight.
+    let terminal = complete_terminal_shutdown(
+        handle,
+        async {
+            for task in service_tasks {
+                task.await
+                    .map_err(|error| eyre::eyre!("node service task failed to join: {error}"))?;
+            }
+            Ok(())
+        },
+        |deadline| {
+            let final_journal =
+                inspect_message_journal(&terminal_journal_directory, terminal_genesis_block)
+                    .wrap_err("final pre-CLEAN journal-context proof")?;
+            eyre::ensure!(
+                final_journal.header.anchor == lifecycle_anchor,
+                "final pre-CLEAN journal context changed its immutable anchor"
+            );
+            lifecycle.mark_clean_until(deadline)
+        },
+    );
+    tokio::pin!(terminal);
     tokio::select! {
-        result = handle.wait_for_node_exit() => result,
-        Ok(err) = l1_fatal_rx => Err(eyre::eyre!("L1 derivation stopped and cannot resume: {err}")),
+        result = &mut terminal => result,
+        Ok(err) = l1_fatal_rx => {
+            let fatal = eyre::eyre!("L1 derivation stopped and cannot continue: {err}");
+            if task_executor.initiate_graceful_shutdown().is_err() {
+                reth_tracing::tracing::error!(
+                    target: "arb-reth",
+                    "failed to initiate cleanup shutdown after fatal L1 derivation",
+                );
+            }
+            if let Err(shutdown_error) = terminal.await {
+                reth_tracing::tracing::error!(
+                    target: "arb-reth",
+                    %shutdown_error,
+                    "terminal cleanup also failed after fatal L1 derivation",
+                );
+            }
+            Err(fatal)
+        },
     }
 }
 
@@ -1066,9 +1268,9 @@ mod tests {
         include_bytes!("../../tests/fixtures/robinhood-chain-info.json");
     const ROBINHOOD_GENESIS: &[u8] = include_bytes!("../../tests/fixtures/robinhood-genesis.json");
 
-    /// A bad `--l1-rpc` used to be caught only on the genesis resume path, which parses it to
-    /// resolve batch 0. The `--l1-start-block` and checkpoint paths never built a provider, so the
-    /// same input booted a node that logged one error and then served a tip that never advanced.
+    /// A bad `--l1-rpc` used to be caught only on the genesis-start path, which parses it to resolve
+    /// batch 0. Explicit start overrides never built a provider, so the same input booted a node
+    /// that logged one error and then served a tip that never advanced.
     #[test]
     fn a_malformed_l1_rpc_is_rejected_before_anything_is_spawned() {
         for bad in ["not-a-url", "", "://missing-scheme", "   "] {
@@ -1149,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_resume_delayed_cursor_comes_from_durable_tip_header() {
+    fn manual_start_delayed_cursor_comes_from_durable_tip_header() {
         let provider: MockEthProvider = MockEthProvider::new();
         let tip = 3_117;
         provider.add_header(
@@ -1196,6 +1398,16 @@ mod tests {
     }
 
     #[test]
+    fn removed_durability_bypass_flags_are_rejected_by_clap() {
+        for flag in ["--no-fsync", "--init-message-journal-at-tip"] {
+            let error = NodeArgs::try_parse_from(["arb-reth", flag])
+                .expect_err("removed Phase-A flag must fail during parsing");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            assert!(error.to_string().contains(flag));
+        }
+    }
+
+    #[test]
     fn cli_accepts_repeated_feed_urls_and_parallel_connections() {
         let args = NodeArgs::try_parse_from([
             "arb-reth",
@@ -1210,10 +1422,7 @@ mod tests {
 
         assert_eq!(
             args.feed_urls,
-            [
-                "wss://relay-a.example/feed",
-                "wss://relay-b.example/feed"
-            ]
+            ["wss://relay-a.example/feed", "wss://relay-b.example/feed"]
         );
         assert_eq!(args.feed_connections, Some(3));
         assert!(args.feed_sources.is_empty());

@@ -6,9 +6,9 @@ license.workspace = true
 authors.workspace = true
 
 # Stage F.3c catch-up runtime: drives `arb-reth-l1`'s SequencerInbox/delayed-inbox readers over L1
-# windows (with prefetch) into a feed-message channel, and the `arb-l1-resume.json` checkpoint log
-# (`resume`) that makes the walk resumable. Split out of `arb-reth-node`; the fetch/derive primitives
-# stay in `arb-reth-l1`, the node just consumes `run_l1_sync`.
+# windows (with prefetch) into a feed-message channel. Phase A has no checkpoint producer or
+# compatibility reader; retries re-derive from the configured start. Split out of `arb-reth-node`;
+# the fetch/derive primitives stay in `arb-reth-l1`, the node just consumes `run_l1_sync`.
 
 [dependencies]
 arb-reth-l1 = { path = "../arb-reth-l1" }

@@ -15,6 +15,16 @@ use std::{
 };
 
 const MAX_TRACKED_MESSAGES: usize = 16_384;
+pub(crate) const TRADING_PERMITTED: bool = false;
+pub(crate) const PHASE_COMPLETE: bool = false;
+
+/// Publish the permanent Phase-A closure flags after the process metrics recorder is installed.
+pub(crate) fn register_phase_a_metrics() {
+    let trading = metrics::gauge!("arb_reth_trading_permitted");
+    trading.set(f64::from(TRADING_PERMITTED));
+    let complete = metrics::gauge!("arb_reth_phase_complete");
+    complete.set(f64::from(PHASE_COMPLETE));
+}
 
 /// Source-independent ingress and execution-frontier metrics.
 #[derive(Metrics)]
@@ -32,10 +42,6 @@ struct IngressMetricHandles {
     executed_tip: Gauge,
     /// Latest sampled durable database block number.
     durable_tip: Gauge,
-    /// Latest journal-durable contiguous L1-authoritative block number.
-    l1_verified_tip: Gauge,
-    /// Executed blocks not yet covered by the journal-durable L1 authority frontier.
-    verification_distance: Gauge,
     /// Unix timestamp seconds of the latest live-feed WebSocket text or binary frame.
     last_feed_frame_timestamp_seconds: Gauge,
     /// Unix timestamp seconds of the latest physical Feed driver-channel dequeue.
@@ -45,7 +51,6 @@ struct IngressMetricHandles {
 struct IngressMetricsInner {
     handles: IngressMetricHandles,
     executed_tip: AtomicU64,
-    sampled_verified_tip: AtomicU64,
     latest_feed_frame_timestamp: AtomicU64,
     #[cfg(test)]
     executed_publish_pause: ExecutedPublishPause,
@@ -71,7 +76,7 @@ pub(crate) struct IngressMetrics {
 }
 
 impl IngressMetrics {
-    /// Register all ten metrics. Construct this only after the Prometheus recorder is installed.
+    /// Register all eight metrics. Construct this only after the Prometheus recorder is installed.
     pub(crate) fn new() -> Self {
         Self::from_handles(IngressMetricHandles::default())
     }
@@ -83,15 +88,12 @@ impl IngressMetrics {
         handles.l1_dequeued_total.increment(0);
         handles.executed_tip.set(0.0);
         handles.durable_tip.set(0.0);
-        handles.l1_verified_tip.set(0.0);
-        handles.verification_distance.set(0.0);
         handles.last_feed_frame_timestamp_seconds.set(0.0);
         handles.last_feed_dequeue_timestamp_seconds.set(0.0);
         Self {
             inner: Arc::new(IngressMetricsInner {
                 handles,
                 executed_tip: AtomicU64::new(0),
-                sampled_verified_tip: AtomicU64::new(0),
                 latest_feed_frame_timestamp: AtomicU64::new(0),
                 #[cfg(test)]
                 executed_publish_pause: ExecutedPublishPause::default(),
@@ -152,19 +154,17 @@ impl IngressMetrics {
     }
 
     pub(crate) fn set_executed_tip(&self, tip: u64) {
-        self.inner.executed_tip.store(tip, Ordering::Release);
+        let previous = self.inner.executed_tip.fetch_max(tip, Ordering::AcqRel);
+        let mut latest = previous.max(tip);
+        #[cfg(test)]
+        Self::pause_test_publish(&self.inner.executed_publish_pause);
         loop {
-            self.inner.handles.executed_tip.set(tip as f64);
-            let verified = self.inner.sampled_verified_tip.load(Ordering::Acquire);
-            #[cfg(test)]
-            self.pause_executed_publish_after_verified_load();
-            self.inner
-                .handles
-                .verification_distance
-                .set(tip.saturating_sub(verified) as f64);
-            if self.inner.sampled_verified_tip.load(Ordering::Acquire) == verified {
+            self.inner.handles.executed_tip.set(latest as f64);
+            let current = self.inner.executed_tip.load(Ordering::Acquire);
+            if current == latest {
                 break;
             }
+            latest = current;
         }
     }
 
@@ -195,11 +195,6 @@ impl IngressMetrics {
             .expect("executed publish pause lock poisoned");
         *resumed = true;
         self.inner.executed_publish_pause.resume.notify_one();
-    }
-
-    #[cfg(test)]
-    fn pause_executed_publish_after_verified_load(&self) {
-        Self::pause_test_publish(&self.inner.executed_publish_pause);
     }
 
     #[cfg(test)]
@@ -267,20 +262,11 @@ impl IngressMetrics {
         pause.resume.notify_one();
     }
 
-    /// Initialize the shared executed frontier and all four frontier gauges from one startup sample.
-    pub(crate) fn initialize_frontiers(&self, executed: u64, durable: u64, verified: u64) {
-        let distance = executed.saturating_sub(verified);
+    /// Initialize the shared executed and durable frontiers from one startup sample.
+    pub(crate) fn initialize_frontiers(&self, executed: u64, durable: u64) {
         self.inner.executed_tip.store(executed, Ordering::Release);
-        self.inner
-            .sampled_verified_tip
-            .store(verified, Ordering::Release);
         self.inner.handles.executed_tip.set(executed as f64);
         self.inner.handles.durable_tip.set(durable as f64);
-        self.inner.handles.l1_verified_tip.set(verified as f64);
-        self.inner
-            .handles
-            .verification_distance
-            .set(distance as f64);
     }
 
     /// Apply one sampler tick while preserving the previous durable value on a read failure.
@@ -288,7 +274,6 @@ impl IngressMetrics {
         &self,
         durable: &mut u64,
         durable_read: Result<u64, E>,
-        verified: u64,
         captured_executed: u64,
     ) -> Result<(), E> {
         let result = match durable_read {
@@ -298,25 +283,8 @@ impl IngressMetrics {
             }
             Err(error) => Err(error),
         };
-        self.inner
-            .sampled_verified_tip
-            .store(verified, Ordering::Release);
         self.inner.handles.durable_tip.set(*durable as f64);
-        self.inner.handles.l1_verified_tip.set(verified as f64);
-
-        let mut executed = captured_executed;
-        loop {
-            self.inner.handles.executed_tip.set(executed as f64);
-            self.inner
-                .handles
-                .verification_distance
-                .set(executed.saturating_sub(verified) as f64);
-            let current = self.executed_tip();
-            if current == executed {
-                break;
-            }
-            executed = current;
-        }
+        self.set_executed_tip(captured_executed);
         result
     }
 }

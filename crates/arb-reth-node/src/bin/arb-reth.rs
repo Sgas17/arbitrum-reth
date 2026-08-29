@@ -18,11 +18,11 @@ use arb_reth_node::commands::{
     self,
     dump_blocks::DumpBlocksArgs,
     genesis::{GenesisVerifyArgs, GenesisVerifyExportArgs},
+    journal_init::JournalV2InitArgs,
     node::NodeArgs,
     rewind::RewindArgs,
     snapshot::{
-        SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs,
-        SnapshotRepairHistoryArgs,
+        SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs, SnapshotRepairHistoryArgs,
     },
     snapshot_full::{SnapshotFinalizeArgs, SnapshotImportFullArgs},
 };
@@ -41,7 +41,10 @@ use reth_tracing::{RethTracer, Tracer};
 pub unsafe extern "C" fn __rust_probestack() {}
 
 #[derive(Debug, Parser)]
-#[command(name = "arb-reth", about = "Standalone no-engine Arbitrum (ArbOS-on-reth) node")]
+#[command(
+    name = "arb-reth",
+    about = "Standalone no-engine Arbitrum (ArbOS-on-reth) node"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -52,6 +55,8 @@ struct Cli {
 enum Command {
     /// Run the standalone no-engine Arbitrum node.
     Node(NodeArgs),
+    /// One-shot trusted Phase-A journal and lifecycle initialization.
+    JournalV2Init(JournalV2InitArgs),
     /// Snapshot import/read tools.
     Snapshot(SnapshotCmd),
     /// Genesis verification tools.
@@ -100,7 +105,7 @@ enum GenesisSub {
 
 fn main() -> eyre::Result<()> {
     if arb_reth_node::run_recovery_validation_child_from_env()? {
-        return Ok(())
+        return Ok(());
     }
 
     // Idiomatic reth tracing; guard is held for the process lifetime.
@@ -117,8 +122,9 @@ fn main() -> eyre::Result<()> {
     match cli.command {
         Command::Node(args) => {
             let runner = CliRunner::try_default_runtime()?;
-            runner.run_command_until_exit(|ctx| commands::node::run(ctx, args))
+            commands::node::run_until_exit(runner, args)
         }
+        Command::JournalV2Init(args) => commands::journal_init::run(args),
         Command::Snapshot(cmd) => match cmd.command {
             SnapshotSub::BuildPreimages(args) => commands::snapshot::build_preimages(args),
             SnapshotSub::Import(args) => commands::snapshot::import(args),

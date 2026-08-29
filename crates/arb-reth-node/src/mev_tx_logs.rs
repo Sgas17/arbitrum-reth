@@ -51,16 +51,16 @@ impl MevTxLogIpc {
 
     /// Serves local clients until the runtime begins graceful shutdown.
     pub(crate) async fn serve(self, mut shutdown: reth_tasks::shutdown::GracefulShutdown) {
-        loop {
+        let mut clients = tokio::task::JoinSet::new();
+        let shutdown_guard = loop {
             tokio::select! {
                 guard = &mut shutdown => {
-                    drop(guard);
-                    break;
+                    break guard;
                 }
                 accepted = self.listener.accept() => match accepted {
                     Ok((stream, _)) => {
                         let events = self.broadcaster.subscribe();
-                        tokio::spawn(stream_client(stream, events));
+                        clients.spawn(stream_client(stream, events));
                     }
                     Err(error) => {
                         reth_tracing::tracing::warn!(
@@ -71,8 +71,26 @@ impl MevTxLogIpc {
                         );
                     }
                 },
+                completed = clients.join_next(), if !clients.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        panic!("MEV transaction-log client task failed: {error}");
+                    }
+                }
+            }
+        };
+
+        // No publisher may survive the service task that the terminal owner joins. Aborting and
+        // joining every connected client closes its socket and drops its broadcast receiver before
+        // the outer MEV service acknowledges shutdown.
+        clients.abort_all();
+        while let Some(completed) = clients.join_next().await {
+            if let Err(error) = completed
+                && !error.is_cancelled()
+            {
+                panic!("MEV transaction-log client task failed during shutdown: {error}");
             }
         }
+        drop(shutdown_guard);
     }
 }
 
@@ -302,5 +320,56 @@ mod tests {
 
         drop(broadcaster);
         client.await.expect("client task exits");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graceful_shutdown_joins_connected_client_publishers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("joined-mev.sock");
+        let broadcaster = ArbTxLogBroadcaster::new();
+        let ipc = MevTxLogIpc::bind_with_broadcaster(&path, broadcaster.clone()).unwrap();
+        let runtime = reth_tasks::Runtime::test();
+        let server = runtime.spawn_with_graceful_shutdown_signal(|shutdown| async move {
+            ipc.serve(shutdown).await;
+        });
+        let mut client = UnixStream::connect(&path).await.expect("connect client");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        broadcaster.publish(ArbTxLogEvent {
+            block_number: 42,
+            transaction_index: 3,
+            transaction_hash: B256::ZERO,
+            frontier_id: B256::repeat_byte(0xcc),
+            kind: ArbTxExecutionKind::User,
+            success: true,
+            gas_used: 21_000,
+            logs: Vec::new(),
+        });
+        let mut length = [0; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read_exact(&mut length),
+        )
+        .await
+        .expect("accepted client receives a frame")
+        .expect("read frame length");
+        let mut body = vec![0; u32::from_be_bytes(length) as usize];
+        client.read_exact(&mut body).await.expect("read frame");
+
+        drop(
+            runtime
+                .initiate_graceful_shutdown()
+                .expect("initiate MEV service shutdown"),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("MEV service joins all clients")
+            .expect("MEV service task does not panic");
+        let mut trailing = [0; 1];
+        assert_eq!(
+            client.read(&mut trailing).await.expect("read client EOF"),
+            0,
+            "joined client publisher must close its socket"
+        );
+        assert!(!path.exists(), "joined MEV service removes its socket");
     }
 }

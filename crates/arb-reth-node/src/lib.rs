@@ -29,16 +29,18 @@ extern crate alloc;
 
 pub mod commands;
 
+pub mod lifecycle;
 mod recovery;
+mod snapshot_trust;
 
 mod feed;
 
 pub mod genesis;
 pub use genesis::{
-    arb_chain_spec, arb_chain_spec_with_alloc, arb_chain_spec_with_header,
-    arbos_init_from_chain_config_json, arbos_init_from_parsed, orbit_chain_from_chain_info,
-    orbit_chain_from_files, parse_chain_info, parse_nitro_genesis, read_head_header, ChainInfo,
-    NitroGenesisFile, RollupInfo,
+    ChainInfo, NitroGenesisFile, RollupInfo, arb_chain_spec, arb_chain_spec_with_alloc,
+    arb_chain_spec_with_header, arbos_init_from_chain_config_json, arbos_init_from_parsed,
+    orbit_chain_from_chain_info, orbit_chain_from_files, parse_chain_info, parse_nitro_genesis,
+    read_head_header,
 };
 
 pub mod hashed_db;
@@ -50,18 +52,16 @@ pub use hashed_db::{account_by_address, code_of, storage_at};
 pub mod persist;
 pub use persist::persist_executed_block;
 
-// The L1-derivation catch-up runtime and its resume-checkpoint log now live in the
-// `arb-reth-sync` crate; re-export for API stability.
-pub use arb_reth_sync::l1_sync::{run_l1_sync, supervise_l1_sync, L1SyncConfig, L1SyncError};
-pub use arb_reth_sync::resume::{L1ResumeCheckpoint, L1ResumeLog};
+// The L1-derivation catch-up runtime lives in `arb-reth-sync`.
+pub use arb_reth_sync::l1_sync::{L1SyncConfig, L1SyncError, run_l1_sync, supervise_l1_sync};
 
 pub mod launcher;
 pub use launcher::{ArbLauncher, ArbNodeHandle};
 #[doc(hidden)]
 pub use recovery::{RecoveryGate, RecoveryRuntime, run_recovery_validation_child_from_env};
 
-mod mev_tx_logs;
 mod mev_frontier_rpc;
+mod mev_tx_logs;
 
 mod metrics;
 pub use metrics::FeedLatencyTracker;

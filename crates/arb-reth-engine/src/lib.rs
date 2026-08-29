@@ -35,15 +35,19 @@ mod tx_log_stream;
 pub use engine::ArbEngineLifecycleProbe;
 pub use engine::{
     ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, ArbMessageDivergence,
-    is_message_divergence, message_divergence_sequence, wait_for_head,
+    CanonicalL1PhaseUnavailable, is_message_divergence, message_divergence_sequence, wait_for_head,
 };
 pub use engine_spike::ArbPayloadValidator;
 pub use message_compare::{ArbMessageEnrichment, ArbMessageFingerprint, fingerprint_message};
+#[cfg(debug_assertions)]
+pub use message_journal::AuthorityHotPathGuard;
 pub use message_journal::{
-    DIVERGENCE_MARKER_FILE, MESSAGE_JOURNAL_FILE, MessageJournalAnchor, MessageJournalEntry,
-    MessageJournalInspection, clear_divergence_marker_at, divergence_marker_path,
-    inspect_message_journal, message_journal_path, rewrite_journal_to_identity_at,
-    truncate_journal_at, validate_journal_target_at,
+    DIVERGENCE_MARKER_FILE, JournalBenchmarkAdapter, JournalDirectory, LIFECYCLE_FILE,
+    MESSAGE_JOURNAL_PREFIX, MESSAGE_JOURNAL_V1_FILE, MessageJournalAnchor, MessageJournalEntry,
+    MessageJournalInspection, PromotionCheckpoint, assert_authority_operation_allowed,
+    clear_divergence_marker_at, divergence_marker_path, encode_promotion_payload,
+    initialize_journal_v2, inspect_message_journal, inspect_stopped_message_journal,
+    recover_stopped_message_journal, truncate_authenticated_short_tail,
 };
 pub use native_payload::ArbPayloadBuilder;
 pub use tx_log_stream::{

@@ -10,15 +10,10 @@ The endpoint includes reth engine-tree, persistence, state-root, and RPC metrics
 
 ## Recovery readiness
 
-`reth_arb_reth_recovery_ready` is one unlabeled 0/1 gauge registered in every node mode. It is `1`
-on normal exact-parity startup. It remains `0` for the entire
-`arb-message-recovery.json` quarantine, including offline repair and authoritative L1
-rederivation, and changes to `1` only after the final marker unlink and parent-directory fsync.
-The same production gate releases Feed, replay-file input, ordinary HTTP/WS RPC, and MEV IPC
-publication, so this gauge does not race a parallel test or service-ready state.
-
-The gauge reports crash-recovery quarantine only. It does not define trading readiness and does
-not change the ten `arb_reth.ingress` metric names or scheduler semantics below.
+`reth_arb_reth_recovery_ready` reports only the internal recovery gate. It never authorizes service
+or trading in Phase A. The separate constant gauges `reth_arb_reth_trading_permitted` and
+`reth_arb_reth_phase_complete` are both `0`; there is no CLI override or OPEN transition. Exact
+DB/journal classification and bounded DB>J repair remain closed.
 
 ## Ingress scheduling and frontiers
 
@@ -35,15 +30,9 @@ L1-only modes. They have no labels:
   including removal into a pending head. Moving that head into selected service is not counted
   again.
 - `reth_arb_reth_ingress_executed_tip` is the canonical in-memory execution frontier;
-  `reth_arb_reth_ingress_durable_tip` is the database persistence frontier; and
-  `reth_arb_reth_ingress_l1_verified_tip` is the maximal contiguous journal-durable
-  L1-authoritative frontier.
-- `reth_arb_reth_ingress_verification_distance` is
-  `executed_tip - l1_verified_tip`, saturating at zero. A large value means execution has moved
-  farther ahead of durable L1 verification; inspect it alongside both queue depths and the durable
-  tip to distinguish scheduler saturation, execution lag, persistence lag, and L1-verification
-  lag. Excessive distance is an input to a future trading/readiness kill switch. This release does
-  not activate trading or enforce policy.
+  `reth_arb_reth_ingress_durable_tip` is a sampled database persistence frontier. Neither metric is
+  journal D/J or canonical-L1 authority. Phase A publishes no L1-verified tip or verification
+  distance; V/R belong to Phase B.
 - `reth_arb_reth_ingress_last_feed_frame_timestamp_seconds` is updated on every successfully
   received WebSocket text or binary data frame before conversion or parsing, including duplicate,
   stale, malformed, and message-empty frames. Ping, pong, and close frames do not update it.

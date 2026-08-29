@@ -14,7 +14,7 @@ use std::{
     collections::HashSet,
     fs::File,
     io::{BufReader, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -28,7 +28,7 @@ use arb_reth_genesis::snapshot_stream::{HistoryObject, Manifest, Record, Snapsho
 use arbitrum_alloy_consensus::reth::ArbBlockBody;
 use clap::Parser;
 use reth_chainspec::ChainSpec;
-use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments};
+use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments, open_db_read_only};
 use reth_db_api::{
     cursor::DbCursorRW,
     database::Database,
@@ -39,7 +39,7 @@ use reth_db_api::{
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_provider::{
-    BlockWriter, DBProvider, DatabaseProviderFactory, EitherWriter, MetadataWriter,
+    BlockNumReader, BlockWriter, DBProvider, DatabaseProviderFactory, EitherWriter, MetadataWriter,
     ProviderFactory, StaticFileProviderFactory, StaticFileWriter, StorageSettingsCache,
     providers::{RocksDBProvider, StaticFileProvider},
 };
@@ -54,7 +54,14 @@ use reth_storage_api::{BlockBodyIndicesProvider, StageCheckpointWriter};
 use reth_tasks::Runtime;
 use reth_tracing::tracing::info;
 
-use crate::{ArbNode, L1ResumeCheckpoint, L1ResumeLog, stored_receipt::decode_stored_receipts};
+use crate::{
+    ArbNode,
+    snapshot_trust::{
+        ApprovedSnapshotTrust, SnapshotDigestReader, load_approved_descriptor,
+        verify_snapshot_metadata, verify_snapshot_stream_digest, write_completion,
+    },
+    stored_receipt::decode_stored_receipts,
+};
 
 type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;
 
@@ -111,6 +118,10 @@ pub struct SnapshotImportFullArgs {
     /// Nitro `genesis.json` for the same chain.
     #[arg(long = "genesis", value_name = "PATH")]
     genesis_json: PathBuf,
+
+    /// Exact compile-time-allowlisted Robinhood snapshot trust descriptor.
+    #[arg(long = "snapshot-trust-descriptor", value_name = "PATH")]
+    snapshot_trust_descriptor: PathBuf,
 }
 
 /// Finish a datadir whose sections were imported but which never reached finalisation.
@@ -139,99 +150,10 @@ pub struct SnapshotFinalizeArgs {
 /// needs comes back out of the datadir: the convert point is the highest header, its root and hash
 /// come from that header, and `S_lo` is where the changeset segments begin.
 pub fn finalize_datadir(args: SnapshotFinalizeArgs) -> eyre::Result<()> {
-    let manifest_path = args
-        .datadir
-        .join(super::snapshot::SNAPSHOT_IMPORT_MANIFEST_FILE);
-    if manifest_path.exists() {
-        return Err(eyre::eyre!(
-            "{} is already finished; its completion manifest is at {}",
-            args.datadir.display(),
-            manifest_path.display()
-        ));
-    }
-
-    let static_files_path = args.datadir.join("static_files");
-    let history_from = lowest_changeset_block(&static_files_path)?;
-
-    let chain_info = std::fs::read(&args.chain_info)
-        .map_err(|error| eyre::eyre!("read {}: {error}", args.chain_info.display()))?;
-    let genesis = std::fs::read(&args.genesis_json)
-        .map_err(|error| eyre::eyre!("read {}: {error}", args.genesis_json.display()))?;
-    let (chain_spec, _init, _info) = crate::orbit_chain_from_files(&chain_info, &genesis)?;
-
-    let factory = open_factory(
-        &args.datadir.join("db"),
-        &static_files_path,
-        &args.datadir.join("rocksdb"),
-        Arc::new(chain_spec),
-    )?;
-
-    // The convert point is wherever the blocks section stopped, and its header carries the root the
-    // trie was already checked against.
-    let provider = factory.provider()?;
-    let block = provider
-        .static_file_provider()
-        .get_highest_static_file_block(StaticFileSegment::Headers)
-        .ok_or_else(|| eyre::eyre!("no headers in {}", args.datadir.display()))?;
-    let head = reth_storage_api::HeaderProvider::sealed_header(&provider, block)?
-        .ok_or_else(|| eyre::eyre!("block {block} is missing its header"))?;
-    let manifest = Manifest {
-        block,
-        root: head.state_root,
-        state_id: 0,
-        hash: head.hash(),
-        resume: None,
-    };
-    drop(provider);
-
-    info!(
-        target: "arb-snapshot",
-        block,
-        root = %manifest.root,
-        history_from,
-        "finishing a datadir that stopped after its state root"
-    );
-
-    finalize(&factory, &manifest, history_from, &args.datadir)?;
-    println!(
-        "finished {} at block {block} root {:#x}",
-        args.datadir.display(),
-        manifest.root
-    );
-    Ok(())
-}
-
-/// `S_lo`, read from where the account-changeset segments begin.
-///
-/// reth resolves a segment's path from the block range in its name, and the import renames those
-/// files to agree with their headers, so the lowest name is the lowest block with history.
-fn lowest_changeset_block(static_files: &std::path::Path) -> eyre::Result<u64> {
-    const PREFIX: &str = "static_file_account-change-sets_";
-    let mut lowest: Option<u64> = None;
-    for entry in std::fs::read_dir(static_files)
-        .map_err(|error| eyre::eyre!("read {}: {error}", static_files.display()))?
-    {
-        let name = entry?.file_name().to_string_lossy().into_owned();
-        let Some(range) = name.strip_prefix(PREFIX) else {
-            continue;
-        };
-        // Skip the sidecars, which share the prefix but carry an extension.
-        if range.contains('.') {
-            continue;
-        }
-        let Some((start, _)) = range.split_once('_') else {
-            continue;
-        };
-        if let Ok(start) = start.parse::<u64>() {
-            lowest = Some(lowest.map_or(start, |current: u64| current.min(start)));
-        }
-    }
-    lowest.ok_or_else(|| {
-        eyre::eyre!(
-            "no account-changeset segments in {}; this datadir has no state history to finish",
-            static_files.display()
-        )
-    })
+    let _ = args;
+    Err(eyre::eyre!(
+        "Phase A disables detached snapshot finalization: only one fully streamed, descriptor-verified import may create completion evidence"
+    ))
 }
 
 /// What a section wrote, for the run's summary and for cross-checking against the exporter's own
@@ -248,26 +170,44 @@ pub struct BlockSectionStats {
 }
 
 pub fn import_full(args: SnapshotImportFullArgs) -> eyre::Result<()> {
+    // Inventory is read-only and must reject stale authority before any untrusted input is opened.
     super::snapshot::ensure_fresh_import_target(&args.out)?;
+    let chain_info = std::fs::read(&args.chain_info)
+        .map_err(|error| eyre::eyre!("read {}: {error}", args.chain_info.display()))?;
+    let genesis = std::fs::read(&args.genesis_json)
+        .map_err(|error| eyre::eyre!("read {}: {error}", args.genesis_json.display()))?;
+    let trust = load_approved_descriptor(&args.snapshot_trust_descriptor)?;
+    // Verify all small externally supplied trust bytes before inspecting or mutating the target.
+    // The 449 GB stream itself is hashed exactly once, by the reader that imports it below.
+    verify_snapshot_metadata(trust, &chain_info, &genesis)?;
+    let (chain_spec, init, _info) = crate::orbit_chain_from_files(&chain_info, &genesis)?;
+    if init.chain_id.to::<u64>() != trust.chain_id {
+        return Err(eyre::eyre!(
+            "snapshot chain id does not match frozen trust descriptor"
+        ));
+    }
+    let chain_spec = Arc::new(chain_spec);
 
     let file = File::open(&args.stream)
         .map_err(|error| eyre::eyre!("open {}: {error}", args.stream.display()))?;
-    let mut stream = SnapshotStream::open(BufReader::with_capacity(STREAM_BUFFER, file))?;
+    let reader = SnapshotDigestReader::new(BufReader::with_capacity(STREAM_BUFFER, file));
+    let mut stream = SnapshotStream::open(reader)?;
     let manifest = stream.manifest().clone();
+    if manifest.block != trust.head_number
+        || manifest.hash != trust.head_hash
+        || manifest.root != trust.head_state_root
+    {
+        return Err(eyre::eyre!(
+            "full snapshot manifest does not match the frozen Robinhood head identity"
+        ));
+    }
     info!(
         target: "arb-snapshot",
         block = manifest.block,
         root = %manifest.root,
         state_id = manifest.state_id,
-        "opened full-snapshot stream"
+        "opened descriptor-verified full-snapshot stream"
     );
-
-    let chain_info = std::fs::read(&args.chain_info)
-        .map_err(|error| eyre::eyre!("read {}: {error}", args.chain_info.display()))?;
-    let genesis = std::fs::read(&args.genesis_json)
-        .map_err(|error| eyre::eyre!("read {}: {error}", args.genesis_json.display()))?;
-    let (chain_spec, _init, _info) = crate::orbit_chain_from_files(&chain_info, &genesis)?;
-    let chain_spec = Arc::new(chain_spec);
 
     let db_path = args.out.join("db");
     let static_files_path = args.out.join("static_files");
@@ -275,7 +215,12 @@ pub fn import_full(args: SnapshotImportFullArgs) -> eyre::Result<()> {
     std::fs::create_dir_all(&static_files_path)?;
     std::fs::create_dir_all(&rocksdb_path)?;
 
-    let factory = open_factory(&db_path, &static_files_path, &rocksdb_path, chain_spec)?;
+    let factory = open_factory(
+        &db_path,
+        &static_files_path,
+        &rocksdb_path,
+        chain_spec.clone(),
+    )?;
 
     let blocks = write_blocks(&factory, &mut stream, &manifest)?;
     info!(
@@ -307,6 +252,10 @@ pub fn import_full(args: SnapshotImportFullArgs) -> eyre::Result<()> {
     }
 
     let state = write_state(&factory, &mut stream)?;
+    let mut reader = stream.into_inner();
+    std::io::copy(&mut reader, &mut std::io::sink())?;
+    let (stream_length, stream_digest) = reader.finish();
+    verify_snapshot_stream_digest(trust, stream_length, stream_digest)?;
     info!(
         target: "arb-snapshot",
         accounts = state.accounts,
@@ -330,6 +279,9 @@ pub fn import_full(args: SnapshotImportFullArgs) -> eyre::Result<()> {
     rename_changeset_files_to_header(&static_files_path)?;
 
     finalize(&factory, &manifest, history.first_block, &args.out)?;
+    drop(factory);
+    validate_reopened_completion_store(&args.out, chain_spec, trust)?;
+    write_completion(&args.out, trust)?;
 
     println!(
         "converted {} blocks ({} transactions, {} receipts), {} history objects, {} accounts at \
@@ -354,7 +306,7 @@ fn finalize<DB: SnapshotDb>(
     factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
     manifest: &Manifest,
     history_from: u64,
-    out: &std::path::Path,
+    _out: &std::path::Path,
 ) -> eyre::Result<()> {
     run_stage(
         factory,
@@ -407,15 +359,38 @@ fn finalize<DB: SnapshotDb>(
     provider
         .commit()
         .map_err(|error| eyre::eyre!("commit finalisation: {error}"))?;
+    Ok(())
+}
 
-    write_resume_log(manifest, out)?;
-
-    // Last, and only once everything above held. Without it the node refuses to boot, so a run that
-    // dies anywhere earlier leaves a datadir that cannot be mistaken for a finished one.
-    super::snapshot::write_snapshot_import_manifest(
-        out,
-        &(manifest.block, head.hash(), head.header().clone()),
+fn validate_reopened_completion_store(
+    out: &Path,
+    chain_spec: Arc<ChainSpec>,
+    trust: ApprovedSnapshotTrust,
+) -> eyre::Result<()> {
+    let db = open_db_read_only(
+        out.join("db"),
+        DatabaseArguments::new(ClientVersion::default()),
     )?;
+    let static_files = StaticFileProvider::read_only(out.join("static_files"))?;
+    let rocksdb = RocksDBProvider::builder(out.join("rocksdb"))
+        .with_default_tables()
+        .with_read_only(true)
+        .build()
+        .map_err(|error| eyre::eyre!("open RocksDB read-only after snapshot import: {error}"))?;
+    let factory: ProviderFactory<ArbNodeTypesWithDB> =
+        ProviderFactory::new(db, chain_spec, static_files, rocksdb, Runtime::test())?;
+    factory.set_storage_settings_cache(StorageSettings::v2());
+    let provider = factory.provider()?;
+    let head = reth_storage_api::HeaderProvider::sealed_header(&provider, trust.head_number)?
+        .ok_or_else(|| eyre::eyre!("reopened snapshot head is missing"))?;
+    if provider.last_block_number()? != trust.head_number
+        || head.hash() != trust.head_hash
+        || head.state_root != trust.head_state_root
+    {
+        return Err(eyre::eyre!(
+            "reopened snapshot store does not match frozen number/hash/state-root"
+        ));
+    }
     Ok(())
 }
 
@@ -462,49 +437,6 @@ where
         info!(target: "arb-snapshot", stage = what, at = output.checkpoint.block_number, "building index");
     }
     info!(target: "arb-snapshot", stage = what, elapsed = ?started.elapsed(), "index built");
-    Ok(())
-}
-
-/// Give the node its L1-derivation cursor, so it does not re-derive from batch 0.
-///
-/// Nothing in L2 state records where derivation left off, so without this the node re-derives from
-/// batch 0: the chain's whole parent-chain range fetched and discarded before one new block. The
-/// exporter reads the answer out of the snapshot's `arbitrumdata` and carries it in the manifest.
-fn write_resume_log(manifest: &Manifest, out: &std::path::Path) -> eyre::Result<()> {
-    let Some(resume) = manifest.resume else {
-        info!(
-            target: "arb-snapshot",
-            "the stream carries no resume point, so the node will re-derive from batch 0; \
-             re-export with --arbitrumdata to avoid that"
-        );
-        return Ok(());
-    };
-    // The boundary sits at or below the convert point, never above it: derivation would otherwise
-    // start after blocks the datadir does not have and leave a gap.
-    if resume.l2_block > manifest.block {
-        return Err(eyre::eyre!(
-            "resume point names L2 block {}, above the convert point {}",
-            resume.l2_block,
-            manifest.block
-        ));
-    }
-    let log = L1ResumeLog {
-        checkpoints: vec![L1ResumeCheckpoint {
-            l1_block: resume.l1_block,
-            delayed_count: resume.delayed_count,
-            l2_block: resume.l2_block,
-        }],
-    };
-    let path = L1ResumeLog::path_in(out);
-    std::fs::write(&path, serde_json::to_vec(&log)?)
-        .map_err(|error| eyre::eyre!("write {}: {error}", path.display()))?;
-    info!(
-        target: "arb-snapshot",
-        l1_block = resume.l1_block,
-        delayed = resume.delayed_count,
-        l2_block = resume.l2_block,
-        "wrote the L1 derivation resume point"
-    );
     Ok(())
 }
 
@@ -1664,100 +1596,6 @@ mod tests {
         (bytes, manifest)
     }
 
-    /// A stream carrying a resume point must leave the node able to skip re-deriving the whole
-    /// chain. Without this the conversion is correct but unusable: the node re-derives from batch 0,
-    /// which on a real chain is hundreds of thousands of L1 blocks fetched and discarded.
-    #[test]
-    fn a_resume_point_in_the_stream_becomes_the_node_s_derivation_cursor() {
-        let factory = v2_factory();
-        let root = B256::repeat_byte(0xee);
-        let (bytes, mut manifest) = full_stream(root);
-        // Rebuild the stream with a resume point in its manifest.
-        manifest.resume = Some(arb_reth_genesis::snapshot_stream::ResumePoint {
-            l1_block: 25_679_956,
-            delayed_count: 91_588,
-            l2_block: 3,
-        });
-        let _ = bytes;
-        let mut rebuilt = StreamBuilder::new(&manifest).blocks();
-        let mut parent = B256::ZERO;
-        for number in 0..=4u64 {
-            let h = header(number, parent, &[], &[]);
-            parent = h.hash_slow();
-            rebuilt = rebuilt
-                .header(number, &alloy_rlp::encode(&h))
-                .body(number, &body_rlp(&[]));
-        }
-        let bytes = rebuilt
-            .end_section()
-            .history_section()
-            .end_section()
-            .state()
-            .account(keccak256(ACCOUNT_A), 1, U256::from(1u64), None)
-            .end_section()
-            .finish();
-
-        let mut stream = SnapshotStream::open(bytes.as_slice()).unwrap();
-        assert_eq!(stream.manifest().resume, manifest.resume);
-        write_blocks(&factory, &mut stream, &manifest).unwrap();
-
-        let out = tempfile::tempdir().unwrap();
-        write_resume_log(&manifest, out.path()).unwrap();
-
-        let log = L1ResumeLog::load(&L1ResumeLog::path_in(out.path())).expect("resume log");
-        assert_eq!(log.checkpoints.len(), 1);
-        assert_eq!(log.checkpoints[0].l1_block, 25_679_956);
-        assert_eq!(log.checkpoints[0].delayed_count, 91_588);
-        // The node resolves it for its own tip, which is what makes a non-boundary convert point work.
-        assert_eq!(log.resume_for(4).map(|c| c.l2_block), Some(3));
-    }
-
-    /// A cursor above the convert point would start derivation after blocks the datadir does not
-    /// have, leaving a gap that nothing downstream detects.
-    #[test]
-    fn rejects_a_resume_point_above_the_convert_point() {
-        let out = tempfile::tempdir().unwrap();
-        let manifest = Manifest {
-            block: 100,
-            root: B256::repeat_byte(0xee),
-            state_id: 1,
-            hash: B256::repeat_byte(0xaa),
-            resume: Some(arb_reth_genesis::snapshot_stream::ResumePoint {
-                l1_block: 5,
-                delayed_count: 0,
-                l2_block: 101,
-            }),
-        };
-        let error = write_resume_log(&manifest, out.path())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("above the convert point"), "{error}");
-    }
-
-    /// `S_lo` has to come back out of the datadir for finalisation to be re-runnable on its own,
-    /// and the sidecars share the segment prefix, so they must not be mistaken for segments.
-    #[test]
-    fn reads_the_history_floor_back_from_the_changeset_segments() {
-        let dir = tempfile::tempdir().unwrap();
-        for name in [
-            "static_file_account-change-sets_1_499999",
-            "static_file_account-change-sets_1_499999.conf",
-            "static_file_account-change-sets_1_499999.csoff",
-            "static_file_account-change-sets_500000_999999",
-            "static_file_storage-change-sets_1_499999",
-            "static_file_headers_0_499999",
-        ] {
-            std::fs::write(dir.path().join(name), []).unwrap();
-        }
-        assert_eq!(lowest_changeset_block(dir.path()).unwrap(), 1);
-
-        let empty = tempfile::tempdir().unwrap();
-        let error = lowest_changeset_block(empty.path())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("no state history to finish"), "{error}");
-    }
-
     /// Finalisation on top of a converted datadir: reth's own stages build the indices from what
     /// was imported, the checkpoints say how far it is synced, and the boundary says how far back
     /// history goes.
@@ -1832,10 +1670,8 @@ mod tests {
             "head state, taken from the state section"
         );
 
-        // The completion manifest is written last and only on success.
-        assert!(out.path().join("snapshot-import.json").is_file());
-
-        // Absent from this stream, so no cursor is written and the node falls back to batch 0.
+        // Phase A has no old JSON completion or resume sidecar producer.
+        assert!(!out.path().join("snapshot-import.json").exists());
         assert!(!out.path().join("arb-l1-resume.json").is_file());
     }
 

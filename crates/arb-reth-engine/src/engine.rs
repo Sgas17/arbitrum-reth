@@ -79,7 +79,10 @@ use reth_trie::{
 };
 use revm::context_interface::ContextTr as _;
 
-use crate::message_journal::{MessageJournal, MessageJournalAnchor, MessageJournalEntry};
+use crate::message_journal::{
+    JournalClient, JournalDirectory, JournalRuntime, MessageJournalEntry, inspect_message_journal,
+    validate_runtime_capacity, write_divergence_marker_at,
+};
 use crate::native_payload::ArbPayloadJobGenerator;
 use crate::{
     ArbEngineInput, ArbEngineInputSource, ArbMessageFingerprint, ArbPayloadAttributes,
@@ -104,6 +107,24 @@ impl fmt::Display for ArbMessageDivergence {
 }
 
 impl Error for ArbMessageDivergence {}
+
+/// Phase-A terminal condition for an L1 overlap that would require authority promotion.
+#[derive(Debug)]
+pub struct CanonicalL1PhaseUnavailable {
+    sequence: u64,
+}
+
+impl fmt::Display for CanonicalL1PhaseUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "canonical L1 authority promotion is unavailable in phase A at sequence {}",
+            self.sequence
+        )
+    }
+}
+
+impl Error for CanonicalL1PhaseUnavailable {}
 
 fn divergence_at(sequence: u64, message: impl Into<String>) -> eyre::Report {
     eyre::Report::new(ArbMessageDivergence {
@@ -386,23 +407,6 @@ fn plan_applied_l1_chunk(
     })
 }
 
-fn append_durable_message_events(
-    journal: &mut MessageJournal,
-    pending: &mut VecDeque<MessageJournalEntry>,
-    additional: &[MessageJournalEntry],
-    durable_tip: u64,
-) -> eyre::Result<()> {
-    let entries = pending
-        .iter()
-        .chain(additional)
-        .filter(|entry| entry.block_number <= durable_tip)
-        .copied()
-        .collect::<Vec<_>>();
-    journal.append_durable(&entries)?;
-    pending.retain(|entry| entry.block_number > durable_tip);
-    Ok(())
-}
-
 /// The concrete sender type returned by [`EngineApiTreeHandler::spawn_new`] for `ArbNode`.
 type ToTree = crossbeam_channel::Sender<
     FromEngine<EngineApiRequest<ArbPayloadTypes, ArbPrimitives>, ArbBlock>,
@@ -424,7 +428,8 @@ fn sparse_root_hazards(state: &revm::state::EvmState, preserve_created_empty_acc
     hazards
 }
 
-/// Ensures every driver exit asks the engine tree to flush and release persistence handles.
+/// Explicit terminal-owner capability for asking the engine tree to flush and release handles.
+/// Dropping the capability is deliberately non-authorizing.
 struct EngineTerminationGuard {
     to_tree: ToTree,
     requested: AtomicBool,
@@ -450,12 +455,6 @@ impl EngineTerminationGuard {
             }))
             .ok()?;
         Some(terminated_rx)
-    }
-}
-
-impl Drop for EngineTerminationGuard {
-    fn drop(&mut self) {
-        let _ = self.request();
     }
 }
 
@@ -1467,14 +1466,13 @@ where
     provider: BlockchainProvider<N>,
     tip: SealedHeader<Header>,
     to_tree: ToTree,
-    // Sends termination on error and panic paths before the persistence proxy is joined.
+    // Used only by the explicit terminal shutdown path; destruction sends no termination event.
     engine_termination_guard: EngineTerminationGuard,
     // Declared after both tree senders so they drop before this joins the proxy thread.
     _persistence_proxy_guard: crate::storage_v2::PersistenceProxyGuard,
     /// Reth's local payload-builder service for deterministic ArbOS message payloads.
     payload_builder: PayloadBuilderHandle<ArbPayloadTypes>,
-    // Declared after the handle so driver drop closes the command channel before the explicit
-    // service stop/join fallback runs.
+    // Used only by explicit terminal shutdown; destruction sends no Stop and performs no join.
     payload_service: PayloadServiceGuard,
     canonical: CanonicalInMemoryState<ArbPrimitives>,
     obs_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, B256)>,
@@ -1493,11 +1491,12 @@ where
     /// Bounded identities for comparing delayed L1 copies with already-executed feed messages.
     recent_messages: BTreeMap<u64, AppliedMessageIdentity>,
     genesis_block: u64,
-    message_journal: MessageJournal,
-    pending_journal_events: VecDeque<MessageJournalEntry>,
+    journal_anchor_sequence: u64,
+    journal: JournalClient,
+    journal_runtime: Mutex<Option<JournalRuntime>>,
+    journal_directory: JournalDirectory,
     /// Last sequence observed from the ordered L1 chunk stream in this process.
     last_l1_sequence: Option<u64>,
-    l1_verified_tip: Arc<AtomicU64>,
     #[cfg(debug_assertions)]
     reconciliation_calls: u64,
     #[cfg(debug_assertions)]
@@ -1519,7 +1518,7 @@ enum PayloadServiceCommand {
 }
 
 impl PayloadServiceGuard {
-    fn stop_and_join(&self) -> eyre::Result<()> {
+    fn request_stop(&self) {
         if let Some(command) = self
             .command
             .lock()
@@ -1528,6 +1527,10 @@ impl PayloadServiceGuard {
         {
             let _ = command.try_send(PayloadServiceCommand::Stop);
         }
+    }
+
+    fn stop_and_join(&self) -> eyre::Result<()> {
+        self.request_stop();
         if let Some(thread) = self
             .thread
             .lock()
@@ -1543,11 +1546,34 @@ impl PayloadServiceGuard {
             Ok(())
         }
     }
-}
 
-impl Drop for PayloadServiceGuard {
-    fn drop(&mut self) {
-        let _ = self.stop_and_join();
+    fn stop_and_join_until(&self, deadline: tokio::time::Instant) -> eyre::Result<()> {
+        self.request_stop();
+        let thread = self
+            .thread
+            .lock()
+            .expect("payload thread lock poisoned")
+            .take();
+        if let Some(thread) = thread {
+            while !thread.is_finished() {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    drop(thread);
+                    return Err(eyre!(
+                        "terminal deadline expired waiting for payload-service thread"
+                    ));
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            if thread.join().is_err() {
+                self.failed.store(true, Ordering::Release);
+            }
+        }
+        if self.failed.load(Ordering::Acquire) {
+            Err(eyre!("arb payload service terminated unexpectedly"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1650,7 +1676,7 @@ where
     })
 }
 
-/// Per-driver debug probe incremented inside the actual shutdown and journal-flush methods.
+/// Per-driver debug probe incremented inside the actual shutdown and journal-stop methods.
 #[cfg(debug_assertions)]
 #[derive(Clone, Default)]
 pub struct ArbEngineLifecycleProbe {
@@ -1661,7 +1687,7 @@ pub struct ArbEngineLifecycleProbe {
 #[derive(Default)]
 struct ArbEngineLifecycleProbeInner {
     shutdown_calls: AtomicU64,
-    journal_flush_calls: AtomicU64,
+    journal_stop_calls: AtomicU64,
     payload_service_command: Mutex<Option<tokio::sync::mpsc::Sender<PayloadServiceCommand>>>,
     payload_service_early_return: Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
 }
@@ -1673,9 +1699,9 @@ impl ArbEngineLifecycleProbe {
         self.inner.shutdown_calls.load(Ordering::Relaxed)
     }
 
-    /// Number of entries into the engine's actual durable-journal flush method.
-    pub fn journal_flush_calls(&self) -> u64 {
-        self.inner.journal_flush_calls.load(Ordering::Relaxed)
+    /// Number of entries into the engine's actual asynchronous-journal stop barrier.
+    pub fn journal_stop_calls(&self) -> u64 {
+        self.inner.journal_stop_calls.load(Ordering::Relaxed)
     }
 
     /// Trigger a panic in the actual payload-service thread for terminal-failure tests.
@@ -1703,71 +1729,6 @@ impl ArbEngineLifecycleProbe {
             .try_send(())
             .expect("payload service accepts early-return command");
     }
-}
-
-fn open_message_journal_for_tip(
-    datadir: &std::path::Path,
-    genesis_block: u64,
-    tip_number: u64,
-    tip_hash: B256,
-    allow_bootstrap: bool,
-) -> eyre::Result<MessageJournal> {
-    let journal_path = MessageJournal::path_in(datadir);
-    let divergence_path = MessageJournal::divergence_path_in(datadir);
-    if divergence_path.exists() {
-        return Err(eyre!(
-            "unresolved feed/L1 divergence marker at {}; keep the node stopped, rewind/recover, then clear the marker explicitly",
-            divergence_path.display()
-        ));
-    }
-    let expected_sequence = tip_number.checked_sub(genesis_block).ok_or_else(|| {
-        eyre!("durable database tip {tip_number} is below L2 genesis block {genesis_block}")
-    })?;
-    let journal = if journal_path.exists() {
-        if allow_bootstrap {
-            return Err(eyre!(
-                "message journal already exists at {}; remove --init-message-journal-at-tip after its one successful use",
-                journal_path.display()
-            ));
-        }
-        MessageJournal::open(journal_path)?
-    } else {
-        if tip_number != genesis_block && !allow_bootstrap {
-            return Err(eyre!(
-                "message journal is missing for non-genesis database tip {tip_number} at {}; initialize an explicit trusted anchor with --init-message-journal-at-tip",
-                journal_path.display()
-            ));
-        }
-        MessageJournal::create(
-            journal_path,
-            MessageJournalAnchor {
-                sequence: expected_sequence,
-                block_number: tip_number,
-                block_hash: tip_hash,
-            },
-        )?
-    };
-    let journal_tip = journal.watermark();
-    if journal_tip.sequence != expected_sequence
-        || journal_tip.block_number != tip_number
-        || journal_tip.block_hash != tip_hash
-    {
-        let recovery = if journal_tip.block_number < tip_number {
-            "rewind the database to the journal watermark"
-        } else {
-            "rerun the interrupted rewind at the current database tip"
-        };
-        return Err(eyre!(
-            "message journal watermark {} / {} ({:#x}) does not match durable database tip {} / {} ({:#x}); keep the node stopped and {recovery} before restarting",
-            journal_tip.sequence,
-            journal_tip.block_number,
-            journal_tip.block_hash,
-            expected_sequence,
-            tip_number,
-            tip_hash,
-        ));
-    }
-    Ok(journal)
 }
 
 impl<N> ArbEngineDriver<N>
@@ -1806,30 +1767,74 @@ where
         runtime: Runtime,
         tuning: ArbEngineTuning,
         prune_builder: Option<PrunerBuilder>,
-        allow_message_journal_bootstrap: bool,
-        l1_verified_tip: Arc<AtomicU64>,
         tx_log_stream: Option<ArbTxLogBroadcaster>,
+        journal_directory: JournalDirectory,
     ) -> eyre::Result<Self> {
-        let message_journal = {
+        validate_runtime_capacity(
+            tuning.memory_block_buffer_target,
+            tuning.persistence_threshold,
+            tuning.persistence_backpressure_threshold,
+        )?;
+        let (inspection, journal_runtime) = {
             let db_provider = factory.database_provider_ro()?;
             let db_path = db_provider.storage_path();
-            let datadir = db_path.parent().ok_or_else(|| {
+            let db_datadir = db_path.parent().ok_or_else(|| {
                 eyre!("database path {} has no datadir parent", db_path.display())
             })?;
-            open_message_journal_for_tip(
-                datadir,
+            if db_datadir != journal_directory.path() {
+                return Err(eyre!(
+                    "pinned journal datadir {} does not own database path {}",
+                    journal_directory.path().display(),
+                    db_path.display(),
+                ));
+            }
+            let inspection = inspect_message_journal(&journal_directory, genesis_block)?;
+            let expected_sequence =
+                genesis_tip
+                    .number
+                    .checked_sub(genesis_block)
+                    .ok_or_else(|| {
+                        eyre!(
+                            "durable database tip {} is below L2 genesis block {genesis_block}",
+                            genesis_tip.number
+                        )
+                    })?;
+            if inspection.watermark.sequence != expected_sequence
+                || inspection.watermark.block_number != genesis_tip.number
+                || inspection.watermark.block_hash != genesis_tip.hash()
+            {
+                return Err(eyre!(
+                    "v2 journal J {} / {} ({:#x}) does not equal database D {} / {} ({:#x})",
+                    inspection.watermark.sequence,
+                    inspection.watermark.block_number,
+                    inspection.watermark.block_hash,
+                    expected_sequence,
+                    genesis_tip.number,
+                    genesis_tip.hash(),
+                ));
+            }
+            // Startup classification proved the reopened database equals committed J above. Seed
+            // runtime persistence from that committed exact identity, never from a sampled DB tip;
+            // subsequent D advancement comes only from pinned Reth persistence acknowledgements.
+            let runtime = JournalRuntime::open(
+                journal_directory.clone(),
                 genesis_block,
-                genesis_tip.number,
-                genesis_tip.hash(),
-                allow_message_journal_bootstrap,
-            )?
+                alloy_eips::BlockNumHash {
+                    number: inspection.watermark.block_number,
+                    hash: inspection.watermark.block_hash,
+                },
+            )?;
+            (inspection, runtime)
         };
-        // The opened journal is the durable authority source on every start. Overwrite rather
-        // than taking a maximum so a stale or speculative caller seed cannot survive a restart.
-        l1_verified_tip.store(
-            message_journal.l1_verified_tip().block_number,
-            Ordering::Release,
-        );
+        let journal = journal_runtime.client.clone();
+        let persistence_observer = journal_runtime.persistence.clone();
+        let journal_anchor_sequence = inspection.anchor().sequence;
+        let recent_messages = inspection
+            .entries
+            .iter()
+            .copied()
+            .map(|entry| (entry.sequence, entry.into()))
+            .collect();
 
         // ---- persistence service (real MDBX writer; pruner from --prune.* flags) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
@@ -1851,8 +1856,12 @@ where
         };
         let (sync_metrics_tx, _sync_metrics_rx) =
             tokio::sync::mpsc::unbounded_channel::<reth_stages_api::MetricEvent>();
-        let (persistence, persistence_proxy_guard) =
-            crate::storage_v2::spawn_persistence(factory, pruner, sync_metrics_tx);
+        let (persistence, persistence_proxy_guard) = crate::storage_v2::spawn_persistence(
+            factory,
+            pruner,
+            sync_metrics_tx,
+            persistence_observer,
+        );
 
         // ---- engine-tree wiring (all reth components) ----
         let consensus: Arc<dyn reth_consensus::FullConsensus<ArbPrimitives>> =
@@ -1965,12 +1974,13 @@ where
             pending_applied: None,
             next_seq,
             pending: BTreeMap::new(),
-            recent_messages: BTreeMap::new(),
+            recent_messages,
             genesis_block,
-            message_journal,
-            pending_journal_events: VecDeque::new(),
+            journal_anchor_sequence,
+            journal,
+            journal_runtime: Mutex::new(Some(journal_runtime)),
+            journal_directory,
             last_l1_sequence: None,
-            l1_verified_tip,
             #[cfg(debug_assertions)]
             reconciliation_calls: 0,
             #[cfg(debug_assertions)]
@@ -2046,7 +2056,7 @@ where
         let plan = plan_applied_l1_chunk(
             inputs,
             self.next_seq,
-            self.message_journal.anchor().sequence,
+            self.journal_anchor_sequence,
             authority_sequence,
             self.last_l1_sequence,
             |sequence| self.applied_identity(sequence),
@@ -2059,33 +2069,15 @@ where
             })
             .collect::<eyre::Result<Vec<_>>>()?;
 
-        if plan.overlap_len > 0 {
-            let durable_tip = self.provider.last_block_number()?;
-            let durable_promotions = plan
-                .promotions
-                .iter()
-                .map(|&(sequence, identity)| identity.journal_entry(sequence))
-                .collect::<Vec<_>>();
-            append_durable_message_events(
-                &mut self.message_journal,
-                &mut self.pending_journal_events,
-                &durable_promotions,
-                durable_tip,
-            )?;
-
-            for (sequence, identity) in plan.promotions {
-                self.recent_messages.insert(sequence, identity);
-                if identity.block_number > durable_tip {
-                    self.pending_journal_events
-                        .push_back(identity.journal_entry(sequence));
-                }
-            }
-            self.trim_recent_messages();
-            self.publish_l1_verified_tip();
-
-            if let Some((sequence_number, timing)) = self.settle_pending_applied().await? {
-                on_applied(sequence_number, timing);
-            }
+        if let Some((sequence, _)) = plan.promotions.first() {
+            return Err(eyre::Report::new(CanonicalL1PhaseUnavailable {
+                sequence: *sequence,
+            }));
+        }
+        if plan.overlap_len > 0
+            && let Some((sequence_number, timing)) = self.settle_pending_applied().await?
+        {
+            on_applied(sequence_number, timing);
         }
         if let Some(last) = inputs.last() {
             self.last_l1_sequence = Some(last.sequence_number());
@@ -2109,7 +2101,6 @@ where
                 .await?;
             return Ok(self.tip.hash());
         }
-        self.flush_durable_message_journal()?;
         if seq < self.next_seq {
             self.verify_applied_overlap(input)?;
             if let Some((sequence_number, timing)) = self.settle_pending_applied().await? {
@@ -2144,11 +2135,12 @@ where
         // seq == next_seq: queue this block, then drain the contiguous feed-ahead buffer. Each
         // subsequent payload-attributes request is queued before the previous final FCU is
         // awaited, which restores the native engine overlap without reading pending state.
+        let reservation = self.journal.reserve_execution(seq).await?;
         let parent_hash = self.tip.hash();
         let (mut hash, completed) = self
             .apply_one_native(seq, &selected, Instant::now())
             .await?;
-        self.record_applied_message(seq, &selected, hash, parent_hash)?;
+        self.record_applied_message(seq, &selected, hash, parent_hash, reservation)?;
         self.pending.remove(&seq);
         if let Some((sequence_number, timing)) = completed {
             on_applied(sequence_number, timing);
@@ -2156,11 +2148,18 @@ where
         self.next_seq += 1;
         while drain_pending && let Some(buffered) = self.pending.get(&self.next_seq).cloned() {
             let sequence_number = self.next_seq;
+            let reservation = self.journal.reserve_execution(sequence_number).await?;
             let parent_hash = self.tip.hash();
             let (new_hash, completed) = self
                 .apply_one_native(sequence_number, &buffered, Instant::now())
                 .await?;
-            self.record_applied_message(sequence_number, &buffered, new_hash, parent_hash)?;
+            self.record_applied_message(
+                sequence_number,
+                &buffered,
+                new_hash,
+                parent_hash,
+                reservation,
+            )?;
             self.pending.remove(&sequence_number);
             hash = new_hash;
             if let Some((completed_sequence, timing)) = completed {
@@ -2184,7 +2183,7 @@ where
         let sequence = input.sequence_number();
         let applied = self.applied_identity(sequence);
         let Some(applied) = applied else {
-            if sequence > self.message_journal.anchor().sequence {
+            if sequence > self.journal_anchor_sequence {
                 return Err(divergence_at(
                     sequence,
                     format!(
@@ -2220,14 +2219,11 @@ where
     }
 
     fn applied_identity(&self, sequence: u64) -> Option<AppliedMessageIdentity> {
-        self.recent_messages
-            .get(&sequence)
-            .copied()
-            .or_else(|| self.message_journal.entry(sequence).map(Into::into))
+        self.recent_messages.get(&sequence).copied()
     }
 
     fn l1_authority_sequence(&self) -> u64 {
-        let mut sequence = self.message_journal.anchor().sequence;
+        let mut sequence = self.journal_anchor_sequence;
         while let Some(next) = sequence.checked_add(1) {
             if next >= self.next_seq
                 || self
@@ -2241,18 +2237,13 @@ where
         sequence
     }
 
-    fn publish_l1_verified_tip(&self) {
-        let verified = self.message_journal.l1_verified_tip();
-        self.l1_verified_tip
-            .fetch_max(verified.block_number, Ordering::Release);
-    }
-
     fn record_applied_message(
         &mut self,
         sequence: u64,
         input: &ArbEngineInput,
         block_hash: B256,
         parent_hash: B256,
+        reservation: crate::message_journal::ExecutionReservation,
     ) -> eyre::Result<()> {
         let block_number = self
             .genesis_block
@@ -2273,8 +2264,8 @@ where
             delayed_messages_read: input.message().message_with_meta_data.delayed_messages_read,
         };
         self.recent_messages.insert(sequence, identity);
-        self.pending_journal_events
-            .push_back(identity.journal_entry(sequence));
+        self.journal
+            .enqueue_executed(identity.journal_entry(sequence), reservation)?;
         self.trim_recent_messages();
         Ok(())
     }
@@ -2290,9 +2281,12 @@ where
 
     /// Durably block automatic restart after any fail-closed driver error.
     pub fn write_divergence_marker(&self, input: &ArbEngineInput, error: &str) -> eyre::Result<()> {
-        self.message_journal.write_divergence_marker(
-            self.tip.number,
-            self.tip.hash(),
+        write_divergence_marker_at(
+            &self.journal_directory,
+            alloy_eips::BlockNumHash {
+                number: self.tip.number,
+                hash: self.tip.hash(),
+            },
             self.next_seq,
             input,
             error,
@@ -2309,41 +2303,6 @@ where
             .and_then(|sequence| self.pending.get(&sequence))
             .unwrap_or(fallback);
         self.write_divergence_marker(input, &format!("{error:#}"))
-    }
-
-    /// Number of durability batches appended by this driver's message journal.
-    #[doc(hidden)]
-    pub const fn message_journal_append_operations(&self) -> usize {
-        self.message_journal.append_operations()
-    }
-
-    /// Persist every journal event whose corresponding block is already durable in Reth.
-    pub fn flush_durable_message_journal(&mut self) -> eyre::Result<()> {
-        #[cfg(debug_assertions)]
-        self.lifecycle_probe
-            .inner
-            .journal_flush_calls
-            .fetch_add(1, Ordering::Relaxed);
-        if self.pending_journal_events.is_empty() {
-            return Ok(());
-        }
-        let durable_tip = self.provider.last_block_number()?;
-        if self
-            .pending_journal_events
-            .front()
-            .is_some_and(|entry| entry.block_number <= durable_tip)
-            && self.message_journal.recovery_marker_exists()
-        {
-            recovery_failpoint("replay_db_persisted_before_journal");
-        }
-        append_durable_message_events(
-            &mut self.message_journal,
-            &mut self.pending_journal_events,
-            &[],
-            durable_tip,
-        )?;
-        self.publish_l1_verified_tip();
-        Ok(())
     }
 
     /// Drive Reth's local payload lifecycle for one already-ordered Arbitrum message.
@@ -2847,9 +2806,60 @@ where
         self.canonical.clone()
     }
 
+    fn prove_journaled_tip(&self, journaled: crate::MessageJournalAnchor) -> eyre::Result<()> {
+        if (journaled.block_number, journaled.block_hash) != (self.tip.number, self.tip.hash()) {
+            return Err(eyre!(
+                "clean shutdown proof failed: J {} ({:#x}) does not equal final tip {} ({:#x})",
+                journaled.block_number,
+                journaled.block_hash,
+                self.tip.number,
+                self.tip.hash(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn stop_journal(&self) -> eyre::Result<()> {
+        #[cfg(debug_assertions)]
+        self.lifecycle_probe
+            .inner
+            .journal_stop_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let journaled = self.journal.drain()?;
+        self.prove_journaled_tip(journaled)?;
+        let runtime = self
+            .journal_runtime
+            .lock()
+            .expect("journal runtime lock poisoned")
+            .take();
+        if let Some(runtime) = runtime {
+            runtime.shutdown()?;
+        }
+        Ok(())
+    }
+
+    fn stop_journal_until(&self, deadline: tokio::time::Instant) -> eyre::Result<()> {
+        #[cfg(debug_assertions)]
+        self.lifecycle_probe
+            .inner
+            .journal_stop_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let journaled = self.journal.drain_until(deadline)?;
+        self.prove_journaled_tip(journaled)?;
+        let runtime = self
+            .journal_runtime
+            .lock()
+            .expect("journal runtime lock poisoned")
+            .take();
+        if let Some(runtime) = runtime {
+            runtime.shutdown_until(deadline)?;
+        }
+        Ok(())
+    }
+
     /// Settle the exact recovery frontier, flush its journal, then release every engine-tree and
     /// persistence writer before stopped storage is reopened for final proof.
-    pub async fn quiesce_for_recovery(mut self) -> eyre::Result<SealedHeader<Header>> {
+    pub async fn quiesce_for_recovery(self) -> eyre::Result<SealedHeader<Header>> {
         #[cfg(debug_assertions)]
         self.lifecycle_probe
             .inner
@@ -2859,7 +2869,7 @@ where
             .engine_termination_guard
             .request()
             .ok_or_else(|| eyre!("recovery engine termination was already requested"))?;
-        match tokio::time::timeout(Duration::from_secs(120), terminated_rx).await {
+        match tokio::time::timeout(Duration::from_secs(15), terminated_rx).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 return Err(eyre!(
@@ -2875,7 +2885,7 @@ where
         }
         recovery_failpoint("recovery_persistence_quiesced");
         self.payload_service.stop_and_join()?;
-        self.flush_durable_message_journal()?;
+        self.stop_journal()?;
         recovery_failpoint("current_frontier_journal_fsynced_before_marker_removal");
         let tip = self.tip.clone();
         drop(self);
@@ -2885,33 +2895,48 @@ where
 
     /// Ask the engine tree to persist its in-memory tail and terminate.
     pub async fn shutdown(&self) -> eyre::Result<()> {
+        self.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(15))
+            .await
+    }
+
+    /// Ask the engine tree to persist and terminate before one caller-owned absolute deadline.
+    pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> eyre::Result<()> {
         #[cfg(debug_assertions)]
         self.lifecycle_probe
             .inner
             .shutdown_calls
             .fetch_add(1, Ordering::Relaxed);
-        let terminated_rx = self.engine_termination_guard.request();
-        if terminated_rx.is_none() {
-            tracing::warn!(
-                target: "arb-reth::engine",
-                "engine termination was already requested or the engine channel is closed",
-            );
-        } else if let Some(terminated_rx) = terminated_rx {
-            match tokio::time::timeout(Duration::from_secs(10), terminated_rx).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => tracing::warn!(
-                    target: "arb-reth::engine",
-                    %err,
-                    "engine termination response channel closed",
-                ),
-                Err(_) => tracing::warn!(
-                    target: "arb-reth::engine",
-                    target_block = self.tip.number,
-                    "timed out waiting for engine termination",
-                ),
+        let terminated_rx = self.engine_termination_guard.request().ok_or_else(|| {
+            eyre!(
+                "cannot prove persist-to-head: engine termination was already requested or the engine channel is closed"
+            )
+        })?;
+        match tokio::time::timeout_at(deadline, terminated_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                return Err(eyre!("engine termination response channel closed: {err}"));
+            }
+            Err(_) => {
+                return Err(eyre!(
+                    "terminal deadline expired waiting for engine termination at block {}",
+                    self.tip.number,
+                ));
             }
         }
-        self.payload_service.stop_and_join()
+        if tokio::time::Instant::now() >= deadline {
+            return Err(eyre!(
+                "terminal deadline expired before payload-service settlement at block {}",
+                self.tip.number
+            ));
+        }
+        self.payload_service.stop_and_join_until(deadline)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(eyre!(
+                "terminal deadline expired before journal settlement at block {}",
+                self.tip.number
+            ));
+        }
+        self.stop_journal_until(deadline)
     }
 }
 
@@ -2932,18 +2957,42 @@ mod termination_tests {
     use super::*;
 
     #[test]
-    fn dropping_driver_guard_requests_engine_termination() {
+    fn dropping_driver_guard_cannot_request_engine_termination() {
         let (to_tree, from_driver) = crossbeam_channel::unbounded();
         drop(EngineTerminationGuard::new(to_tree));
+        assert!(
+            matches!(
+                from_driver.recv_timeout(Duration::from_millis(50)),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            ),
+            "driver destruction must release its sender without authorizing termination"
+        );
+    }
 
-        let message = from_driver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("termination event");
-        let FromEngine::Event(FromOrchestrator::Terminate { tx }) = message else {
-            panic!("unexpected engine message")
-        };
-        // The guard intentionally drops the acknowledgement receiver after requesting shutdown.
-        assert!(tx.send(()).is_err());
+    #[test]
+    fn dropping_payload_guard_cannot_request_stop_or_join() {
+        let (command, mut commands) = tokio::sync::mpsc::channel(1);
+        let (early_return, _early_return_rx) = tokio::sync::mpsc::channel(1);
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            observed_tx
+                .send(matches!(
+                    commands.blocking_recv(),
+                    Some(PayloadServiceCommand::Stop)
+                ))
+                .unwrap();
+        });
+        drop(PayloadServiceGuard {
+            command: Mutex::new(Some(command)),
+            early_return,
+            thread: Mutex::new(Some(thread)),
+            failed: Arc::new(AtomicBool::new(false)),
+        });
+
+        assert!(
+            !observed_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "payload guard destruction must not send Stop"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2990,48 +3039,6 @@ mod reconciliation_tests {
     use super::*;
     use arbitrum_alloy_sequencer::sequencer::feed::BatchDataStats;
     use base64::{Engine as _, prelude::BASE64_STANDARD};
-
-    #[test]
-    fn journal_startup_gate_requires_explicit_bootstrap_and_exact_tip() -> eyre::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let hash = B256::repeat_byte(0x11);
-
-        let missing = open_message_journal_for_tip(dir.path(), 0, 10, hash, false)
-            .err()
-            .expect("non-genesis tip must not be trusted implicitly");
-        assert!(
-            missing
-                .to_string()
-                .contains("--init-message-journal-at-tip")
-        );
-
-        open_message_journal_for_tip(dir.path(), 0, 10, hash, true)?;
-        let repeated = open_message_journal_for_tip(dir.path(), 0, 10, hash, true)
-            .err()
-            .expect("bootstrap flag must be one-shot");
-        assert!(repeated.to_string().contains("already exists"));
-        open_message_journal_for_tip(dir.path(), 0, 10, hash, false)?;
-
-        let mismatch =
-            open_message_journal_for_tip(dir.path(), 0, 11, B256::repeat_byte(0x22), false)
-                .err()
-                .expect("DB ahead of journal must refuse startup");
-        assert!(
-            mismatch
-                .to_string()
-                .contains("rewind the database to the journal watermark")
-        );
-
-        std::fs::write(
-            MessageJournal::divergence_path_in(dir.path()),
-            b"torn marker",
-        )?;
-        let marked = open_message_journal_for_tip(dir.path(), 0, 10, hash, false)
-            .err()
-            .expect("any marker file must block startup");
-        assert!(marked.to_string().contains("unresolved feed/L1 divergence"));
-        Ok(())
-    }
 
     #[test]
     fn only_typed_message_failures_are_divergence() {
@@ -3328,67 +3335,6 @@ mod reconciliation_tests {
         assert_eq!(whole.promotions.len(), 3);
         assert_eq!(second.promotions.len(), 2);
         assert_eq!(second.promotions.last().unwrap().0, 3);
-    }
-
-    #[test]
-    fn durable_promotions_share_one_append_operation() -> eyre::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = MessageJournal::path_in(dir.path());
-        let anchor = MessageJournalAnchor {
-            sequence: 0,
-            block_number: 100,
-            block_hash: B256::repeat_byte(0x10),
-        };
-        let mut journal = MessageJournal::create(path, anchor)?;
-        let feed = [
-            identity(1, ArbEngineInputSource::Feed).journal_entry(1),
-            identity(2, ArbEngineInputSource::Feed).journal_entry(2),
-        ];
-        let mut pending = VecDeque::from(feed);
-        let promotions = [
-            identity(1, ArbEngineInputSource::L1).journal_entry(1),
-            identity(2, ArbEngineInputSource::L1).journal_entry(2),
-        ];
-
-        append_durable_message_events(&mut journal, &mut pending, &promotions, 102)?;
-
-        assert_eq!(journal.append_operations(), 1);
-        assert_eq!(journal.l1_verified_tip().sequence, 2);
-        assert!(pending.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn non_durable_promotion_cannot_publish_early() -> eyre::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = MessageJournal::path_in(dir.path());
-        let anchor = MessageJournalAnchor {
-            sequence: 0,
-            block_number: 100,
-            block_hash: B256::repeat_byte(0x10),
-        };
-        let mut journal = MessageJournal::create(path, anchor)?;
-        let mut pending = VecDeque::from([
-            identity(1, ArbEngineInputSource::Feed).journal_entry(1),
-            identity(2, ArbEngineInputSource::Feed).journal_entry(2),
-        ]);
-        let promotions = [
-            identity(1, ArbEngineInputSource::L1).journal_entry(1),
-            identity(2, ArbEngineInputSource::L1).journal_entry(2),
-        ];
-
-        append_durable_message_events(&mut journal, &mut pending, &promotions, 101)?;
-        pending.push_back(promotions[1]);
-        assert_eq!(journal.l1_verified_tip().sequence, 1);
-        assert_eq!(
-            pending.len(),
-            2,
-            "feed and promotion for block 102 remain queued"
-        );
-
-        append_durable_message_events(&mut journal, &mut pending, &[], 102)?;
-        assert_eq!(journal.l1_verified_tip().sequence, 2);
-        Ok(())
     }
 
     #[test]

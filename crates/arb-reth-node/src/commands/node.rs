@@ -1,75 +1,55 @@
-//! `arb-reth node`: runnable entrypoint for the Arbitrum engine-tree node.
+//! `arb-reth node`: permanently storage-only Phase-B1 entrypoint.
 //!
-//! This wires the CLI to the [`ArbLauncher`] custom `LaunchNode`: it opens an on-disk MDBX
-//! database under the data directory, boots reth's `LaunchContext` provider/blockchain-db
-//! stack, spawns the `ArbEngineDriver` block producer (which drives reth's engine tree; see
-//! `launcher.rs`), and optionally serves the `eth_*` JSON-RPC API.
-//!
-//! ## Feed sources
-//!
-//! The sequencer-feed channel is created but left empty by default. L1-inbox derivation
-//! (`--l1-rpc`, below) or `--replay-feed` fills it.
-//!
-//! With `--replay-feed <NDJSON>` the binary reads a file of
-//! `BroadcastFeedMessage` JSON objects (one per line) and pushes them all into the
-//! feed channel immediately after launch, then keeps the feed channel open so the
-//! driver can drain it while RPC queries remain servable. The held sender keeps the
-//! node alive until SIGTERM. This lets a user run a finite replay and then inspect
-//! the produced blocks via JSON-RPC.
-//!
-//! With `--chain <PATH>` an Arbitrum chain-config JSON is parsed to produce a real
-//! ArbOS genesis allocation instead of the MAINNET placeholder.
+//! B1 authenticates the stopped v3 journal, lifecycle, completion, and reopened L2 store through
+//! read-only handles, then returns [`CanonicalAuthorityStorageOnly`]. It never constructs an
+//! ordinary launcher, provider URL, network service, writable database, or task.
 
 use std::{
-    fs,
     net::{IpAddr, SocketAddr},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
+#[cfg(test)]
+use std::path::Path;
+
+use crate::ARB_ONE_CHAIN_ID;
+#[cfg(test)]
+use crate::arb_chain_spec;
+#[cfg(test)]
+use crate::arbos_init_from_parsed;
 use crate::feed;
-use crate::launcher::{
-    ArbLauncher, ArbNodeHandle, TerminalSignalObserver, TerminalSignalOwner,
-    terminal_signal_channel,
-};
-use crate::lifecycle::{LifecycleGuard, LifecycleState};
-use crate::metrics::FeedLatencyTracker;
-use crate::mev_tx_logs::MevTxLogIpc;
-use crate::recovery::{
-    ParentChainClaim, ParentChainClassification, RECOVERY_WORKER_ENV, RecoveryConfig,
-    finalize_recovery_and_release, is_recovery_worker, preflight_before_l1_genesis,
-    preflight_ordinary_authority, prepare_recovery, recovery_failpoint,
-};
-use crate::{
-    ARB_ONE_CHAIN_ID, ArbNode, ArbTxLogBroadcaster, arb_chain_spec,
-    arbos_init_from_chain_config_json, arbos_init_from_parsed,
-};
+#[cfg(test)]
+use crate::launcher::ArbNodeHandle;
+use crate::launcher::{TerminalSignalObserver, terminal_signal_channel};
+use crate::lifecycle::LifecycleState;
+#[cfg(test)]
+use crate::recovery::preflight_before_l1_genesis;
+use crate::recovery::{OrdinaryAuthorityEvidence, preflight_ordinary_authority};
 use alloy_primitives::Address;
+#[cfg(test)]
 use alloy_provider::{Provider, ProviderBuilder};
 use arb_reth_engine::{
-    JournalDirectory, inspect_message_journal, inspect_stopped_message_journal,
-    recover_stopped_message_journal,
+    JournalDirectory, MessageJournalInspection, StorageContextV3, inspect_message_journal,
+    inspect_selected_journal_header,
 };
-use arb_reth_l1::{DelayedInboxReader, SequencerInboxReader};
+#[cfg(test)]
+use arb_reth_l1::DelayedInboxReader;
+#[cfg(test)]
 use arbitrum_alloy_sequencer::init_message::parse_init_message_from_body;
-use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use clap::Parser;
-use eyre::WrapErr as _;
-use reth_chainspec::{ChainSpec, MAINNET};
+use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_cli_runner::{CliContext, CliRunner};
-use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments};
-use reth_node_builder::{LaunchContext, LaunchNode, NodeBuilder, NodeConfig};
-use reth_node_core::{
-    args::{DatadirArgs, MetricArgs, PruningArgs},
-    dirs::{DataDirPath, MaybePlatformPath},
-};
-use reth_provider::{BlockNumReader, HeaderProvider};
-use reth_tracing::tracing::{info, warn};
+use reth_db_api::models::StorageSettings;
+use reth_node_core::args::PruningArgs;
+use reth_provider::{BlockNumReader, HeaderProvider, StorageSettingsCache};
 
+#[cfg(any())]
 struct ProcessSignals {
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
 }
 
+#[cfg(any())]
 impl ProcessSignals {
     fn install() -> std::io::Result<Self> {
         Ok(Self {
@@ -100,6 +80,7 @@ impl ProcessSignals {
     }
 }
 
+#[cfg(any())]
 async fn own_process_signals(
     mut signals: ProcessSignals,
     owner: TerminalSignalOwner,
@@ -139,38 +120,14 @@ async fn own_process_signals(
 /// Drive the node command to a terminal result without Reth's signal race dropping its owner.
 pub fn run_until_exit(runner: CliRunner, args: NodeArgs) -> eyre::Result<()> {
     let runtime = runner.runtime();
-    let (signal_owner, signal_observer) = terminal_signal_channel();
-    let command_runtime = runtime.clone();
-    let result = runner.block_on(async move {
-        let signals = ProcessSignals::install()?;
-        let signal_task = tokio::spawn(own_process_signals(
-            signals,
-            signal_owner,
-            command_runtime.clone(),
-        ));
-        let result = run(
-            CliContext {
-                task_executor: command_runtime,
-            },
-            args,
-            signal_observer,
-        )
-        .await;
-        signal_task.abort();
-        let _ = signal_task.await;
-        result
-    });
-
-    if result.is_err() {
-        let _ = runtime.initiate_graceful_shutdown();
-    }
-    let graceful = runtime.graceful_shutdown_with_timeout(std::time::Duration::from_secs(5));
-    if result.is_ok() && !graceful {
-        return Err(eyre::eyre!(
-            "runtime tasks remained live after node terminal completion"
-        ));
-    }
-    result
+    let (_, signal_observer) = terminal_signal_channel();
+    runner.block_on(run(
+        CliContext {
+            task_executor: runtime,
+        },
+        args,
+        signal_observer,
+    ))
 }
 
 /// `arb-reth`: standalone no-engine Arbitrum (ArbOS-on-reth) node.
@@ -418,6 +375,7 @@ pub struct NodeArgs {
 /// rollup was deployed at, resolved as one coherent set the way Nitro resolves its
 /// `RollupAddresses` from chain info (`chaininfo.GetRollupAddressesConfig`). The addresses always
 /// travel together; you do not mix one chain's inbox with another's bridge.
+#[cfg(any())]
 struct RollupDeployment {
     sequencer_inbox: Address,
     bridge: Address,
@@ -430,6 +388,7 @@ struct RollupDeployment {
 }
 
 /// Validates the pair of files required to boot an Orbit chain.
+#[cfg(test)]
 fn orbit_boot_paths<'a>(
     chain_info: Option<&'a Path>,
     genesis: Option<&'a Path>,
@@ -450,12 +409,14 @@ fn orbit_boot_paths<'a>(
 ///
 /// Snapshot chain specs use the imported snapshot head as reth's genesis header, so only use its
 /// nonce when its block number matches the rollup's L2 genesis block.
+#[cfg(test)]
 fn genesis_delayed_messages_read(chain_spec: &ChainSpec, l2_genesis_block: u64) -> Option<u64> {
     let header = chain_spec.genesis_header();
     (header.number == l2_genesis_block).then(|| u64::from_be_bytes(header.nonce.0))
 }
 
 /// Returns the delayed-message cursor stored in a persisted L2 header's nonce.
+#[cfg(test)]
 fn header_delayed_messages_read<P>(provider: &P, block: u64) -> eyre::Result<Option<u64>>
 where
     P: HeaderProvider<Header = alloy_consensus::Header>,
@@ -474,6 +435,7 @@ where
 ///   genesis default to a fresh chain (block 0), not Arbitrum One's heights. Either can still be
 ///   overridden explicitly.
 /// - Exactly one set: rejected, rather than pairing a custom address with an Arbitrum One one.
+#[cfg(any())]
 fn resolve_rollup_deployment(args: &NodeArgs) -> eyre::Result<RollupDeployment> {
     match (args.l1_sequencer_inbox, args.l1_bridge) {
         (None, None) => Ok(RollupDeployment {
@@ -512,6 +474,7 @@ fn resolve_rollup_deployment(args: &NodeArgs) -> eyre::Result<RollupDeployment> 
 /// boots and then silently stops depends on which derivation start the flags select. The sync
 /// runtime parses the same string again inside its task, where the failure is not recoverable and
 /// reaches only a log line.
+#[cfg(test)]
 fn validate_l1_rpc(l1_rpc: &str) -> eyre::Result<()> {
     l1_rpc
         .parse::<url::Url>()
@@ -519,6 +482,7 @@ fn validate_l1_rpc(l1_rpc: &str) -> eyre::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn derive_genesis_from_l1(
     l1_rpc: &str,
     bridge: Address,
@@ -554,6 +518,7 @@ async fn derive_genesis_from_l1(
     Ok((spec, chain_id))
 }
 
+#[cfg(test)]
 async fn derive_genesis_from_l1_after_preflight(
     datadir: &Path,
     genesis_block: u64,
@@ -566,6 +531,7 @@ async fn derive_genesis_from_l1_after_preflight(
     derive_genesis_from_l1(l1_rpc, bridge, from_block, base_fee_override).await
 }
 
+#[cfg(any())]
 fn run_recovery_worker_subprocess() -> eyre::Result<()> {
     let status = std::process::Command::new(std::env::current_exe()?)
         .args(std::env::args_os().skip(1))
@@ -578,6 +544,7 @@ fn run_recovery_worker_subprocess() -> eyre::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn complete_terminal_shutdown<P, F, C>(
     handle: ArbNodeHandle<P>,
     stop_services: F,
@@ -593,7 +560,181 @@ where
     mark_clean(deadline)
 }
 
+#[derive(Debug)]
+pub struct CanonicalAuthorityStorageOnly {
+    lifecycle: LifecycleState,
+}
+
+impl std::fmt::Display for CanonicalAuthorityStorageOnly {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "CanonicalAuthorityStorageOnly(lifecycle={:?})",
+            self.lifecycle
+        )
+    }
+}
+
+impl std::error::Error for CanonicalAuthorityStorageOnly {}
+
+#[derive(Debug)]
+pub struct DivergenceEvidencePhaseUnavailable;
+
+impl std::fmt::Display for DivergenceEvidencePhaseUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "DivergenceEvidencePhaseUnavailable: valid divergence evidence requires a later authorized canonical-evidence phase",
+        )
+    }
+}
+
+impl std::error::Error for DivergenceEvidencePhaseUnavailable {}
+
+#[derive(Debug)]
+pub struct RecoveryEvidencePhaseUnavailable;
+
+impl std::fmt::Display for RecoveryEvidencePhaseUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "RecoveryEvidencePhaseUnavailable: valid recovery evidence requires a later authorized canonical-recovery phase",
+        )
+    }
+}
+
+impl std::error::Error for RecoveryEvidencePhaseUnavailable {}
+
+pub(crate) fn require_no_phase_a_evidence(evidence: OrdinaryAuthorityEvidence) -> eyre::Result<()> {
+    match evidence {
+        OrdinaryAuthorityEvidence::None => Ok(()),
+        OrdinaryAuthorityEvidence::Divergence => Err(DivergenceEvidencePhaseUnavailable.into()),
+        OrdinaryAuthorityEvidence::Recovery => Err(RecoveryEvidencePhaseUnavailable.into()),
+    }
+}
+
+fn validate_reopened_storage(
+    args: &NodeArgs,
+    directory: &JournalDirectory,
+    chain_spec: std::sync::Arc<ChainSpec>,
+    configured_genesis: &alloy_consensus::Header,
+    journal: &MessageJournalInspection,
+) -> eyre::Result<()> {
+    let factory = super::journal_init::open_read_only_factory(directory.path(), chain_spec)?;
+    let provider = factory.provider()?;
+    eyre::ensure!(
+        provider.cached_storage_settings() == StorageSettings::v2(),
+        "ordinary B1 startup requires persisted Reth storage-v2"
+    );
+    let tip_number = provider.last_block_number()?;
+    let tip = provider
+        .sealed_header(tip_number)?
+        .ok_or_else(|| eyre::eyre!("reopened store tip {tip_number} is missing"))?;
+    eyre::ensure!(
+        tip_number == journal.watermark.block_number && tip.hash() == journal.watermark.block_hash,
+        "reopened stopped store does not equal exact journal J"
+    );
+    let anchor = provider
+        .sealed_header(journal.header.anchor.block_number)?
+        .ok_or_else(|| eyre::eyre!("reopened store journal anchor is missing"))?;
+    eyre::ensure!(
+        anchor.hash() == journal.header.anchor.block_hash,
+        "reopened store journal anchor hash mismatch"
+    );
+    match (
+        args.snapshot_head.as_ref(),
+        args.snapshot_trust_descriptor.as_ref(),
+    ) {
+        (Some(head_path), Some(descriptor_path)) => {
+            let head = crate::read_head_header(head_path)?;
+            super::snapshot::validate_snapshot_import_for_launch(
+                directory,
+                &head,
+                descriptor_path,
+            )?;
+            let trust = crate::snapshot_trust::load_approved_descriptor(descriptor_path)?;
+            eyre::ensure!(
+                journal.header.anchor.sequence
+                    == trust
+                        .head_number
+                        .checked_sub(configured_genesis.number)
+                        .ok_or_else(|| eyre::eyre!("approved snapshot head precedes L2 genesis"))?
+                    && journal.header.anchor.block_number == trust.head_number
+                    && journal.header.anchor.block_hash == trust.head_hash
+                    && anchor.state_root == trust.head_state_root,
+                "journal anchor does not equal approved completion/reopened snapshot store"
+            );
+        }
+        (None, None) => {
+            eyre::ensure!(
+                journal.header.anchor.sequence == 0
+                    && journal.header.anchor.block_number == configured_genesis.number
+                    && journal.header.anchor.block_hash == configured_genesis.hash_slow()
+                    && anchor.state_root == configured_genesis.state_root,
+                "journal anchor does not equal exact configured genesis/reopened store"
+            );
+        }
+        _ => {
+            return Err(eyre::eyre!(
+                "--snapshot-head and --snapshot-trust-descriptor are required together"
+            ));
+        }
+    }
+    drop(provider);
+    drop(factory);
+    Ok(())
+}
+
+fn classify_storage_only(args: &NodeArgs) -> eyre::Result<CanonicalAuthorityStorageOnly> {
+    let datadir = args
+        .datadir
+        .as_deref()
+        .ok_or_else(|| eyre::eyre!("B1 storage classification requires an explicit --datadir"))?;
+    eyre::ensure!(datadir.is_dir(), "B1 storage datadir does not exist");
+    let directory = JournalDirectory::open(datadir)?;
+    let snapshot_expected = args.snapshot_trust_descriptor.is_some();
+    let evidence = preflight_ordinary_authority(&directory, snapshot_expected)?;
+    require_no_phase_a_evidence(evidence)?;
+    let selected_header = inspect_selected_journal_header(&directory)?;
+    eyre::ensure!(
+        args.l1_sequencer_inbox.is_none()
+            && args.l1_bridge.is_none()
+            && args.l1_inbox_deploy_block.is_none()
+            && args.l2_genesis_block.is_none()
+            && args.initial_l1_base_fee.is_none(),
+        "B1 storage context cannot be supplied or overridden by node CLI authority"
+    );
+    let (chain_spec, configured_genesis, deployment) = super::journal_init::reviewed_storage_chain(
+        args.chain_config.as_deref(),
+        args.chain_info.as_deref(),
+        args.genesis_json.as_deref(),
+        args.snapshot_trust_descriptor.as_deref(),
+    )?;
+    let context = StorageContextV3 {
+        l2_chain_id: chain_spec.chain().id(),
+        l2_genesis_number: configured_genesis.number,
+        l2_genesis_hash: configured_genesis.hash_slow(),
+        sequencer_inbox: deployment.sequencer_inbox,
+        bridge: deployment.bridge,
+        deployment_block: deployment.deployed_at,
+        anchor: selected_header.anchor,
+    };
+    let journal = inspect_message_journal(&directory, context)?;
+    let lifecycle = crate::lifecycle::inspect_existing_read_only(&directory, context.anchor)?;
+    validate_reopened_storage(args, &directory, chain_spec, &configured_genesis, &journal)?;
+    Ok(CanonicalAuthorityStorageOnly {
+        lifecycle: lifecycle.state,
+    })
+}
+
 pub async fn run(
+    _ctx: CliContext,
+    args: NodeArgs,
+    _terminal_signal: TerminalSignalObserver,
+) -> eyre::Result<()> {
+    Err(classify_storage_only(&args)?.into())
+}
+
+#[cfg(any())]
+pub async fn removed_ordinary_runtime_path(
     ctx: CliContext,
     args: NodeArgs,
     terminal_signal: TerminalSignalObserver,
@@ -1405,6 +1546,74 @@ mod tests {
             assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
             assert!(error.to_string().contains(flag));
         }
+    }
+
+    #[test]
+    fn b1_entrypoint_call_graph_is_permanently_storage_only() {
+        let source = include_str!("node.rs");
+        let run = source
+            .split_once("pub async fn run(")
+            .unwrap()
+            .1
+            .split_once("#[cfg(any())]\npub async fn removed_ordinary_runtime_path")
+            .unwrap()
+            .0;
+        assert!(run.contains("Err(classify_storage_only(&args)?.into())"));
+        for prohibited in [
+            "spawn",
+            "connect",
+            "bind",
+            "NodeBuilder",
+            "ArbLauncher",
+            "LifecycleGuard",
+            "prepare_recovery",
+            "mark_running",
+            "mark_clean",
+            "feed::",
+            "l1_rpc",
+            "rpc_addr",
+        ] {
+            assert!(
+                !run.contains(prohibited),
+                "B1 run body contains prohibited operation {prohibited}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_only_rejection_touches_no_configured_socket_or_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let args = NodeArgs::try_parse_from([
+            "arb-reth",
+            "--datadir",
+            dir.path().to_str().unwrap(),
+            "--l1-rpc",
+            &endpoint,
+            "--feed-url",
+            &endpoint,
+            "--http",
+        ])
+        .unwrap();
+        let runtime = reth_tasks::Runtime::test();
+        let (_, terminal_signal) = terminal_signal_channel();
+        let error = run(
+            CliContext {
+                task_executor: runtime,
+            },
+            args,
+            terminal_signal,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("missing v3 journal lineage"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "storage-only rejection touched a configured provider/feed endpoint"
+        );
     }
 
     #[test]

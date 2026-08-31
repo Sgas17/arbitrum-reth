@@ -88,12 +88,8 @@ use reth_trie_db::{
 // Boot-wiring: write head header + checkpoints so ProviderFactory opens at the block.
 use alloy_consensus::Header;
 use alloy_rlp::Decodable;
-use arb_reth_engine::{
-    DIVERGENCE_MARKER_FILE, LIFECYCLE_FILE, MESSAGE_JOURNAL_PREFIX, MESSAGE_JOURNAL_V1_FILE,
-};
 use arb_revm::ArbSpecId;
 
-use crate::recovery::RECOVERY_MARKER_FILE;
 use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use reth_provider::{
     BlockNumReader, DatabaseProviderFactory, StageCheckpointWriter, StaticFileProviderFactory,
@@ -585,23 +581,9 @@ pub(crate) fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if [
-                MESSAGE_JOURNAL_V1_FILE,
-                DIVERGENCE_MARKER_FILE,
-                RECOVERY_MARKER_FILE,
-            ]
-            .iter()
-            .any(|prefix| name == *prefix || name.starts_with(&format!("{prefix}.")))
-                || name.starts_with(MESSAGE_JOURNAL_PREFIX)
-                || name == LIFECYCLE_FILE
-                || name.starts_with(&format!("{LIFECYCLE_FILE}."))
-                || name == "snapshot-import.json"
-                || name.starts_with("snapshot-import.json.")
-                || name == crate::snapshot_trust::SNAPSHOT_COMPLETION_FILE
-                || name.starts_with("arb-snapshot-completion-v1.bin.")
-            {
+            if name != "db" || !entry.file_type()?.is_dir() {
                 eyre::bail!(
-                    "snapshot import requires a fresh target; stale message authority metadata exists at {}",
+                    "snapshot import requires a fresh target; unexpected root sibling exists at {}",
                     entry.path().display()
                 );
             }
@@ -612,7 +594,7 @@ pub(crate) fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
     if db_path.exists() {
         for entry in std::fs::read_dir(&db_path)? {
             let entry = entry?;
-            if entry.file_name() != "preimage" {
+            if entry.file_name() != "preimage" || !entry.file_type()?.is_dir() {
                 eyre::bail!(
                     "snapshot import requires a fresh target; unexpected path exists at {}",
                     entry.path().display()
@@ -621,14 +603,6 @@ pub(crate) fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
         }
     }
 
-    for path in [out.join("static_files"), out.join("rocksdb")] {
-        if path.exists() {
-            eyre::bail!(
-                "snapshot import requires a fresh target; remove the previous import at {}",
-                path.display()
-            );
-        }
-    }
     Ok(())
 }
 
@@ -1472,6 +1446,7 @@ pub fn read(args: SnapshotReadArgs) -> eyre::Result<()> {
 mod tests {
     use super::*;
     use alloy_primitives::{address, b256};
+    use arb_reth_engine::{DIVERGENCE_MARKER_FILE, MESSAGE_JOURNAL_FAMILY_PREFIX};
     use reth_db_api::{
         BlockNumberList,
         models::{ShardedKey, storage_sharded_key::StorageShardedKey},
@@ -1479,6 +1454,8 @@ mod tests {
     use reth_storage_api::{
         AccountReader, PruneCheckpointReader, StateProvider, TryIntoHistoricalStateProvider,
     };
+
+    use crate::recovery::RECOVERY_MARKER_FILE;
 
     #[test]
     fn preimage_batches_are_deduplicated_and_native_store_roundtrips() -> eyre::Result<()> {
@@ -1611,10 +1588,10 @@ mod tests {
         std::fs::remove_file(resume_tmp_path)?;
 
         for artifact in [
-            MESSAGE_JOURNAL_V1_FILE.to_string(),
-            format!("{MESSAGE_JOURNAL_PREFIX}0.bin"),
-            format!("{MESSAGE_JOURNAL_PREFIX}0.bin.compact.tmp"),
-            format!("{MESSAGE_JOURNAL_PREFIX}0.bin.recovery.tmp"),
+            "arb-message-journal.ndjson".to_string(),
+            format!("{MESSAGE_JOURNAL_FAMILY_PREFIX}-v1.bin"),
+            format!("{MESSAGE_JOURNAL_FAMILY_PREFIX}-v2-g00000000000000000000.log"),
+            format!("{MESSAGE_JOURNAL_FAMILY_PREFIX}-v3-g00000000000000000000.tmp"),
             DIVERGENCE_MARKER_FILE.to_string(),
             RECOVERY_MARKER_FILE.to_string(),
             format!("{RECOVERY_MARKER_FILE}.tmp"),
@@ -1622,13 +1599,14 @@ mod tests {
             let path = temp.path().join(artifact);
             std::fs::write(&path, b"stale authority")?;
             let error = ensure_fresh_import_target(temp.path()).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("stale message authority metadata")
-            );
+            assert!(error.to_string().contains("unexpected root sibling"));
             std::fs::remove_file(path)?;
         }
+
+        std::fs::write(temp.path().join("unrelated.txt"), b"not an import input")?;
+        let error = ensure_fresh_import_target(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("unexpected root sibling"));
+        std::fs::remove_file(temp.path().join("unrelated.txt"))?;
 
         std::fs::create_dir(temp.path().join("db/.preimage.tmp"))?;
         assert!(find_staging_preimage_dir(&temp.path().join("db"))?.is_some());
@@ -1643,6 +1621,35 @@ mod tests {
         std::fs::write(other.path().join("db/mdbx.dat"), [])?;
         let error = ensure_fresh_import_target(other.path()).unwrap_err();
         assert!(error.to_string().contains("unexpected path"));
+
+        let wrong_root_type = tempfile::tempdir()?;
+        std::fs::write(wrong_root_type.path().join("db"), b"not a directory")?;
+        let error = ensure_fresh_import_target(wrong_root_type.path()).unwrap_err();
+        assert!(error.to_string().contains("unexpected root sibling"));
+
+        let wrong_preimage_type = tempfile::tempdir()?;
+        std::fs::create_dir(wrong_preimage_type.path().join("db"))?;
+        std::fs::write(
+            wrong_preimage_type.path().join("db/preimage"),
+            b"not a directory",
+        )?;
+        let error = ensure_fresh_import_target(wrong_preimage_type.path()).unwrap_err();
+        assert!(error.to_string().contains("unexpected path"));
+
+        #[cfg(unix)]
+        {
+            let linked_root = tempfile::tempdir()?;
+            let target = tempfile::tempdir()?;
+            std::os::unix::fs::symlink(target.path(), linked_root.path().join("db"))?;
+            let error = ensure_fresh_import_target(linked_root.path()).unwrap_err();
+            assert!(error.to_string().contains("unexpected root sibling"));
+
+            let linked_preimage = tempfile::tempdir()?;
+            std::fs::create_dir(linked_preimage.path().join("db"))?;
+            std::os::unix::fs::symlink(target.path(), linked_preimage.path().join("db/preimage"))?;
+            let error = ensure_fresh_import_target(linked_preimage.path()).unwrap_err();
+            assert!(error.to_string().contains("unexpected path"));
+        }
         Ok(())
     }
 
@@ -1650,7 +1657,7 @@ mod tests {
     fn snapshot_import_entry_points_reject_authority_before_opening_inputs() -> eyre::Result<()> {
         let ordinary = tempfile::tempdir()?;
         std::fs::write(
-            ordinary.path().join(MESSAGE_JOURNAL_V1_FILE),
+            ordinary.path().join("arb-message-journal-v1.log"),
             b"stale authority",
         )?;
         let ordinary_args = SnapshotImportArgs::try_parse_from([
@@ -1665,11 +1672,7 @@ mod tests {
             "missing-blocks.stream",
         ])?;
         let error = import(ordinary_args).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("stale message authority metadata")
-        );
+        assert!(error.to_string().contains("unexpected root sibling"));
         assert!(!ordinary.path().join("static_files").exists());
         assert!(!ordinary.path().join("rocksdb").exists());
 
@@ -1689,11 +1692,7 @@ mod tests {
             "missing-snapshot-trust.json",
         ])?;
         let error = super::super::snapshot_full::import_full(full_args).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("stale message authority metadata")
-        );
+        assert!(error.to_string().contains("unexpected root sibling"));
         assert!(!full.path().join("db").exists());
         assert!(!full.path().join("static_files").exists());
         assert!(!full.path().join("rocksdb").exists());

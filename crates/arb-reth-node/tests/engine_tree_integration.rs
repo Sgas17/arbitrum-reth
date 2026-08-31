@@ -4,7 +4,7 @@
 mod tests {
     use arb_reth_engine::{
         ArbEngineDriver, ArbEngineInput, ArbEngineTuning, JournalDirectory, MessageJournalAnchor,
-        initialize_journal_v2,
+        StorageContextV3, initialize_journal_v3,
     };
     use arb_reth_evm::ArbEvmConfig;
 
@@ -12,7 +12,7 @@ mod tests {
     use std::vec::Vec;
 
     use alloy_consensus::Header;
-    use alloy_primitives::{U256, address};
+    use alloy_primitives::{Address, U256, address};
     use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 
     use reth_primitives_traits::SealedHeader;
@@ -122,15 +122,21 @@ mod tests {
             .to_path_buf();
         let journal_directory =
             JournalDirectory::open(&journal_datadir).expect("open pinned journal datadir");
-        initialize_journal_v2(
-            &journal_directory,
-            MessageJournalAnchor {
+        let storage_context = StorageContextV3 {
+            l2_chain_id: chain_id,
+            l2_genesis_number: 0,
+            l2_genesis_hash: genesis_tip.hash(),
+            sequencer_inbox: Address::repeat_byte(0x22),
+            bridge: Address::repeat_byte(0x33),
+            deployment_block: 44,
+            anchor: MessageJournalAnchor {
                 sequence: 0,
                 block_number: genesis_tip.number,
                 block_hash: genesis_tip.hash(),
             },
-        )
-        .expect("initialize v2 journal at genesis");
+        };
+        initialize_journal_v3(&journal_directory, storage_context)
+            .expect("initialize v3 journal at genesis");
         let provider = BlockchainProvider::new(factory.clone()).expect("BlockchainProvider::new");
         let canonical = provider.canonical_in_memory_state();
         let mut driver = ArbEngineDriver::<TestNodeTypes>::spawn(
@@ -140,6 +146,7 @@ mod tests {
             chain_id,
             genesis_tip,
             0,
+            storage_context,
             canonical,
             Runtime::test(),
             tuning,
@@ -236,6 +243,7 @@ mod tests {
             chain_id,
             restart_tip,
             0,
+            storage_context,
             restart_canonical,
             Runtime::test(),
             ArbEngineTuning::reth_defaults(),

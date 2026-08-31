@@ -28,6 +28,7 @@ metrics = "0.24"
 rayon = "1"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json.workspace = true
+sha2 = "=0.10.9"
 tracing = "0.1"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

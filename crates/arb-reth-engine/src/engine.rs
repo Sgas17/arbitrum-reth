@@ -80,8 +80,8 @@ use reth_trie::{
 use revm::context_interface::ContextTr as _;
 
 use crate::message_journal::{
-    JournalClient, JournalDirectory, JournalRuntime, MessageJournalEntry, inspect_message_journal,
-    validate_runtime_capacity, write_divergence_marker_at,
+    JournalClient, JournalDirectory, JournalRuntime, MessageJournalEntry, StorageContextV3,
+    inspect_message_journal, validate_runtime_capacity, write_divergence_marker_at,
 };
 use crate::native_payload::ArbPayloadJobGenerator;
 use crate::{
@@ -1763,6 +1763,7 @@ where
         chain_id: u64,
         genesis_tip: SealedHeader<Header>,
         genesis_block: u64,
+        storage_context: StorageContextV3,
         canonical: CanonicalInMemoryState<ArbPrimitives>,
         runtime: Runtime,
         tuning: ArbEngineTuning,
@@ -1788,7 +1789,7 @@ where
                     db_path.display(),
                 ));
             }
-            let inspection = inspect_message_journal(&journal_directory, genesis_block)?;
+            let inspection = inspect_message_journal(&journal_directory, storage_context)?;
             let expected_sequence =
                 genesis_tip
                     .number
@@ -1818,7 +1819,7 @@ where
             // subsequent D advancement comes only from pinned Reth persistence acknowledgements.
             let runtime = JournalRuntime::open(
                 journal_directory.clone(),
-                genesis_block,
+                storage_context,
                 alloy_eips::BlockNumHash {
                     number: inspection.watermark.block_number,
                     hash: inspection.watermark.block_hash,

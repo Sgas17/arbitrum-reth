@@ -19,6 +19,8 @@ use arb_reth_engine::{
 const WARMUP_MESSAGES: usize = 10_000;
 const MEASURED_MESSAGES: usize = 100_000;
 const REPEATS: usize = 5;
+const BASELINE_COMMIT: &str = "ab1ab20c5d8245ca0cbc4d89fe2117c5fce00924";
+const BASELINE_TREE: &str = "215dabf36cbfe93d4276682dc7e31ab4bff88f36";
 const CORPUS_SHA256: &str = "fbe357e36740581eb8231da98bb23c864aa784b1cb687732028ec417999fe791";
 const CORPUS: &[u8] = include_bytes!("../tests/fixtures/ite106a-benchmark-corpus-v1.json");
 const CORPUS_MANIFEST: &str = include_str!("../tests/fixtures/ite106a-benchmark-corpus-v1.sha256");
@@ -50,7 +52,6 @@ struct StageSamples {
 struct Run {
     pressure: Pressure,
     repeat: usize,
-    decode: StageSamples,
     fingerprint: StageSamples,
     reserve_and_enqueue: StageSamples,
 }
@@ -61,8 +62,10 @@ struct Provenance {
     compiler: String,
     required_cargo_invocation: &'static str,
     release_asserted: bool,
-    checkout_commit: String,
-    checkout_tree: String,
+    baseline_commit: &'static str,
+    baseline_tree: &'static str,
+    candidate_commit: String,
+    candidate_tree: String,
     checkout_dirty: bool,
     adapter_source_keccak256: B256,
     corpus_sha256: &'static str,
@@ -72,7 +75,7 @@ struct Provenance {
     repeats: usize,
     persistence_tuning: &'static str,
     journal_storage: &'static str,
-    stage_clock_boundaries: [&'static str; 3],
+    stage_clock_boundaries: [&'static str; 2],
     pressure_generator: &'static str,
     host: String,
     kernel: String,
@@ -113,7 +116,7 @@ fn summarize(raw_nanoseconds: Vec<u64>) -> StageSamples {
 
 async fn run_once(pressure: Pressure, repeat: usize) -> eyre::Result<Run> {
     let directory = tempfile::Builder::new()
-        .prefix("ite106a-benchmark-")
+        .prefix("ite106b1-benchmark-")
         .tempdir_in(JOURNAL_STORAGE_ROOT)?;
     let journal_directory = arb_reth_engine::JournalDirectory::open(directory.path())?;
     let mut adapter =
@@ -121,16 +124,13 @@ async fn run_once(pressure: Pressure, repeat: usize) -> eyre::Result<Run> {
             .await?;
     let first_sequence = adapter.first_sequence();
     let mut parent_hash = B256::ZERO;
-    let mut decode = Vec::with_capacity(MEASURED_MESSAGES);
     let mut fingerprint = Vec::with_capacity(MEASURED_MESSAGES);
     let mut reserve_and_enqueue = Vec::with_capacity(MEASURED_MESSAGES);
     for index in 0..WARMUP_MESSAGES + MEASURED_MESSAGES {
         let sequence = first_sequence + index as u64;
-        let start = Instant::now();
         let mut message: BroadcastFeedMessage = serde_json::from_slice(black_box(CORPUS))?;
         message.sequence_number = sequence;
         let input = ArbEngineInput::feed(message, None);
-        let decode_ns = start.elapsed().as_nanos() as u64;
 
         let start = Instant::now();
         let fingerprinted = fingerprint_message(black_box(input.message()))?;
@@ -156,7 +156,6 @@ async fn run_once(pressure: Pressure, repeat: usize) -> eyre::Result<Run> {
         parent_hash = block_hash;
 
         if index >= WARMUP_MESSAGES {
-            decode.push(decode_ns);
             fingerprint.push(fingerprint_ns);
             reserve_and_enqueue.push(enqueue_ns);
         }
@@ -165,7 +164,6 @@ async fn run_once(pressure: Pressure, repeat: usize) -> eyre::Result<Run> {
     Ok(Run {
         pressure,
         repeat,
-        decode: summarize(decode),
         fingerprint: summarize(fingerprint),
         reserve_and_enqueue: summarize(reserve_and_enqueue),
     })
@@ -205,7 +203,7 @@ fn parse_output() -> eyre::Result<PathBuf> {
         flag.as_deref() == Some(std::ffi::OsStr::new("--output"))
             && path.is_some()
             && arguments.next().is_none(),
-        "usage: ite106a_benchmark --output PATH"
+        "usage: ite106b1_benchmark --output PATH"
     );
     Ok(PathBuf::from(path.unwrap()))
 }
@@ -214,12 +212,12 @@ fn parse_output() -> eyre::Result<PathBuf> {
 async fn main() -> eyre::Result<()> {
     eyre::ensure!(
         !cfg!(debug_assertions),
-        "ITE-106A benchmark requires --release"
+        "ITE-106B1 benchmark requires --release"
     );
     let checkout_dirty = checkout_dirty();
     eyre::ensure!(
         !checkout_dirty,
-        "ITE-106A benchmark requires an immutable clean checkout"
+        "ITE-106B1 benchmark requires an immutable clean checkout"
     );
     let output_path = parse_output()?;
     let mut runs = Vec::with_capacity(REPEATS * 2);
@@ -230,12 +228,14 @@ async fn main() -> eyre::Result<()> {
     }
     let output = Output {
         provenance: Provenance {
-            schema: "ite106a-production-feed-stage-benchmark-v2",
+            schema: "ite106b1-production-journal-v3-benchmark-v1",
             compiler: command_output("rustc", &["+1.97.1", "-Vv"]),
-            required_cargo_invocation: "cargo +1.97.1 run -p arb-reth-engine --example ite106a_benchmark --release --locked --offline -- --output PATH",
+            required_cargo_invocation: "cargo +1.97.1 run -p arb-reth-engine --example ite106b1_benchmark --release --locked --offline -- --output PATH",
             release_asserted: !cfg!(debug_assertions),
-            checkout_commit: command_output("git", &["rev-parse", "HEAD"]),
-            checkout_tree: command_output("git", &["rev-parse", "HEAD^{tree}"]),
+            baseline_commit: BASELINE_COMMIT,
+            baseline_tree: BASELINE_TREE,
+            candidate_commit: command_output("git", &["rev-parse", "HEAD"]),
+            candidate_tree: command_output("git", &["rev-parse", "HEAD^{tree}"]),
             checkout_dirty,
             adapter_source_keccak256: keccak256(ADAPTER_SOURCE),
             corpus_sha256: CORPUS_SHA256,
@@ -246,7 +246,6 @@ async fn main() -> eyre::Result<()> {
             persistence_tuning: "work_items=1024,record_liabilities=4096,outstanding_bytes=67108864,protected_execution_work=1,protected_execution_records=1,max_unjournaled_distance=1024",
             journal_storage: "/dev/shm tmpfs synthetic local storage; production worker append/sync/reread/compaction enabled",
             stage_clock_boundaries: [
-                "before BroadcastFeedMessage serde_json decode -> after ArbEngineInput::feed",
                 "before production fingerprint_message -> after exact fingerprint",
                 "before production reserve_execution -> after production enqueue_executed acceptance",
             ],

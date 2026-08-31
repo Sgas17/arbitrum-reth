@@ -30,9 +30,15 @@ extern crate alloc;
 pub mod commands;
 
 pub mod lifecycle;
+// B1 deliberately leaves the reviewed Phase-A recovery machinery compiled but unreachable from
+// the permanently storage-only node dispatch.
+#[allow(dead_code)]
 mod recovery;
 mod snapshot_trust;
 
+// Feed/runtime services remain available to direct tests and later phases, but B1 has no ordinary
+// launcher path that can reach them.
+#[allow(dead_code)]
 mod feed;
 
 pub mod genesis;
@@ -58,11 +64,13 @@ pub use arb_reth_sync::l1_sync::{L1SyncConfig, L1SyncError, run_l1_sync, supervi
 pub mod launcher;
 pub use launcher::{ArbLauncher, ArbNodeHandle};
 #[doc(hidden)]
-pub use recovery::{RecoveryGate, RecoveryRuntime, run_recovery_validation_child_from_env};
+pub use recovery::{RecoveryGate, RecoveryRuntime};
 
 mod mev_frontier_rpc;
+#[allow(dead_code)]
 mod mev_tx_logs;
 
+#[allow(dead_code)]
 mod metrics;
 pub use metrics::FeedLatencyTracker;
 

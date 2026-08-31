@@ -58,15 +58,21 @@ async fn rpc_serves_eth_queries() {
         data_dir.db().parent().expect("datadir owns db directory"),
     )
     .expect("open pinned test datadir");
-    arb_reth_engine::initialize_journal_v2(
-        &journal_directory,
-        arb_reth_engine::MessageJournalAnchor {
+    let storage_context = arb_reth_engine::StorageContextV3 {
+        l2_chain_id: arb_reth_node::ARB_ONE_CHAIN_ID,
+        l2_genesis_number: 0,
+        l2_genesis_hash: MAINNET.genesis_hash(),
+        sequencer_inbox: alloy_primitives::Address::repeat_byte(0x22),
+        bridge: alloy_primitives::Address::repeat_byte(0x33),
+        deployment_block: 44,
+        anchor: arb_reth_engine::MessageJournalAnchor {
             sequence: 0,
             block_number: 0,
             block_hash: MAINNET.genesis_hash(),
         },
-    )
-    .expect("initialize v2 test journal");
+    };
+    arb_reth_engine::initialize_journal_v3(&journal_directory, storage_context)
+        .expect("initialize v3 test journal");
 
     let rpc_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
     let tx_log_stream = ArbTxLogBroadcaster::new();
@@ -77,6 +83,7 @@ async fn rpc_serves_eth_queries() {
         terminal_signal: arb_reth_node::launcher::TerminalSignalObserver::for_test_runtime(),
         chain_id: arb_reth_node::ARB_ONE_CHAIN_ID,
         genesis_block: 0,
+        storage_context,
         tuning: arb_reth_node::ArbEngineTuning::reth_defaults(),
         prune_config: None,
         feed_messages: feed_rx,

@@ -18,7 +18,7 @@ use arb_reth_node::commands::{
     self,
     dump_blocks::DumpBlocksArgs,
     genesis::{GenesisVerifyArgs, GenesisVerifyExportArgs},
-    journal_init::JournalV2InitArgs,
+    journal_init::JournalV3InitArgs,
     node::NodeArgs,
     rewind::RewindArgs,
     snapshot::{
@@ -55,8 +55,8 @@ struct Cli {
 enum Command {
     /// Run the standalone no-engine Arbitrum node.
     Node(NodeArgs),
-    /// One-shot trusted Phase-A journal and lifecycle initialization.
-    JournalV2Init(JournalV2InitArgs),
+    /// One-shot trusted compact-storage journal and lifecycle initialization.
+    JournalV3Init(JournalV3InitArgs),
     /// Snapshot import/read tools.
     Snapshot(SnapshotCmd),
     /// Genesis verification tools.
@@ -104,10 +104,6 @@ enum GenesisSub {
 }
 
 fn main() -> eyre::Result<()> {
-    if arb_reth_node::run_recovery_validation_child_from_env()? {
-        return Ok(());
-    }
-
     // Idiomatic reth tracing; guard is held for the process lifetime.
     let _guard = RethTracer::new().init()?;
 
@@ -124,7 +120,7 @@ fn main() -> eyre::Result<()> {
             let runner = CliRunner::try_default_runtime()?;
             commands::node::run_until_exit(runner, args)
         }
-        Command::JournalV2Init(args) => commands::journal_init::run(args),
+        Command::JournalV3Init(args) => commands::journal_init::run(args),
         Command::Snapshot(cmd) => match cmd.command {
             SnapshotSub::BuildPreimages(args) => commands::snapshot::build_preimages(args),
             SnapshotSub::Import(args) => commands::snapshot::import(args),

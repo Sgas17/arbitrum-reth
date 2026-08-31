@@ -37,8 +37,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use arb_reth_engine::{
-    DIVERGENCE_MARKER_FILE, JournalDirectory, LIFECYCLE_FILE, MESSAGE_JOURNAL_PREFIX,
-    MESSAGE_JOURNAL_V1_FILE, MessageJournalAnchor, inspect_message_journal,
+    DIVERGENCE_MARKER_FILE, JournalDirectory, LIFECYCLE_FILE, MESSAGE_JOURNAL_FAMILY_PREFIX,
+    MESSAGE_JOURNAL_PREFIX, MessageJournalAnchor, StorageContextV3, inspect_message_journal,
+    inspect_selected_journal_header,
 };
 
 use crate::lifecycle::LifecycleState;
@@ -50,8 +51,9 @@ const OLD_SNAPSHOT_MANIFEST: &str = "snapshot-import.json";
 const RESUME_FILE: &str = "arb-l1-resume.json";
 const RECOVERY_VERSION: u64 = 1;
 const RECOVERY_FAILPOINT_ENV: &str = "ARB_RETH_RECOVERY_FAILPOINT";
-const RECOVERY_VALIDATE_DATADIR_ENV: &str = "ARB_RETH_INTERNAL_RECOVERY_VALIDATE_DATADIR";
+#[cfg(test)]
 const RECOVERY_VALIDATE_RECEIPTS_ENV: &str = "ARB_RETH_INTERNAL_RECOVERY_RECEIPTS_PRUNED";
+#[cfg(test)]
 const RECOVERY_VALIDATE_SENDERS_ENV: &str = "ARB_RETH_INTERNAL_RECOVERY_SENDERS_PRUNED";
 
 type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<crate::ArbNode, reth_db::DatabaseEnv>;
@@ -110,6 +112,7 @@ struct RecoveryStorageConfig {
     directory: JournalDirectory,
     chain_spec: Arc<ChainSpec>,
     genesis_block: u64,
+    storage_context: StorageContextV3,
     prune_config: Option<PruneConfig>,
 }
 
@@ -256,22 +259,6 @@ pub(crate) fn recovery_failpoint(name: &str) {
     }
 }
 
-pub fn run_recovery_validation_child_from_env() -> eyre::Result<bool> {
-    let Some(datadir) = std::env::var_os(RECOVERY_VALIDATE_DATADIR_ENV) else {
-        return Ok(false);
-    };
-    let receipts_fully_pruned = std::env::var_os(RECOVERY_VALIDATE_RECEIPTS_ENV).as_deref()
-        == Some(std::ffi::OsStr::new("1"));
-    let senders_fully_pruned = std::env::var_os(RECOVERY_VALIDATE_SENDERS_ENV).as_deref()
-        == Some(std::ffi::OsStr::new("1"));
-    validate_reopened_finalization(
-        Path::new(&datadir),
-        receipts_fully_pruned,
-        senders_fully_pruned,
-    )?;
-    Ok(true)
-}
-
 pub(crate) fn preflight_before_l1_genesis(datadir: &Path, _genesis_block: u64) -> eyre::Result<()> {
     inspect_artifacts(datadir, InventoryMode::Fresh)?;
     for storage in ["db", "static_files", "rocksdb"] {
@@ -289,13 +276,69 @@ pub(crate) fn preflight_before_l1_genesis(datadir: &Path, _genesis_block: u64) -
 pub(crate) fn preflight_ordinary_authority(
     directory: &JournalDirectory,
     snapshot_completion_expected: bool,
-) -> eyre::Result<()> {
+) -> eyre::Result<OrdinaryAuthorityEvidence> {
     inspect_pinned_artifacts(
         directory,
         InventoryMode::Ordinary {
             snapshot_completion_expected,
         },
-    )
+    )?;
+    let divergence = directory.entry_exists(DIVERGENCE_MARKER_FILE)?;
+    let recovery = directory.entry_exists(RECOVERY_MARKER_FILE)?;
+    if divergence {
+        validate_divergence_marker(directory)?;
+    }
+    if recovery {
+        read_marker(directory)?;
+    }
+    Ok(if divergence {
+        OrdinaryAuthorityEvidence::Divergence
+    } else if recovery {
+        OrdinaryAuthorityEvidence::Recovery
+    } else {
+        OrdinaryAuthorityEvidence::None
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OrdinaryAuthorityEvidence {
+    None,
+    Divergence,
+    Recovery,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DivergenceMarkerV3 {
+    version: u64,
+    detected_unix_seconds: u64,
+    tip_block_number: u64,
+    tip_block_hash: B256,
+    next_sequence: u64,
+    incoming_source: arb_reth_engine::ArbEngineInputSource,
+    incoming_message: serde_json::Value,
+    error: String,
+}
+
+fn validate_divergence_marker(directory: &JournalDirectory) -> eyre::Result<()> {
+    const MAX_DIVERGENCE_MARKER_LEN: usize = 1024 * 1024;
+    let bytes = directory.read_entry(DIVERGENCE_MARKER_FILE, MAX_DIVERGENCE_MARKER_LEN)?;
+    let marker: DivergenceMarkerV3 =
+        serde_json::from_slice(&bytes).wrap_err("decode divergence marker")?;
+    ensure!(marker.version == 3, "unsupported divergence marker version");
+    ensure!(
+        !marker.error.is_empty(),
+        "divergence marker has an empty error"
+    );
+    let _ = (
+        marker.detected_unix_seconds,
+        marker.tip_block_number,
+        marker.tip_block_hash,
+        marker.next_sequence,
+        marker.incoming_source,
+        marker.incoming_message,
+    );
+    Ok(())
 }
 
 pub(crate) async fn prepare_recovery(config: RecoveryConfig) -> eyre::Result<RecoveryPreparation> {
@@ -326,7 +369,17 @@ pub(crate) async fn prepare_recovery(config: RecoveryConfig) -> eyre::Result<Rec
             snapshot_completion_expected: config.snapshot_seeded,
         },
     )?;
-    let journal = inspect_message_journal(&config.directory, config.genesis_block)?;
+    let selected_header = inspect_selected_journal_header(&config.directory)?;
+    let storage_context = StorageContextV3 {
+        l2_chain_id: config.chain_id,
+        l2_genesis_number: config.genesis_block,
+        l2_genesis_hash: config.chain_spec.genesis_hash(),
+        sequencer_inbox: config.sequencer_inbox,
+        bridge: config.bridge,
+        deployment_block: config.deployed_at,
+        anchor: selected_header.anchor,
+    };
+    let journal = inspect_message_journal(&config.directory, storage_context)?;
     ensure!(
         !journal.has_authenticated_short_tail,
         "authenticated journal tail requires stopped recovery"
@@ -336,6 +389,7 @@ pub(crate) async fn prepare_recovery(config: RecoveryConfig) -> eyre::Result<Rec
         directory: config.directory.clone(),
         chain_spec: config.chain_spec.clone(),
         genesis_block: config.genesis_block,
+        storage_context,
         prune_config: config.prune_config.clone(),
     };
 
@@ -474,26 +528,36 @@ pub(crate) fn finalize_recovery_and_release(
     runtime: &RecoveryRuntime,
     _gate: &RecoveryGate,
 ) -> eyre::Result<()> {
-    let mut marker = read_marker(&runtime.storage.directory)?;
-    ensure!(
-        marker.phase == RecoveryPhase::DbUnwound,
-        "recovery worker did not durably record repair completion"
-    );
-    ensure!(
-        runtime.needs_worker || marker == runtime.marker,
-        "recovery marker changed unexpectedly"
-    );
-    run_reopened_validation_subprocess(&runtime.storage)?;
-    ensure!(
-        read_marker(&runtime.storage.directory)? == marker,
-        "recovery marker changed during fresh-process validation"
-    );
-    marker.phase = RecoveryPhase::ReopenedValidated;
-    write_marker(&runtime.storage.directory, &marker, false)?;
-    recovery_failpoint("reopened_storage_validated");
-    Err(eyre!(
-        "DB>J repair reached exact J and released its writer, but phase A remains recovery-closed; snapshot/operator recovery required"
-    ))
+    #[cfg(not(test))]
+    {
+        let _ = (runtime, _gate);
+        Err(eyre!(
+            "RecoveryEvidencePhaseUnavailable: B1 has no production recovery validation dispatch"
+        ))
+    }
+    #[cfg(test)]
+    {
+        let mut marker = read_marker(&runtime.storage.directory)?;
+        ensure!(
+            marker.phase == RecoveryPhase::DbUnwound,
+            "recovery worker did not durably record repair completion"
+        );
+        ensure!(
+            runtime.needs_worker || marker == runtime.marker,
+            "recovery marker changed unexpectedly"
+        );
+        run_reopened_validation_subprocess(&runtime.storage)?;
+        ensure!(
+            read_marker(&runtime.storage.directory)? == marker,
+            "recovery marker changed during fresh-process validation"
+        );
+        marker.phase = RecoveryPhase::ReopenedValidated;
+        write_marker(&runtime.storage.directory, &marker, false)?;
+        recovery_failpoint("reopened_storage_validated");
+        Err(eyre!(
+            "DB>J repair reached exact J and released its writer, but phase A remains recovery-closed; snapshot/operator recovery required"
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1719,14 +1783,14 @@ fn validate_repaired_storage(
         storage.genesis_block,
         marker.target_block_number,
     )?;
-    let journal = inspect_message_journal(&storage.directory, storage.genesis_block)?;
+    let journal = inspect_message_journal(&storage.directory, storage.storage_context)?;
     validate_marker_against_journal(marker, &journal)?;
     Ok(())
 }
 
+#[cfg(test)]
 fn run_reopened_validation_subprocess(storage: &RecoveryStorageConfig) -> eyre::Result<()> {
     let mut command = std::process::Command::new(std::env::current_exe()?);
-    #[cfg(test)]
     command
         .args([
             "--exact",
@@ -1736,8 +1800,6 @@ fn run_reopened_validation_subprocess(storage: &RecoveryStorageConfig) -> eyre::
         ])
         .env("ITE106A_RECOVERY_ACTION", "final-validate")
         .env("ITE106A_RECOVERY_DATADIR", &storage.datadir);
-    #[cfg(not(test))]
-    command.env(RECOVERY_VALIDATE_DATADIR_ENV, &storage.datadir);
     command.env(
         RECOVERY_VALIDATE_RECEIPTS_ENV,
         if receipts_fully_pruned(storage.prune_config.as_ref()) {
@@ -1796,7 +1858,18 @@ fn validate_reopened_finalization(
         marker.l2_genesis_block_number,
         exact.tip_number,
     )?;
-    let journal = inspect_message_journal(&directory, marker.l2_genesis_block_number)?;
+    let journal = inspect_message_journal(
+        &directory,
+        StorageContextV3 {
+            l2_chain_id: marker.l2_chain_id,
+            l2_genesis_number: marker.l2_genesis_block_number,
+            l2_genesis_hash: marker.l2_genesis_hash,
+            sequencer_inbox: marker.sequencer_inbox,
+            bridge: marker.bridge,
+            deployment_block: marker.deployment_block,
+            anchor: marker.anchor(),
+        },
+    )?;
     validate_marker_against_journal(&marker, &journal)?;
     ensure!(
         read_marker(&directory)? == marker,
@@ -1832,18 +1905,10 @@ fn inspect_pinned_artifacts(directory: &JournalDirectory, mode: InventoryMode) -
 }
 
 fn inspect_artifact_names(names: Vec<String>, mode: InventoryMode) -> eyre::Result<()> {
-    if matches!(mode, InventoryMode::Ordinary { .. })
-        && names.iter().any(|name| name == DIVERGENCE_MARKER_FILE)
-    {
-        return Err(eyre!(
-            "divergence evidence has precedence; operator recovery required"
-        ));
-    }
     let mut journal_finals = 0usize;
     let mut lifecycle = false;
     for name in names {
-        let authority_family = name.starts_with(MESSAGE_JOURNAL_PREFIX)
-            || name.starts_with(MESSAGE_JOURNAL_V1_FILE)
+        let authority_family = name.starts_with(MESSAGE_JOURNAL_FAMILY_PREFIX)
             || name.starts_with(LIFECYCLE_FILE)
             || name.starts_with(SNAPSHOT_COMPLETION_FILE)
             || name.starts_with(OLD_SNAPSHOT_MANIFEST)
@@ -1856,13 +1921,6 @@ fn inspect_artifact_names(names: Vec<String>, mode: InventoryMode) -> eyre::Resu
         if matches!(mode, InventoryMode::Fresh) {
             return Err(eyre!("fresh target contains authority artifact {name}"));
         }
-        if name == MESSAGE_JOURNAL_V1_FILE
-            || name.starts_with(&format!("{MESSAGE_JOURNAL_V1_FILE}."))
-        {
-            return Err(eyre!(
-                "legacy message journal artifact rejects phase-A startup: {name}"
-            ));
-        }
         if name == RESUME_FILE || name.starts_with(&format!("{RESUME_FILE}.")) {
             return Err(eyre!("resume artifact rejects phase-A startup: {name}"));
         }
@@ -1871,7 +1929,9 @@ fn inspect_artifact_names(names: Vec<String>, mode: InventoryMode) -> eyre::Resu
                 "old snapshot manifest rejects phase-A startup: {name}"
             ));
         }
-        debug_assert_ne!(name, DIVERGENCE_MARKER_FILE);
+        if name == DIVERGENCE_MARKER_FILE {
+            continue;
+        }
         if name.starts_with(DIVERGENCE_MARKER_FILE) {
             return Err(eyre!("unsupported divergence-marker sibling {name}"));
         }
@@ -1909,10 +1969,12 @@ fn inspect_artifact_names(names: Vec<String>, mode: InventoryMode) -> eyre::Resu
             journal_finals += 1;
             continue;
         }
-        return Err(eyre!("malformed or temporary v2 journal sibling {name}"));
+        return Err(eyre!(
+            "unsupported, malformed, or temporary journal sibling {name}"
+        ));
     }
     if matches!(mode, InventoryMode::Ordinary { .. }) {
-        ensure!(journal_finals > 0, "missing v2 journal lineage");
+        ensure!(journal_finals > 0, "missing v3 journal lineage");
         ensure!(lifecycle, "missing lifecycle authority");
     }
     Ok(())
@@ -2000,15 +2062,16 @@ mod tests {
     }
 
     #[test]
-    fn exact_v2_name_and_artifact_guards() {
+    fn exact_v3_name_and_four_inventory_guards() {
         assert_eq!(
-            exact_journal_final("arb-message-journal-v2-g00000000000000000042.log"),
+            exact_journal_final("arb-message-journal-v3-g00000000000000000042.log"),
             Some(42)
         );
         for invalid in [
-            "arb-message-journal-v2-g42.log",
-            "arb-message-journal-v2-g00000000000000000042.tmp",
-            "arb-message-journal-v2-g0000000000000000004x.log",
+            "arb-message-journal-v3-g42.log",
+            "arb-message-journal-v3-g00000000000000000042.tmp",
+            "arb-message-journal-v3-g0000000000000000004x.log",
+            "arb-message-journal-v2-g00000000000000000042.log",
         ] {
             assert_eq!(exact_journal_final(invalid), None);
         }
@@ -2038,14 +2101,29 @@ mod tests {
             )
             .unwrap_err()
             .to_string()
-            .contains("divergence evidence has precedence")
+            .contains("unsupported recovery-marker sibling")
         );
 
+        // Fresh, ordinary, divergence, and recovery inventories use exact names only. Marker body
+        // validation is a separate mandatory preflight after the complete sibling set is accepted.
         assert!(inspect_artifact_names(Vec::new(), InventoryMode::Fresh).is_ok());
         let ordinary = vec![
-            "arb-message-journal-v2-g00000000000000000000.log".to_owned(),
+            "arb-message-journal-v3-g00000000000000000000.log".to_owned(),
             LIFECYCLE_FILE.to_owned(),
         ];
+        for marker in [DIVERGENCE_MARKER_FILE, RECOVERY_MARKER_FILE] {
+            let mut inventory = ordinary.clone();
+            inventory.push(marker.to_owned());
+            assert!(
+                inspect_artifact_names(
+                    inventory,
+                    InventoryMode::Ordinary {
+                        snapshot_completion_expected: false,
+                    },
+                )
+                .is_ok()
+            );
+        }
         let mut with_completion = ordinary.clone();
         with_completion.push(SNAPSHOT_COMPLETION_FILE.to_owned());
         assert!(
@@ -2066,5 +2144,103 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn both_marker_bodies_validate_before_divergence_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join("arb-message-journal-v3-g00000000000000000000.log"),
+            [],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(LIFECYCLE_FILE), []).unwrap();
+        let divergence = serde_json::json!({
+            "version": 3,
+            "detected_unix_seconds": 1,
+            "tip_block_number": 1,
+            "tip_block_hash": B256::repeat_byte(1),
+            "next_sequence": 2,
+            "incoming_source": arb_reth_engine::ArbEngineInputSource::Feed,
+            "incoming_message": {},
+            "error": "fixture",
+        });
+        std::fs::write(
+            dir.path().join(DIVERGENCE_MARKER_FILE),
+            serde_json::to_vec(&divergence).unwrap(),
+        )
+        .unwrap();
+        let recovery = RecoveryMarker {
+            version: RECOVERY_VERSION,
+            phase: RecoveryPhase::Classified,
+            l2_chain_id: 1,
+            l2_genesis_block_number: 0,
+            l2_genesis_hash: B256::repeat_byte(2),
+            sequencer_inbox: Address::repeat_byte(3),
+            bridge: Address::repeat_byte(4),
+            deployment_block: 0,
+            snapshot_seeded: false,
+            anchor_sequence: 0,
+            anchor_block_number: 0,
+            anchor_block_hash: B256::repeat_byte(5),
+            target_sequence: 1,
+            target_block_number: 1,
+            target_block_hash: B256::repeat_byte(6),
+            target_state_root: B256::repeat_byte(7),
+            old_db_tip_number: 2,
+            old_db_tip_hash: B256::repeat_byte(8),
+            old_db_tip_state_root: B256::repeat_byte(9),
+            active_unwind_horizon: 1,
+            account_history_prune_checkpoint: ObservedPruneCheckpoint::None,
+            storage_history_prune_checkpoint: ObservedPruneCheckpoint::None,
+            account_changeset_ranges: Vec::new(),
+            storage_changeset_ranges: Vec::new(),
+        };
+        std::fs::write(
+            dir.path().join(RECOVERY_MARKER_FILE),
+            serde_json::to_vec(&recovery).unwrap(),
+        )
+        .unwrap();
+        let directory = JournalDirectory::open(dir.path()).unwrap();
+        assert_eq!(
+            preflight_ordinary_authority(&directory, false).unwrap(),
+            OrdinaryAuthorityEvidence::Divergence
+        );
+        let divergence_error = crate::commands::node::require_no_phase_a_evidence(
+            preflight_ordinary_authority(&directory, false).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            divergence_error
+                .downcast_ref::<crate::commands::node::DivergenceEvidencePhaseUnavailable>()
+                .is_some()
+        );
+
+        std::fs::remove_file(dir.path().join(DIVERGENCE_MARKER_FILE)).unwrap();
+        let recovery_error = crate::commands::node::require_no_phase_a_evidence(
+            preflight_ordinary_authority(&directory, false).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            recovery_error
+                .downcast_ref::<crate::commands::node::RecoveryEvidencePhaseUnavailable>()
+                .is_some()
+        );
+        std::fs::write(
+            dir.path().join(DIVERGENCE_MARKER_FILE),
+            serde_json::to_vec(&divergence).unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(dir.path().join(RECOVERY_MARKER_FILE), b"{").unwrap();
+        assert!(preflight_ordinary_authority(&directory, false).is_err());
+        std::fs::write(
+            dir.path().join(RECOVERY_MARKER_FILE),
+            serde_json::to_vec(&recovery).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(DIVERGENCE_MARKER_FILE), b"{").unwrap();
+        assert!(preflight_ordinary_authority(&directory, false).is_err());
     }
 }

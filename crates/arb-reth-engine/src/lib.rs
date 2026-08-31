@@ -42,12 +42,16 @@ pub use message_compare::{ArbMessageEnrichment, ArbMessageFingerprint, fingerpri
 #[cfg(debug_assertions)]
 pub use message_journal::AuthorityHotPathGuard;
 pub use message_journal::{
-    DIVERGENCE_MARKER_FILE, JournalBenchmarkAdapter, JournalDirectory, LIFECYCLE_FILE,
-    MESSAGE_JOURNAL_PREFIX, MESSAGE_JOURNAL_V1_FILE, MessageJournalAnchor, MessageJournalEntry,
-    MessageJournalInspection, PromotionCheckpoint, assert_authority_operation_allowed,
-    clear_divergence_marker_at, divergence_marker_path, encode_promotion_payload,
-    initialize_journal_v2, inspect_message_journal, inspect_stopped_message_journal,
-    recover_stopped_message_journal, truncate_authenticated_short_tail,
+    AuthorityKind, AuthorityRecordV3, B3RecoveryMarkerRequired, CanonicalContextV1,
+    DIVERGENCE_MARKER_FILE, EvidenceLocatorV1, JournalBenchmarkAdapter, JournalDirectory,
+    LIFECYCLE_FILE, MESSAGE_JOURNAL_FAMILY_PREFIX, MESSAGE_JOURNAL_PREFIX, MessageJournalAnchor,
+    MessageJournalEntry, MessageJournalInspection, RecoveryTargetV3, RetainedGridRecordV3,
+    StorageContextV3, assert_authority_operation_allowed, clear_divergence_marker_at,
+    create_recovery_truncation_lineage, decode_authority_record, decode_grid_record, decode_header,
+    decode_identity, decode_locator, divergence_marker_path, encode_authority_record,
+    encode_grid_record, encode_header, encode_identity, encode_locator, initialize_journal_v3,
+    inspect_message_journal, inspect_selected_journal_header, inspect_stopped_message_journal,
+    repair_stopped_message_journal,
 };
 pub use native_payload::ArbPayloadBuilder;
 pub use tx_log_stream::{

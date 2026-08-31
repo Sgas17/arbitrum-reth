@@ -433,6 +433,23 @@ impl LifecycleGuard {
     }
 }
 
+/// Inspect an existing lifecycle authority without acquiring a writable file description.
+///
+/// B1 startup uses this dedicated seam for stopped classification and drops the descriptor before
+/// returning its permanent storage-only closure.
+pub fn inspect_existing_read_only(
+    directory: &JournalDirectory,
+    anchor: MessageJournalAnchor,
+) -> eyre::Result<LifecycleSlot> {
+    let parent = directory.parent_file();
+    let file = open_lifecycle_read_only_at(parent.as_raw_fd())?;
+    let geometry = prove_geometry_and_entry(&parent, &file)?;
+    let binding = setup_binding(geometry, anchor);
+    let (_, selected) = validate_slots(&file, binding)?;
+    prove_after_write(&parent, &file, anchor, binding)?;
+    Ok(selected)
+}
+
 pub fn encode_slot(slot: LifecycleSlot) -> [u8; SLOT_LEN] {
     let mut out = [0u8; SLOT_LEN];
     out[..16].copy_from_slice(MAGIC);
@@ -515,6 +532,19 @@ fn open_lifecycle_at(parent: RawFd, create: bool) -> eyre::Result<File> {
         } else {
             "open existing lifecycle authority"
         });
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_lifecycle_read_only_at(parent: RawFd) -> eyre::Result<File> {
+    arb_reth_engine::assert_authority_operation_allowed("lifecycle-openat-read-only");
+    let name = CString::new(LIFECYCLE_FILE).expect("fixed lifecycle name has no NUL");
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    #[cfg(test)]
+    LIFECYCLE_OPEN_FLAGS.with(|observed| observed.borrow_mut().push(flags));
+    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).wrap_err("open existing lifecycle read-only");
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
@@ -1235,6 +1265,20 @@ mod tests {
             LIFECYCLE_OPEN_FLAGS.with(|observed| observed.borrow().clone()),
             vec![libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW],
             "ordinary startup or a transition reopened the lifecycle path"
+        );
+        drop(guard);
+
+        LIFECYCLE_OPEN_FLAGS.with(|observed| observed.borrow_mut().clear());
+        assert_eq!(
+            inspect_existing_read_only(&directory, anchor())
+                .unwrap()
+                .state,
+            LifecycleState::Clean
+        );
+        assert_eq!(
+            LIFECYCLE_OPEN_FLAGS.with(|observed| observed.borrow().clone()),
+            vec![libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW],
+            "B1 classification acquired a writable lifecycle descriptor"
         );
     }
 

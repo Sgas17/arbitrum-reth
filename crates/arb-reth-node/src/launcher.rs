@@ -467,6 +467,7 @@ pub struct ArbNodeHandle<P> {
     /// Running RPC server handle. Dropping this shuts down the HTTP server.
     pub rpc_handle: Option<RpcServerHandle>,
     /// Source-independent ingress metrics shared with live-feed followers.
+    #[allow(dead_code)]
     pub(crate) ingress_metrics: IngressMetrics,
     #[cfg(test)]
     driver_test_observations: std::sync::Arc<DriverTestObservations>,
@@ -561,6 +562,8 @@ pub struct ArbLauncher {
     /// feed message's sequence number maps to L2 block `seq + genesis_block`. Seeds the driver's
     /// sequence-dedup cursor so feed and L1-derivation messages reconcile without double-applying.
     pub genesis_block: u64,
+    /// Exact v3 journal storage-context preimage derived by the stopped trusted caller.
+    pub storage_context: arb_reth_engine::StorageContextV3,
     /// Engine-tree persistence tuning (batch/buffer/backpressure knobs).
     pub tuning: ArbEngineTuning,
     /// One pinned datadir descriptor shared by lifecycle and journal authority operations.
@@ -1072,6 +1075,7 @@ impl ArbLauncher {
             terminal_signal,
             chain_id,
             genesis_block,
+            storage_context,
             tuning,
             journal_directory,
             prune_config,
@@ -1085,6 +1089,8 @@ impl ArbLauncher {
             #[cfg(test)]
             driver_test_control,
         } = self;
+        #[cfg(test)]
+        let mut storage_context = storage_context;
 
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
@@ -1208,14 +1214,15 @@ impl ArbLauncher {
                     .number
                     .checked_sub(genesis_block)
                     .ok_or_else(|| eyre!("test head precedes configured genesis"))?;
-                arb_reth_engine::initialize_journal_v2(
-                    &journal_directory,
-                    arb_reth_engine::MessageJournalAnchor {
-                        sequence,
-                        block_number: genesis_tip.number,
-                        block_hash: genesis_tip.hash(),
-                    },
-                )?;
+                storage_context.anchor = arb_reth_engine::MessageJournalAnchor {
+                    sequence,
+                    block_number: genesis_tip.number,
+                    block_hash: genesis_tip.hash(),
+                };
+                arb_reth_engine::initialize_journal_v3(&journal_directory, storage_context)?;
+            } else {
+                storage_context.anchor =
+                    arb_reth_engine::inspect_selected_journal_header(&journal_directory)?.anchor;
             }
         }
 
@@ -1235,6 +1242,7 @@ impl ArbLauncher {
             chain_id,
             genesis_tip,
             genesis_block,
+            storage_context,
             canonical,
             task_executor.clone(),
             tuning,
@@ -1812,6 +1820,25 @@ mod tests {
 
     use crate::ArbNode;
 
+    pub(crate) fn test_storage_context(
+        chain_id: u64,
+        genesis_block: u64,
+    ) -> arb_reth_engine::StorageContextV3 {
+        arb_reth_engine::StorageContextV3 {
+            l2_chain_id: chain_id,
+            l2_genesis_number: genesis_block,
+            l2_genesis_hash: B256::repeat_byte(0x11),
+            sequencer_inbox: alloy_primitives::Address::repeat_byte(0x22),
+            bridge: alloy_primitives::Address::repeat_byte(0x33),
+            deployment_block: 44,
+            anchor: arb_reth_engine::MessageJournalAnchor {
+                sequence: 0,
+                block_number: genesis_block,
+                block_hash: B256::ZERO,
+            },
+        }
+    }
+
     #[tokio::test]
     async fn first_terminal_signal_owns_one_exact_checked_deadline() {
         let (owner, observer) = terminal_signal_channel();
@@ -2327,6 +2354,7 @@ mod tests {
                 terminal_signal: TerminalSignalObserver::for_test_runtime(),
                 chain_id: 412346,
                 genesis_block: 0,
+                storage_context: test_storage_context(412346, 0),
                 tuning: ArbEngineTuning::reth_defaults(),
                 prune_config: None,
                 feed_messages: feed_rx,
@@ -2386,6 +2414,7 @@ mod tests {
             terminal_signal,
             chain_id: 412346,
             genesis_block: 0,
+            storage_context: test_storage_context(412346, 0),
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
             feed_messages: feed_rx,
@@ -2732,8 +2761,12 @@ mod tests {
 
         let directory = arb_reth_engine::JournalDirectory::open(&datadir)
             .expect("reopen pinned shutdown test datadir");
-        let journal = arb_reth_engine::inspect_message_journal(&directory, 0)
-            .expect("reopen durable v2 message journal after runtime termination");
+        let mut storage_context = test_storage_context(412346, 0);
+        storage_context.anchor = arb_reth_engine::inspect_selected_journal_header(&directory)
+            .expect("read journal header after shutdown")
+            .anchor;
+        let journal = arb_reth_engine::inspect_message_journal(&directory, storage_context)
+            .expect("reopen durable v3 message journal after runtime termination");
         let last = journal
             .entries
             .last()
@@ -2783,6 +2816,7 @@ mod tests {
             terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
+            storage_context: test_storage_context(412346, 0),
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
             feed_messages: feed_rx,
@@ -2954,6 +2988,7 @@ mod tests {
             terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
+            storage_context: test_storage_context(412346, 0),
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
             feed_messages: feed_rx,
@@ -3140,6 +3175,7 @@ mod tests {
             terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
+            storage_context: test_storage_context(412346, 0),
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
             feed_messages: feed_rx,
@@ -3287,6 +3323,7 @@ mod tests {
                 terminal_signal: TerminalSignalObserver::for_test_runtime(),
                 chain_id: 412346,
                 genesis_block: 0,
+                storage_context: test_storage_context(412346, 0),
                 tuning: ArbEngineTuning::reth_defaults(),
                 prune_config: None,
                 feed_messages: feed_rx,
@@ -3321,6 +3358,7 @@ mod tests {
             terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
+            storage_context: test_storage_context(412346, 0),
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
             feed_messages: feed_rx,
@@ -3404,6 +3442,7 @@ mod tests {
             terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
+            storage_context: test_storage_context(412346, 0),
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
             feed_messages: feed_rx,
@@ -3518,6 +3557,7 @@ mod tests {
                 terminal_signal: TerminalSignalObserver::for_test_runtime(),
                 chain_id: 412346,
                 genesis_block: 0,
+                storage_context: test_storage_context(412346, 0),
                 tuning: ArbEngineTuning::reth_defaults(),
                 prune_config: None,
                 feed_messages: first_feed_rx,
@@ -3586,6 +3626,7 @@ mod tests {
             terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
+            storage_context: test_storage_context(412346, 0),
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: None,
             feed_messages: restart_feed_rx,
@@ -4030,6 +4071,7 @@ mod tests {
             terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id,
             genesis_block: 0,
+            storage_context: test_storage_context(chain_id, 0),
             tuning: ArbEngineTuning {
                 persistence_threshold: 0,
                 ..ArbEngineTuning::reth_defaults()
@@ -4085,8 +4127,15 @@ mod tests {
             .expect("feed message must become canonical");
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
-                    let inspection =
-                        arb_reth_engine::inspect_message_journal(&authority_directory, 0);
+                    let mut storage_context = test_storage_context(chain_id, 0);
+                    storage_context.anchor =
+                        arb_reth_engine::inspect_selected_journal_header(&authority_directory)
+                            .expect("read authority journal header")
+                            .anchor;
+                    let inspection = arb_reth_engine::inspect_message_journal(
+                        &authority_directory,
+                        storage_context,
+                    );
                     if inspection.is_ok_and(|journal| journal.watermark.block_number >= head) {
                         break;
                     }
@@ -4310,6 +4359,7 @@ mod tests {
             terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id,
             genesis_block: 0,
+            storage_context: test_storage_context(chain_id, 0),
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: Some(prune_config),
             feed_messages: feed_rx,
@@ -4422,6 +4472,7 @@ mod tests {
             terminal_signal: TerminalSignalObserver::for_test_runtime(),
             chain_id: 412346,
             genesis_block: 0,
+            storage_context: test_storage_context(412346, 0),
             tuning: ArbEngineTuning {
                 persistence_threshold: 128,
                 memory_block_buffer_target: 0,

@@ -23,6 +23,7 @@ use reth_primitives_traits::{NodePrimitives, SealedBlock};
 
 use arbitrum_alloy_consensus::reth::ArbPrimitives;
 
+mod canonical_authority;
 pub mod engine;
 pub mod engine_spike;
 mod message_compare;
@@ -31,27 +32,36 @@ pub mod native_payload;
 mod storage_v2;
 mod tx_log_stream;
 
+pub use canonical_authority::{
+    CANONICAL_OBSERVATION_V1_LEN, CanonicalObservationV1, CanonicalPayloadKind,
+    DIVERGENCE_MARKER_V4_LEN, DivergenceCauseV4, DivergenceMarkerV4,
+    decode_production_bootstrap_observation, fingerprint_commitment, read_divergence_marker_v4,
+    write_divergence_marker_v4,
+};
 #[cfg(debug_assertions)]
 pub use engine::ArbEngineLifecycleProbe;
 pub use engine::{
     ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, ArbMessageDivergence,
-    CanonicalL1PhaseUnavailable, is_message_divergence, message_divergence_sequence, wait_for_head,
+    CanonicalBatchComparison, CanonicalL1PhaseUnavailable, compare_complete_l1_batch,
+    is_message_divergence, message_divergence_sequence, wait_for_head,
 };
 pub use engine_spike::ArbPayloadValidator;
 pub use message_compare::{ArbMessageEnrichment, ArbMessageFingerprint, fingerprint_message};
 #[cfg(debug_assertions)]
 pub use message_journal::AuthorityHotPathGuard;
 pub use message_journal::{
-    AuthorityKind, AuthorityRecordV3, B3RecoveryMarkerRequired, CanonicalContextV1,
-    DIVERGENCE_MARKER_FILE, EvidenceLocatorV1, JournalBenchmarkAdapter, JournalDirectory,
+    AuthorityAcknowledgementV3, AuthorityCandidateV3, AuthorityFenceV3, AuthorityKind,
+    AuthorityRecordV3, B3RecoveryMarkerRequired, CanonicalContextV1, DIVERGENCE_MARKER_FILE,
+    EvidenceLocatorV1, JournalBenchmarkAdapter, JournalClient, JournalDirectory, JournalRuntime,
     LIFECYCLE_FILE, MESSAGE_JOURNAL_FAMILY_PREFIX, MESSAGE_JOURNAL_PREFIX, MessageJournalAnchor,
     MessageJournalEntry, MessageJournalInspection, RecoveryTargetV3, RetainedGridRecordV3,
-    StorageContextV3, assert_authority_operation_allowed, clear_divergence_marker_at,
-    create_recovery_truncation_lineage, decode_authority_record, decode_grid_record, decode_header,
-    decode_identity, decode_locator, divergence_marker_path, encode_authority_record,
-    encode_grid_record, encode_header, encode_identity, encode_locator, initialize_journal_v3,
-    inspect_message_journal, inspect_selected_journal_header, inspect_stopped_message_journal,
-    repair_stopped_message_journal,
+    StorageContextV3, assert_authority_operation_allowed, create_recovery_truncation_lineage,
+    decode_authority_record, decode_grid_record, decode_header, decode_identity, decode_locator,
+    divergence_marker_path, encode_authority_record, encode_grid_record, encode_header,
+    encode_identity, encode_locator, initialize_approved_snapshot_journal_v3,
+    initialize_journal_v3, inspect_message_journal, inspect_selected_journal_header,
+    inspect_stopped_message_journal, is_authority_candidate_stale, production_bootstrap_authority,
+    production_canonical_context, production_storage_context, repair_stopped_message_journal,
 };
 pub use native_payload::ArbPayloadBuilder;
 pub use tx_log_stream::{

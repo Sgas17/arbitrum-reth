@@ -8,11 +8,11 @@ use alloy_rpc_types_eth::{Filter, Log};
 use alloy_sol_types::SolEvent;
 
 use arb_reth_derive::batch::{
-    data_location, parse_sequencer_batch_delivered, SequencerBatchDeliveredData,
+    SequencerBatchDeliveredData, data_location, parse_sequencer_batch_delivered,
 };
 
 use crate::contracts::{SequencerBatchData, SequencerBatchDelivered};
-use crate::{extract_calldata_payload, L1Error};
+use crate::{L1Error, extract_calldata_payload};
 
 pub use crate::contracts::SEQUENCER_INBOX_MAINNET;
 
@@ -41,7 +41,10 @@ pub enum BatchPayload {
     Calldata(Vec<u8>),
     /// `dataLocation == Blob`: the tx's blob versioned hashes plus the L1 block they
     /// were posted in (used to derive the beacon slot for sidecar retrieval).
-    Blob { versioned_hashes: Vec<B256>, block_number: u64 },
+    Blob {
+        versioned_hashes: Vec<B256>,
+        block_number: u64,
+    },
     /// `dataLocation == NoData`: an empty (delayed-only) batch.
     None,
 }
@@ -77,9 +80,11 @@ impl<P: Provider> SequencerInboxReader<P> {
         use alloy_eips::BlockId;
         use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
         const BATCH_COUNT_SELECTOR: [u8; 4] = [0x06, 0xf1, 0x30, 0x56];
-        let tx = TransactionRequest::default().to(self.address).input(TransactionInput::new(
-            alloy_primitives::Bytes::from_static(&BATCH_COUNT_SELECTOR),
-        ));
+        let tx = TransactionRequest::default()
+            .to(self.address)
+            .input(TransactionInput::new(alloy_primitives::Bytes::from_static(
+                &BATCH_COUNT_SELECTOR,
+            )));
         let out = self
             .provider
             .call(tx)
@@ -127,7 +132,10 @@ impl<P: Provider> SequencerInboxReader<P> {
             .event_signature(SequencerBatchDelivered::SIGNATURE_HASH)
             .from_block(from_block)
             .to_block(to_block);
-        self.provider.get_logs(&filter).await.map_err(|e| L1Error::Rpc(e.to_string()))
+        self.provider
+            .get_logs(&filter)
+            .await
+            .map_err(|e| L1Error::Rpc(e.to_string()))
     }
 
     /// Find the L1 block in which the batch with `sequence_number` was delivered,
@@ -155,7 +163,10 @@ impl<P: Provider> SequencerInboxReader<P> {
                 }
                 let seq = u64::from_be_bytes(topics[1].0[24..32].try_into().unwrap());
                 if seq == sequence_number {
-                    return Ok(Some(log.block_number.ok_or(L1Error::Missing("log block_number"))?));
+                    return Ok(Some(
+                        log.block_number
+                            .ok_or(L1Error::Missing("log block_number"))?,
+                    ));
                 }
             }
             from = to + 1;
@@ -175,28 +186,43 @@ impl<P: Provider> SequencerInboxReader<P> {
         let before_acc = topics[2];
         let after_acc = topics[3];
 
-        let event = parse_sequencer_batch_delivered(&log.inner.data.data).map_err(L1Error::Batch)?;
+        let event =
+            parse_sequencer_batch_delivered(&log.inner.data.data).map_err(L1Error::Batch)?;
 
         let payload = match event.data_location {
             data_location::TX_INPUT => {
                 let tx = self.fetch_posting_tx(log).await?;
                 BatchPayload::Calldata(extract_calldata_payload(tx.input().as_ref())?)
             }
-            data_location::SEPARATE_BATCH_EVENT => {
-                BatchPayload::Calldata(self.fetch_separate_batch_payload(log, sequence_number).await?)
-            }
+            data_location::SEPARATE_BATCH_EVENT => BatchPayload::Calldata(
+                self.fetch_separate_batch_payload(log, sequence_number)
+                    .await?,
+            ),
             data_location::BLOB_HASHES => {
                 let tx = self.fetch_posting_tx(log).await?;
-                let versioned_hashes =
-                    tx.blob_versioned_hashes().map(<[B256]>::to_vec).unwrap_or_default();
-                let block_number = log.block_number.ok_or(L1Error::Missing("log block_number"))?;
-                BatchPayload::Blob { versioned_hashes, block_number }
+                let versioned_hashes = tx
+                    .blob_versioned_hashes()
+                    .map(<[B256]>::to_vec)
+                    .unwrap_or_default();
+                let block_number = log
+                    .block_number
+                    .ok_or(L1Error::Missing("log block_number"))?;
+                BatchPayload::Blob {
+                    versioned_hashes,
+                    block_number,
+                }
             }
             data_location::NO_DATA => BatchPayload::None,
             other => return Err(L1Error::UnsupportedDataLocation(other)),
         };
 
-        Ok(DeliveredBatch { sequence_number, before_acc, after_acc, event, payload })
+        Ok(DeliveredBatch {
+            sequence_number,
+            before_acc,
+            after_acc,
+            event,
+            payload,
+        })
     }
 
     /// Resolve a blob batch's payload: derive the beacon slot from the posting
@@ -229,7 +255,9 @@ impl<P: Provider> SequencerInboxReader<P> {
         log: &Log,
         sequence_number: u64,
     ) -> Result<Vec<u8>, L1Error> {
-        let block_number = log.block_number.ok_or(L1Error::Missing("log block_number"))?;
+        let block_number = log
+            .block_number
+            .ok_or(L1Error::Missing("log block_number"))?;
         // Sequence number as the right-aligned 32-byte indexed topic (a uint256).
         let seq_topic = B256::from(U256::from(sequence_number).to_be_bytes::<32>());
         let filter = Filter::new()
@@ -238,18 +266,28 @@ impl<P: Provider> SequencerInboxReader<P> {
             .topic1(seq_topic)
             .from_block(block_number)
             .to_block(block_number);
-        let logs =
-            self.provider.get_logs(&filter).await.map_err(|e| L1Error::Rpc(e.to_string()))?;
+        let logs = self
+            .provider
+            .get_logs(&filter)
+            .await
+            .map_err(|e| L1Error::Rpc(e.to_string()))?;
         let mut matched = logs.into_iter();
-        let data_log = matched.next().ok_or(L1Error::Missing("SequencerBatchData event"))?;
+        let data_log = matched
+            .next()
+            .ok_or(L1Error::Missing("SequencerBatchData event"))?;
         if matched.next().is_some() {
             return Err(L1Error::Missing("unique SequencerBatchData event"));
         }
         decode_event_bytes(&data_log.inner.data.data)
     }
 
-    async fn fetch_posting_tx(&self, log: &Log) -> Result<impl alloy_consensus::Transaction, L1Error> {
-        let tx_hash = log.transaction_hash.ok_or(L1Error::Missing("log transaction_hash"))?;
+    async fn fetch_posting_tx(
+        &self,
+        log: &Log,
+    ) -> Result<impl alloy_consensus::Transaction, L1Error> {
+        let tx_hash = log
+            .transaction_hash
+            .ok_or(L1Error::Missing("log transaction_hash"))?;
         self.provider
             .get_transaction_by_hash(tx_hash)
             .await
@@ -264,12 +302,38 @@ fn decode_event_bytes(data: &[u8]) -> Result<Vec<u8>, L1Error> {
     if data.len() < 64 {
         return Err(L1Error::Missing("SequencerBatchData head"));
     }
+    if U256::from_be_slice(&data[..32]) != U256::from(32) {
+        return Err(L1Error::Missing(
+            "SequencerBatchData offset is not canonical",
+        ));
+    }
     let len: usize = U256::from_be_slice(&data[32..64])
         .try_into()
         .map_err(|_| L1Error::Missing("SequencerBatchData length overflow"))?;
-    data.get(64..64 + len)
+    let body_end = 64usize
+        .checked_add(len)
+        .ok_or(L1Error::Missing("SequencerBatchData length overflow"))?;
+    let encoded_end = body_end
+        .checked_add(31)
+        .map(|end| end / 32 * 32)
+        .ok_or(L1Error::Missing(
+            "SequencerBatchData padded length overflow",
+        ))?;
+    if data.len() != encoded_end
+        || data
+            .get(body_end..encoded_end)
+            .is_none_or(|padding| padding.iter().any(|byte| *byte != 0))
+    {
+        return Err(L1Error::Missing("SequencerBatchData is not canonical ABI"));
+    }
+    data.get(64..body_end)
         .map(<[u8]>::to_vec)
         .ok_or(L1Error::Missing("SequencerBatchData body"))
+}
+
+/// Decode the exact `SequencerBatchData` event body for the stopped canonical observer.
+pub fn decode_separate_batch_event_data(data: &[u8]) -> Result<Vec<u8>, L1Error> {
+    decode_event_bytes(data)
 }
 
 #[cfg(test)]
@@ -292,7 +356,10 @@ mod tests {
     #[test]
     fn decodes_empty_bytes() {
         // Mirrors Arbitrum One batch 0's on-chain SequencerBatchData (empty payload).
-        assert_eq!(decode_event_bytes(&abi_bytes(&[])).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            decode_event_bytes(&abi_bytes(&[])).unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
@@ -314,5 +381,29 @@ mod tests {
         let mut data = U256::from(32u64).to_be_bytes::<32>().to_vec();
         data.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
         assert!(decode_event_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn rejects_noncanonical_offset_padding_and_trailing_data() {
+        let encoded = abi_bytes(b"payload");
+        for changed in [
+            {
+                let mut value = encoded.clone();
+                value[31] = 0x40;
+                value
+            },
+            {
+                let mut value = encoded.clone();
+                value[71] = 1;
+                value
+            },
+            {
+                let mut value = encoded;
+                value.push(0);
+                value
+            },
+        ] {
+            assert!(decode_event_bytes(&changed).is_err());
+        }
     }
 }

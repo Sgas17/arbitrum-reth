@@ -39,7 +39,7 @@ use tokio::sync::watch;
 use arb_reth_engine::{
     DIVERGENCE_MARKER_FILE, JournalDirectory, LIFECYCLE_FILE, MESSAGE_JOURNAL_FAMILY_PREFIX,
     MESSAGE_JOURNAL_PREFIX, MessageJournalAnchor, StorageContextV3, inspect_message_journal,
-    inspect_selected_journal_header,
+    inspect_selected_journal_header, production_storage_context, read_divergence_marker_v4,
 };
 
 use crate::lifecycle::LifecycleState;
@@ -307,37 +307,14 @@ pub(crate) enum OrdinaryAuthorityEvidence {
     Recovery,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DivergenceMarkerV3 {
-    version: u64,
-    detected_unix_seconds: u64,
-    tip_block_number: u64,
-    tip_block_hash: B256,
-    next_sequence: u64,
-    incoming_source: arb_reth_engine::ArbEngineInputSource,
-    incoming_message: serde_json::Value,
-    error: String,
-}
-
 fn validate_divergence_marker(directory: &JournalDirectory) -> eyre::Result<()> {
-    const MAX_DIVERGENCE_MARKER_LEN: usize = 1024 * 1024;
-    let bytes = directory.read_entry(DIVERGENCE_MARKER_FILE, MAX_DIVERGENCE_MARKER_LEN)?;
-    let marker: DivergenceMarkerV3 =
-        serde_json::from_slice(&bytes).wrap_err("decode divergence marker")?;
-    ensure!(marker.version == 3, "unsupported divergence marker version");
-    ensure!(
-        !marker.error.is_empty(),
-        "divergence marker has an empty error"
-    );
-    let _ = (
-        marker.detected_unix_seconds,
-        marker.tip_block_number,
-        marker.tip_block_hash,
-        marker.next_sequence,
-        marker.incoming_source,
-        marker.incoming_message,
-    );
+    let marker =
+        read_divergence_marker_v4(directory).wrap_err("decode binary divergence marker v4")?;
+    let journal = inspect_message_journal(directory, production_storage_context())
+        .wrap_err("authenticate divergence-v4 journal")?;
+    marker
+        .validate_journal_state(&journal)
+        .wrap_err("authenticate divergence-v4 durable fields")?;
     Ok(())
 }
 
@@ -2149,26 +2126,46 @@ mod tests {
     #[test]
     fn both_marker_bodies_validate_before_divergence_precedence() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path()
-                .join("arb-message-journal-v3-g00000000000000000000.log"),
-            [],
-        )
-        .unwrap();
+        let directory = JournalDirectory::open(dir.path()).unwrap();
+        let context = production_storage_context();
+        let journal =
+            arb_reth_engine::initialize_approved_snapshot_journal_v3(&directory, context).unwrap();
         std::fs::write(dir.path().join(LIFECYCLE_FILE), []).unwrap();
-        let divergence = serde_json::json!({
-            "version": 3,
-            "detected_unix_seconds": 1,
-            "tip_block_number": 1,
-            "tip_block_hash": B256::repeat_byte(1),
-            "next_sequence": 2,
-            "incoming_source": arb_reth_engine::ArbEngineInputSource::Feed,
-            "incoming_message": {},
-            "error": "fixture",
-        });
+        let observation = arb_reth_engine::decode_production_bootstrap_observation();
+        let bootstrap = arb_reth_engine::production_bootstrap_authority();
+        let divergence = arb_reth_engine::DivergenceMarkerV4 {
+            cause: arb_reth_engine::DivergenceCauseV4::ExistingAuthorityInvalidatedBySafeReorg,
+            journal_operation_generation: journal.last_operation_generation,
+            authority_chain_position: journal.authority_operation_count,
+            context_id: observation.context_id,
+            context_digest: observation.context_digest,
+            j_sequence: journal.watermark.sequence,
+            j_l2_block_number: journal.watermark.block_number,
+            j_l2_block_hash: journal.watermark.block_hash,
+            v_sequence: journal.v.unwrap().sequence,
+            v_l2_block_number: journal.v.unwrap().block_number,
+            v_l2_block_hash: journal.v.unwrap().block_hash,
+            candidate_sequence: bootstrap.start_sequence,
+            candidate_l2_block_number: bootstrap.start_sequence,
+            expected_fingerprint: B256::ZERO,
+            observed_fingerprint: B256::ZERO,
+            safe_l1_number: observation.safe_l1_number,
+            safe_l1_hash: observation.safe_l1_hash,
+            containing_l1_number: observation.containing_l1_number,
+            containing_l1_hash: observation.containing_l1_hash,
+            posting_transaction_hash: observation.posting_transaction_hash,
+            posting_transaction_index: observation.posting_transaction_index,
+            delivery_log_index: observation.delivery_log_index,
+            batch_sequence: observation.batch_sequence,
+            terminal_message_ordinal: observation.terminal_message_ordinal,
+            decoded_message_count: observation.decoded_message_count,
+            cause_authority_id: bootstrap.authority_id,
+            expected_value: bootstrap.evidence_digest,
+            observed_value: B256::repeat_byte(0xff),
+        };
         std::fs::write(
             dir.path().join(DIVERGENCE_MARKER_FILE),
-            serde_json::to_vec(&divergence).unwrap(),
+            divergence.encode().unwrap(),
         )
         .unwrap();
         let recovery = RecoveryMarker {
@@ -2202,7 +2199,6 @@ mod tests {
             serde_json::to_vec(&recovery).unwrap(),
         )
         .unwrap();
-        let directory = JournalDirectory::open(dir.path()).unwrap();
         assert_eq!(
             preflight_ordinary_authority(&directory, false).unwrap(),
             OrdinaryAuthorityEvidence::Divergence
@@ -2229,7 +2225,7 @@ mod tests {
         );
         std::fs::write(
             dir.path().join(DIVERGENCE_MARKER_FILE),
-            serde_json::to_vec(&divergence).unwrap(),
+            divergence.encode().unwrap(),
         )
         .unwrap();
 

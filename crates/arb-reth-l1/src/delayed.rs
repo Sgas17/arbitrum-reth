@@ -18,11 +18,11 @@ use alloy_sol_types::{SolCall, SolEvent};
 
 use arb_reth_derive::delayed::{DelayedMap, DelayedMessage};
 
-use crate::contracts::{
-    from_origin, InboxMessageDelivered, InboxMessageDeliveredFromOrigin, MessageDelivered,
-    BRIDGE_MAINNET,
-};
 use crate::L1Error;
+use crate::contracts::{
+    BRIDGE_MAINNET, InboxMessageDelivered, InboxMessageDeliveredFromOrigin, MessageDelivered,
+    from_origin,
+};
 
 pub use crate::contracts::BRIDGE_MAINNET as BRIDGE_MAINNET_ADDR;
 
@@ -62,7 +62,10 @@ impl DelayedEvent {
             before_inbox_acc: self.before_inbox_acc,
         };
         if msg.message_data_hash() != self.message_data_hash {
-            return Err(L1Error::Blob(format!("delayed body hash mismatch at index {}", self.index)));
+            return Err(L1Error::Blob(format!(
+                "delayed body hash mismatch at index {}",
+                self.index
+            )));
         }
         Ok(msg)
     }
@@ -92,7 +95,10 @@ impl<P: Provider> DelayedInboxReader<P> {
     }
 
     async fn get_logs(&self, filter: Filter) -> Result<Vec<Log>, L1Error> {
-        self.provider.get_logs(&filter).await.map_err(|e| L1Error::Rpc(e.to_string()))
+        self.provider
+            .get_logs(&filter)
+            .await
+            .map_err(|e| L1Error::Rpc(e.to_string()))
     }
 
     /// Reconstruct every delayed message whose `MessageDelivered` falls in the
@@ -131,7 +137,9 @@ impl<P: Provider> DelayedInboxReader<P> {
         from_block: u64,
         to_block: u64,
     ) -> Result<DelayedMap, L1Error> {
-        Ok(DelayedMap::from_messages(self.fetch_delayed(from_block, to_block).await?))
+        Ok(DelayedMap::from_messages(
+            self.fetch_delayed(from_block, to_block).await?,
+        ))
     }
 
     async fn fetch_metas(
@@ -146,8 +154,11 @@ impl<P: Provider> DelayedInboxReader<P> {
             .to_block(to_block);
         let mut metas = BTreeMap::new();
         for log in self.get_logs(filter).await? {
-            let l1_block = log.block_number.ok_or(L1Error::Missing("MessageDelivered block_number"))?;
-            let event = parse_message_delivered(log.inner.data.topics(), &log.inner.data.data, l1_block)?;
+            let l1_block = log
+                .block_number
+                .ok_or(L1Error::Missing("MessageDelivered block_number"))?;
+            let event =
+                parse_message_delivered(log.inner.data.topics(), &log.inner.data.data, l1_block)?;
             metas.insert(event.index, event);
         }
         Ok(metas)
@@ -170,9 +181,11 @@ impl<P: Provider> DelayedInboxReader<P> {
             .event_signature(InboxMessageDeliveredFromOrigin::SIGNATURE_HASH)
             .from_block(from_block)
             .to_block(to_block);
-        let (inline_logs, from_origin_logs) =
-            futures_util::future::try_join(self.get_logs(inline), self.get_logs(from_origin_filter))
-                .await?;
+        let (inline_logs, from_origin_logs) = futures_util::future::try_join(
+            self.get_logs(inline),
+            self.get_logs(from_origin_filter),
+        )
+        .await?;
 
         for log in inline_logs {
             let index = topic_u64(&log, "InboxMessageDelivered messageNum")?;
@@ -185,10 +198,14 @@ impl<P: Provider> DelayedInboxReader<P> {
         use futures_util::stream::{StreamExt, TryStreamExt};
         // Collect the per-log futures eagerly (not a lazy map in the stream) so the resulting future
         // stays `Send` for the spawned sync task.
-        let body_futs: Vec<_> =
-            from_origin_logs.iter().map(|log| self.origin_body_entry(log)).collect();
-        let fetched: Vec<((u64, Address), Vec<u8>)> =
-            futures_util::stream::iter(body_futs).buffer_unordered(8).try_collect().await?;
+        let body_futs: Vec<_> = from_origin_logs
+            .iter()
+            .map(|log| self.origin_body_entry(log))
+            .collect();
+        let fetched: Vec<((u64, Address), Vec<u8>)> = futures_util::stream::iter(body_futs)
+            .buffer_unordered(8)
+            .try_collect()
+            .await?;
         bodies.extend(fetched);
 
         Ok(bodies)
@@ -196,10 +213,7 @@ impl<P: Provider> DelayedInboxReader<P> {
 
     /// `((index, emitter), body)` for one `InboxMessageDeliveredFromOrigin` log — the tx-calldata
     /// body fetch, packaged for concurrent resolution in [`Self::fetch_bodies`].
-    async fn origin_body_entry(
-        &self,
-        log: &Log,
-    ) -> Result<((u64, Address), Vec<u8>), L1Error> {
+    async fn origin_body_entry(&self, log: &Log) -> Result<((u64, Address), Vec<u8>), L1Error> {
         let index = topic_u64(log, "InboxMessageDeliveredFromOrigin messageNum")?;
         let emitter = log.inner.address;
         let data = self.fetch_from_origin_body(log).await?;
@@ -207,7 +221,9 @@ impl<P: Provider> DelayedInboxReader<P> {
     }
 
     async fn fetch_from_origin_body(&self, log: &Log) -> Result<Vec<u8>, L1Error> {
-        let tx_hash = log.transaction_hash.ok_or(L1Error::Missing("log transaction_hash"))?;
+        let tx_hash = log
+            .transaction_hash
+            .ok_or(L1Error::Missing("log transaction_hash"))?;
         let tx = self
             .provider
             .get_transaction_by_hash(tx_hash)
@@ -242,18 +258,30 @@ pub fn parse_message_delivered(
     data: &[u8],
     l1_block: u64,
 ) -> Result<DelayedEvent, L1Error> {
-    if topics.len() < 3 {
+    if topics.len() != 3 || topics[0] != MessageDelivered::SIGNATURE_HASH {
         return Err(L1Error::Missing("MessageDelivered indexed topics"));
+    }
+    if topics[1].0[..24].iter().any(|byte| *byte != 0) {
+        return Err(L1Error::Missing("MessageDelivered index exceeds u64"));
     }
     let index = u64::from_be_bytes(topics[1].0[24..32].try_into().unwrap());
     let before_inbox_acc = topics[2];
 
     if data.len() != 6 * 32 {
-        return Err(L1Error::Batch(arb_reth_derive::batch::BatchError::EventDataWrongLen(
-            data.len(),
-        )));
+        return Err(L1Error::Batch(
+            arb_reth_derive::batch::BatchError::EventDataWrongLen(data.len()),
+        ));
     }
     let word = |i: usize| &data[i * 32..(i + 1) * 32];
+    if word(0)[..12].iter().any(|byte| *byte != 0)
+        || word(1)[..31].iter().any(|byte| *byte != 0)
+        || word(2)[..12].iter().any(|byte| *byte != 0)
+        || word(5)[..24].iter().any(|byte| *byte != 0)
+    {
+        return Err(L1Error::Missing(
+            "MessageDelivered has non-canonical ABI word",
+        ));
+    }
     Ok(DelayedEvent {
         index,
         before_inbox_acc,
@@ -273,10 +301,35 @@ pub fn parse_inbox_message_data(data: &[u8]) -> Result<Vec<u8>, L1Error> {
     if data.len() < 64 {
         return Err(L1Error::Missing("InboxMessageDelivered data head"));
     }
+    if U256::from_be_slice(&data[..32]) != U256::from(32) {
+        return Err(L1Error::Missing(
+            "InboxMessageDelivered data offset is not canonical",
+        ));
+    }
     let len: usize = U256::from_be_slice(&data[32..64])
         .try_into()
         .map_err(|_| L1Error::Missing("InboxMessageDelivered length overflow"))?;
-    let body = data.get(64..64 + len).ok_or(L1Error::Missing("InboxMessageDelivered body"))?;
+    let body_end = 64usize
+        .checked_add(len)
+        .ok_or(L1Error::Missing("InboxMessageDelivered length overflow"))?;
+    let encoded_end = body_end
+        .checked_add(31)
+        .map(|end| end / 32 * 32)
+        .ok_or(L1Error::Missing(
+            "InboxMessageDelivered padded length overflow",
+        ))?;
+    if data.len() != encoded_end
+        || data
+            .get(body_end..encoded_end)
+            .is_none_or(|padding| padding.iter().any(|byte| *byte != 0))
+    {
+        return Err(L1Error::Missing(
+            "InboxMessageDelivered data is not canonical ABI",
+        ));
+    }
+    let body = data
+        .get(64..body_end)
+        .ok_or(L1Error::Missing("InboxMessageDelivered body"))?;
     Ok(body.to_vec())
 }
 
@@ -301,7 +354,7 @@ mod tests {
     /// the delivering inbox.
     fn encode_message_delivered(m: &DelayedMessage, inbox: Address) -> (Vec<B256>, Vec<u8>) {
         let topics = vec![
-            B256::ZERO, // sig (ignored by the parser)
+            MessageDelivered::SIGNATURE_HASH,
             B256::from(word_u64(m.inbox_seq_num)),
             m.before_inbox_acc,
         ];
@@ -362,13 +415,65 @@ mod tests {
         let m = sample(1, B256::ZERO, b"correct".to_vec());
         let (topics, data) = encode_message_delivered(&m, Address::ZERO);
         let event = parse_message_delivered(&topics, &data, m.block_number).unwrap();
-        assert!(matches!(event.into_message(b"tampered".to_vec()), Err(L1Error::Blob(_))));
+        assert!(matches!(
+            event.into_message(b"tampered".to_vec()),
+            Err(L1Error::Blob(_))
+        ));
     }
 
     #[test]
     fn inbox_data_round_trips() {
         let body = b"\x03\x04\x05 arbitrary delayed payload bytes".to_vec();
-        assert_eq!(parse_inbox_message_data(&encode_inbox_data(&body)).unwrap(), body);
+        assert_eq!(
+            parse_inbox_message_data(&encode_inbox_data(&body)).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn canonical_event_decoders_reject_aliases_padding_and_trailing_data() {
+        let message = sample(1, B256::ZERO, b"body".to_vec());
+        let (topics, data) = encode_message_delivered(&message, Address::repeat_byte(3));
+        for (topic, offset) in [
+            (true, 0usize),
+            (false, 0),
+            (false, 32),
+            (false, 64),
+            (false, 5 * 32),
+        ] {
+            let mut changed_topics = topics.clone();
+            let mut changed_data = data.clone();
+            if topic {
+                changed_topics[1].0[offset] = 1;
+            } else {
+                changed_data[offset] = 1;
+            }
+            assert!(
+                parse_message_delivered(&changed_topics, &changed_data, message.block_number)
+                    .is_err()
+            );
+        }
+
+        let encoded = encode_inbox_data(b"body");
+        for changed in [
+            {
+                let mut value = encoded.clone();
+                value[31] = 0x40;
+                value
+            },
+            {
+                let mut value = encoded.clone();
+                value[68] = 1;
+                value
+            },
+            {
+                let mut value = encoded;
+                value.push(0);
+                value
+            },
+        ] {
+            assert!(parse_inbox_message_data(&changed).is_err());
+        }
     }
 
     #[test]

@@ -16,6 +16,7 @@
 
 use arb_reth_node::commands::{
     self,
+    canonical_observe::CanonicalObserveArgs,
     dump_blocks::DumpBlocksArgs,
     genesis::{GenesisVerifyArgs, GenesisVerifyExportArgs},
     journal_init::JournalV3InitArgs,
@@ -29,6 +30,10 @@ use arb_reth_node::commands::{
 use clap::{Args, Parser, Subcommand};
 use reth_cli_runner::CliRunner;
 use reth_tracing::{RethTracer, Tracer};
+
+const KZG_HELPER_ENV: &str = "ARB_RETH_INTERNAL_KZG_COMMITMENT_HELPER";
+const KZG_TRUSTED_SETUP_DIGEST: [u8; 32] =
+    alloy_primitives::hex!("d39b9f2d047cc9dca2de58f264b6a09448ccd34db967881a6713eacacf0f26b7");
 
 /// Stack-probe shim for x86_64: wasmer references `__rust_probestack` which recent
 /// `compiler-builtins` no longer exports; this satisfies the linker. No-op on aarch64.
@@ -55,6 +60,8 @@ struct Cli {
 enum Command {
     /// Run the standalone no-engine Arbitrum node.
     Node(NodeArgs),
+    /// Observe canonical Ethereum L1 once against a stopped Robinhood datadir.
+    CanonicalObserve(CanonicalObserveArgs),
     /// One-shot trusted compact-storage journal and lifecycle initialization.
     JournalV3Init(JournalV3InitArgs),
     /// Snapshot import/read tools.
@@ -104,6 +111,10 @@ enum GenesisSub {
 }
 
 fn main() -> eyre::Result<()> {
+    if std::env::var_os(KZG_HELPER_ENV).is_some() {
+        return run_kzg_commitment_helper();
+    }
+
     // Idiomatic reth tracing; guard is held for the process lifetime.
     let _guard = RethTracer::new().init()?;
 
@@ -120,6 +131,7 @@ fn main() -> eyre::Result<()> {
             let runner = CliRunner::try_default_runtime()?;
             commands::node::run_until_exit(runner, args)
         }
+        Command::CanonicalObserve(args) => commands::canonical_observe::run(args),
         Command::JournalV3Init(args) => commands::journal_init::run(args),
         Command::Snapshot(cmd) => match cmd.command {
             SnapshotSub::BuildPreimages(args) => commands::snapshot::build_preimages(args),
@@ -136,4 +148,56 @@ fn main() -> eyre::Result<()> {
         Command::Rewind(args) => commands::rewind::run(args),
         Command::DumpBlocks(args) => commands::dump_blocks::run(args),
     }
+}
+
+fn run_kzg_commitment_helper() -> eyre::Result<()> {
+    use std::io::{Read as _, Write as _};
+
+    reject_inherited_descriptors()?;
+    eyre::ensure!(
+        std::env::args_os().len() == 1,
+        "internal KZG helper accepts no arguments"
+    );
+    let mut digest = [0u8; 32];
+    std::io::stdin().read_exact(&mut digest)?;
+    eyre::ensure!(
+        digest == KZG_TRUSTED_SETUP_DIGEST,
+        "internal KZG helper trusted-setup identity mismatch"
+    );
+    let mut blob = Box::new([0u8; c_kzg::BYTES_PER_BLOB]);
+    std::io::stdin().read_exact(blob.as_mut_slice())?;
+    let mut trailing = [0u8; 1];
+    eyre::ensure!(
+        std::io::stdin().read(&mut trailing)? == 0,
+        "internal KZG helper received trailing input"
+    );
+    let blob = c_kzg::Blob::new(*blob);
+    let commitment = c_kzg::ethereum_kzg_settings(0)
+        .blob_to_kzg_commitment(&blob)
+        .map_err(|error| eyre::eyre!("internal KZG commitment failed: {error:?}"))?
+        .to_bytes()
+        .into_inner();
+    std::io::stdout().write_all(&commitment)?;
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+fn reject_inherited_descriptors() -> eyre::Result<()> {
+    let descriptors = std::fs::read_dir("/proc/self/fd")?
+        .map(|entry| {
+            entry?
+                .file_name()
+                .to_string_lossy()
+                .parse::<i32>()
+                .map_err(std::io::Error::other)
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for descriptor in descriptors.into_iter().filter(|descriptor| *descriptor > 2) {
+        let result = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        eyre::ensure!(
+            result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF),
+            "internal KZG helper inherited descriptor {descriptor}"
+        );
+    }
+    Ok(())
 }

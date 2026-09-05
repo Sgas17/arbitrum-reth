@@ -8,7 +8,8 @@ use std::{
 use alloy_consensus::Header;
 use alloy_rlp::Decodable as _;
 use arb_reth_engine::{
-    JournalDirectory, MessageJournalAnchor, StorageContextV3, initialize_journal_v3,
+    JournalDirectory, MessageJournalAnchor, StorageContextV3,
+    initialize_approved_snapshot_journal_v3, initialize_journal_v3,
 };
 use clap::Parser;
 use eyre::{ensure, eyre};
@@ -141,14 +142,23 @@ pub fn run(args: JournalV3InitArgs) -> eyre::Result<()> {
         deployment_block: deployment.deployed_at,
         anchor,
     };
-    initialize_combined_authority(&directory, context)
+    initialize_combined_authority(
+        &directory,
+        context,
+        args.snapshot_trust_descriptor.is_some(),
+    )
 }
 
 fn initialize_combined_authority(
     directory: &JournalDirectory,
     context: StorageContextV3,
+    approved_snapshot: bool,
 ) -> eyre::Result<()> {
-    let inspection = initialize_journal_v3(directory, context)?;
+    let inspection = if approved_snapshot {
+        initialize_approved_snapshot_journal_v3(directory, context)?
+    } else {
+        initialize_journal_v3(directory, context)?
+    };
     ensure!(
         inspection.anchor() == context.anchor,
         "freshly reopened lineage-zero anchor changed"
@@ -235,6 +245,29 @@ pub(crate) fn reviewed_storage_chain(
             "storage context requires either exact reviewed Arbitrum One --chain or the compile-time-allowlisted --chain-info/--genesis/--snapshot-trust-descriptor set"
         )),
     }
+}
+
+pub(crate) fn reviewed_robinhood_storage_chain()
+-> eyre::Result<(Arc<reth_chainspec::ChainSpec>, Header, InitDeployment)> {
+    const CHAIN_INFO: &[u8] = include_bytes!("../../tests/fixtures/robinhood-chain-info.json");
+    const GENESIS: &[u8] = include_bytes!("../../tests/fixtures/robinhood-genesis.json");
+    let trust = crate::snapshot_trust::ApprovedSnapshotTrust::frozen();
+    verify_snapshot_metadata(trust, CHAIN_INFO, GENESIS)?;
+    let (spec, _, info) = crate::orbit_chain_from_files(CHAIN_INFO, GENESIS)?;
+    ensure!(
+        spec.chain().id() == trust.chain_id,
+        "compiled Robinhood chain identity differs from snapshot trust"
+    );
+    let spec = Arc::new(spec);
+    Ok((
+        spec.clone(),
+        spec.genesis_header().clone(),
+        InitDeployment {
+            sequencer_inbox: info.rollup.sequencer_inbox,
+            bridge: info.rollup.bridge,
+            deployed_at: info.rollup.deployed_at,
+        },
+    ))
 }
 
 fn reviewed_arbitrum_one_genesis() -> eyre::Result<Header> {
@@ -505,7 +538,7 @@ mod tests {
         const CHILD_DATADIR: &str = "ARB_RETH_COMBINED_INIT_TEST_DATADIR";
         if let Some(datadir) = std::env::var_os(CHILD_DATADIR) {
             let directory = JournalDirectory::open(std::path::Path::new(&datadir)).unwrap();
-            initialize_combined_authority(&directory, context()).unwrap();
+            initialize_combined_authority(&directory, context(), false).unwrap();
             return;
         }
 
@@ -591,7 +624,7 @@ mod tests {
                 }
             }
             assert!(
-                initialize_combined_authority(&directory, context()).is_err(),
+                initialize_combined_authority(&directory, context(), false).is_err(),
                 "interrupted combined initialization was resumable at {point}"
             );
         }

@@ -71,7 +71,7 @@ pub(crate) struct ApprovedSnapshotTrust {
 }
 
 impl ApprovedSnapshotTrust {
-    const fn frozen() -> Self {
+    pub(crate) const fn frozen() -> Self {
         Self {
             descriptor_sha256: DESCRIPTOR_SHA256,
             chain_id: CHAIN_ID,

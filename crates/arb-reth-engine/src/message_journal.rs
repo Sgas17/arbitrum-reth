@@ -1,8 +1,8 @@
 //! Compact Phase-B storage journal.
 //!
-//! Version 3 freezes only authenticated storage envelopes. Production B1 has no canonical-context
-//! registry entries, no bootstrap-certificate allowlist, and no authority producer. A single
-//! worker continues to own execution appends; future authority and recovery callers remain absent.
+//! Version 3 freezes authenticated storage and compact canonical-authority envelopes. A single
+//! worker owns both execution and authority appends; the sole production context and bootstrap
+//! certificate are compile-time constants.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -15,20 +15,20 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, address, b256};
 use eyre::{WrapErr as _, ensure, eyre};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 
-use crate::{ArbEngineInput, ArbEngineInputSource, ArbMessageEnrichment, ArbMessageFingerprint};
+use crate::{ArbEngineInputSource, ArbMessageEnrichment, ArbMessageFingerprint};
 
 pub const MESSAGE_JOURNAL_PREFIX: &str = "arb-message-journal-v3-g";
 pub const MESSAGE_JOURNAL_FAMILY_PREFIX: &str = "arb-message-journal";
@@ -43,6 +43,7 @@ pub const PROTECTED_EXECUTION_RECORD_FLOOR: usize = 1;
 pub const MAX_UNJOURNALED_SEQUENCE_DISTANCE: u64 = 1_024;
 pub const MAX_SUPPORTED_PERSISTENCE_THRESHOLD: u64 = 512;
 pub const AUTHORITY_MAX_RECORDS: usize = 256;
+pub const AUTHORITY_QUEUE_MAX_ITEMS: usize = 8;
 pub const MAINTENANCE_WORK_ITEMS: usize = 1;
 pub const MAINTENANCE_MAX_WAIT: Duration = Duration::from_secs(30);
 pub const JOURNAL_COMPACT_MIN_IDENTITIES: usize = 100_000;
@@ -1144,10 +1145,76 @@ struct AuthorityPolicy<'a> {
     bootstrap_certificates: &'a [B256],
 }
 
-const PRODUCTION_POLICY: AuthorityPolicy<'static> = AuthorityPolicy {
-    contexts: &[],
-    bootstrap_certificates: &[],
-};
+static PRODUCTION_CONTEXTS: LazyLock<[CanonicalContextV1; 1]> = LazyLock::new(|| {
+    [CanonicalContextV1 {
+        context_id: 1,
+        l1_chain_id: 1,
+        l1_genesis_hash: b256!("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"),
+        l2_chain_id: 4_663,
+        l2_genesis_number: 0,
+        l2_genesis_hash: b256!("aad15f3d702aaea00caf3e9bb56395efe9127bc3b31b24921abf1eee3409305c"),
+        sequencer_inbox: address!("Bd0D173EEb87D57A09521c24388a12789F33ba96"),
+        bridge: address!("Df8755334ce7A73cCF6b581C02eA649AE3E864b3"),
+        deployment_block: 24_994_238,
+        beacon_genesis_validators_root: b256!(
+            "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+        ),
+        beacon_genesis_time: 1_606_824_023,
+        seconds_per_slot: 12,
+        slots_per_epoch: 32,
+        fork_schedule: vec![
+            (0, [0, 0, 0, 0]),
+            (74_240, [1, 0, 0, 0]),
+            (144_896, [2, 0, 0, 0]),
+            (194_048, [3, 0, 0, 0]),
+            (269_568, [4, 0, 0, 0]),
+            (364_032, [5, 0, 0, 0]),
+            (411_392, [6, 0, 0, 0]),
+        ],
+        kzg_trusted_setup_digest: b256!(
+            "d39b9f2d047cc9dca2de58f264b6a09448ccd34db967881a6713eacacf0f26b7"
+        ),
+    }]
+});
+
+const PRODUCTION_BOOTSTRAP_CERTIFICATES: [B256; 1] = [b256!(
+    "f0eec5f30436245f3b1526ba431e1e7339ee7bf6f3818b128cb6b62c50aa8804"
+)];
+
+fn production_policy() -> AuthorityPolicy<'static> {
+    AuthorityPolicy {
+        contexts: PRODUCTION_CONTEXTS.as_slice(),
+        bootstrap_certificates: &PRODUCTION_BOOTSTRAP_CERTIFICATES,
+    }
+}
+
+pub fn production_canonical_context() -> &'static CanonicalContextV1 {
+    &PRODUCTION_CONTEXTS[0]
+}
+
+pub fn production_storage_context() -> StorageContextV3 {
+    let context = production_canonical_context();
+    StorageContextV3 {
+        l2_chain_id: context.l2_chain_id,
+        l2_genesis_number: context.l2_genesis_number,
+        l2_genesis_hash: context.l2_genesis_hash,
+        sequencer_inbox: context.sequencer_inbox,
+        bridge: context.bridge,
+        deployment_block: context.deployment_block,
+        anchor: MessageJournalAnchor {
+            sequence: 31_805_144,
+            block_number: 31_805_144,
+            block_hash: b256!("cc8b407211b69dbac3e16dc083a980db25da7133de714d5f69b7f3d068278990"),
+        },
+    }
+}
+
+pub fn production_bootstrap_authority() -> AuthorityRecordV3 {
+    const BYTES: [u8; AUTHORITY_RECORD_LEN] = alloy_primitives::hex!(
+        "415242415554483300030200000002000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000001e54ed80000000001e54ed80000000000000000000000000000000000000000000000000000000000000000000000000e98af206c759354b4e4c518158334cd032cd12eef2a190081a31221f6b6249d7dd7b8fc3cff04bda62c089fabc806d2be3be9e09a29e80eab392231cca815144152424c4f4333000001000100010000eb0d03086218827bd1b8e4afafe6612f29a009c4dac82920c7084936d4f8c64f00000000018aedf427183b30d80126283ab880afd3cb05860d85402e94875dfd8a656d6199512a1e00000000018866720b23cbbe3df15b5b1cc462e7939612afc0ec5c7831e70f2ab74044a145e1a2bc80a9642ebe2d93d4ce307275536134f9fd10f3f57223fb3dfe05bec02dd300d2000000140000020d0000000000016704000001400000015a000000000001b32d0000000001e54ed80000000001e54ed8cc8b407211b69dbac3e16dc083a980db25da7133de714d5f69b7f3d0682789900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005448a1c37cf918dad6e9330d6138b428f85013a8f60acdfa07b68e161d084e71000000000000000000000000"
+    );
+    decode_authority_record(&BYTES).expect("compiled production bootstrap authority is valid")
+}
 
 fn validate_locator_context(
     locator: EvidenceLocatorV1,
@@ -2323,9 +2390,52 @@ pub struct MessageJournalInspection {
     state: SnapshotState,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthorityFenceV3 {
+    pub journal: MessageJournalAnchor,
+    pub verified: MessageJournalAnchor,
+    pub journal_operation_generation: u64,
+    pub authority_chain_position: u64,
+    pub latest_authority_id: B256,
+    pub latest_authority_chain_digest: B256,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthorityCandidateV3 {
+    pub fence: AuthorityFenceV3,
+    pub start_sequence: u64,
+    pub end_sequence: u64,
+    pub observation: crate::CanonicalObservationV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthorityAcknowledgementV3 {
+    pub fence: AuthorityFenceV3,
+    pub record: AuthorityRecordV3,
+}
+
+#[derive(Debug)]
+struct AuthorityCandidateStale;
+
+impl std::fmt::Display for AuthorityCandidateStale {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("authority candidate fence is stale")
+    }
+}
+
+impl std::error::Error for AuthorityCandidateStale {}
+
+pub fn is_authority_candidate_stale(error: &eyre::Report) -> bool {
+    error.downcast_ref::<AuthorityCandidateStale>().is_some()
+}
+
 impl MessageJournalInspection {
     pub fn anchor(&self) -> MessageJournalAnchor {
         self.header.anchor
+    }
+
+    pub fn bootstrap_authority(&self) -> Option<AuthorityRecordV3> {
+        self.state.bootstrap
     }
 
     pub fn entry(&self, sequence: u64) -> Option<MessageJournalEntry> {
@@ -2340,6 +2450,60 @@ impl MessageJournalInspection {
 
     pub fn identity(&self, sequence: u64) -> Option<MessageJournalAnchor> {
         identity_at(self.header.anchor, &self.entries, sequence)
+    }
+
+    pub fn authority_fence(&self) -> eyre::Result<AuthorityFenceV3> {
+        Ok(AuthorityFenceV3 {
+            journal: self.watermark,
+            verified: self
+                .v
+                .ok_or_else(|| eyre!("canonical authority V is absent"))?,
+            journal_operation_generation: self.last_operation_generation,
+            authority_chain_position: self.authority_operation_count,
+            latest_authority_id: self.latest_authority_id,
+            latest_authority_chain_digest: self.latest_authority_chain_digest,
+        })
+    }
+
+    /// Digest the exact durable identities after converting the candidate range to L1 source.
+    /// This is a preview only: the sole worker independently rebuilds and verifies the digest
+    /// before appending an authority frame and still enforces its 256-record cap. A V4
+    /// observation can describe a complete bounded batch without publishing that range.
+    pub fn promoted_identities_digest(
+        &self,
+        start_sequence: u64,
+        end_sequence: u64,
+    ) -> eyre::Result<B256> {
+        ensure!(
+            start_sequence <= end_sequence,
+            "promoted identity range is empty"
+        );
+        let count = end_sequence
+            .checked_sub(start_sequence)
+            .and_then(|count| count.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| eyre!("promoted identity range overflows"))?;
+        ensure!(
+            count <= 4_096,
+            "observation identity range exceeds the complete-batch cap"
+        );
+        if count == 1
+            && start_sequence == self.header.anchor.sequence
+            && self.bootstrap_authority() == Some(production_bootstrap_authority())
+            && self.header.storage_context_digest == production_storage_context().digest()
+        {
+            return Ok(production_bootstrap_authority().promoted_identities_digest);
+        }
+        let mut hasher = framed_hasher(DOMAIN_IDENTITIES, 2 + count * IDENTITY_LEN);
+        hasher.update((count as u16).to_be_bytes());
+        for sequence in start_sequence..=end_sequence {
+            let mut entry = self
+                .entry(sequence)
+                .ok_or_else(|| eyre!("promoted sequence {sequence} is not retained"))?;
+            entry.source = ArbEngineInputSource::L1;
+            hasher.update(encode_identity(entry));
+        }
+        Ok(B256::from_slice(&hasher.finalize()))
     }
 }
 
@@ -3435,7 +3599,7 @@ pub fn inspect_stopped_message_journal(
     directory: &JournalDirectory,
     expected_context: StorageContextV3,
 ) -> eyre::Result<(MessageJournalInspection, bool)> {
-    inspect_stopped_with_policy(directory, expected_context, PRODUCTION_POLICY)
+    inspect_stopped_with_policy(directory, expected_context, production_policy())
 }
 
 fn inspect_stopped_with_policy(
@@ -3499,7 +3663,7 @@ pub fn inspect_message_journal(
     directory: &JournalDirectory,
     expected_context: StorageContextV3,
 ) -> eyre::Result<MessageJournalInspection> {
-    inspect_message_with_policy(directory, expected_context, PRODUCTION_POLICY)
+    inspect_message_with_policy(directory, expected_context, production_policy())
 }
 
 fn inspect_message_with_policy(
@@ -3573,6 +3737,54 @@ pub fn initialize_journal_v3(
     directory: &JournalDirectory,
     context: StorageContextV3,
 ) -> eyre::Result<MessageJournalInspection> {
+    initialize_journal_with_state(directory, context, empty_snapshot_state(), 904)
+}
+
+pub fn initialize_approved_snapshot_journal_v3(
+    directory: &JournalDirectory,
+    context: StorageContextV3,
+) -> eyre::Result<MessageJournalInspection> {
+    let canonical = production_canonical_context();
+    let bootstrap = production_bootstrap_authority();
+    let expected_anchor = MessageJournalAnchor {
+        sequence: 31_805_144,
+        block_number: 31_805_144,
+        block_hash: b256!("cc8b407211b69dbac3e16dc083a980db25da7133de714d5f69b7f3d068278990"),
+    };
+    ensure!(
+        context.l2_chain_id == canonical.l2_chain_id
+            && context.l2_genesis_number == canonical.l2_genesis_number
+            && context.l2_genesis_hash == canonical.l2_genesis_hash
+            && context.sequencer_inbox == canonical.sequencer_inbox
+            && context.bridge == canonical.bridge
+            && context.deployment_block == canonical.deployment_block
+            && context.anchor == expected_anchor
+            && context.digest()
+                == b256!("68a7fa94cf4188ba7976796d51d91daf6adf2ec9cb8bc6c335665e22673e1631"),
+        "approved snapshot storage context does not match the compiled certificate"
+    );
+    ensure!(
+        bootstrap.locator.context_digest == canonical.digest()?
+            && bootstrap.evidence_digest
+                == crate::decode_production_bootstrap_observation().evidence_digest()
+            && bootstrap.locator == crate::decode_production_bootstrap_observation().locator(),
+        "compiled bootstrap observation/authority bundle is inconsistent"
+    );
+    let mut state = empty_snapshot_state();
+    state.bootstrap = Some(bootstrap);
+    state.v = Some(context.anchor);
+    state.authority_operation_count = 1;
+    state.latest_authority_id = bootstrap.authority_id;
+    state.latest_authority_chain_digest = authority_chain_digest(bootstrap);
+    initialize_journal_with_state(directory, context, state, 1_416)
+}
+
+fn initialize_journal_with_state(
+    directory: &JournalDirectory,
+    context: StorageContextV3,
+    state: SnapshotState,
+    exact_length: u64,
+) -> eyre::Result<MessageJournalInspection> {
     for name in directory.entry_names()? {
         if name.starts_with(MESSAGE_JOURNAL_FAMILY_PREFIX) {
             return Err(eyre!("message-journal artifact already exists"));
@@ -3585,10 +3797,10 @@ pub fn initialize_journal_v3(
         anchor: context.anchor,
         storage_context_digest: context.digest(),
     };
-    let state = empty_snapshot_state();
     ensure!(
-        HEADER_LEN + FRAME_STORAGE_OVERHEAD + snapshot_payload_len(&state)? == 904,
-        "lineage zero is not exactly 904 bytes"
+        (HEADER_LEN + FRAME_STORAGE_OVERHEAD + snapshot_payload_len(&state)?) as u64
+            == exact_length,
+        "lineage-zero exact length changed"
     );
     let temp_name = exact_journal_name(0, "tmp");
     let final_name = exact_journal_name(0, "log");
@@ -3602,9 +3814,9 @@ pub fn initialize_journal_v3(
         &state,
         "initialization",
     )?;
-    let candidate = inspect_file(directory, &temp_name, context, PRODUCTION_POLICY)?;
+    let candidate = inspect_file(directory, &temp_name, context, production_policy())?;
     ensure!(
-        candidate.complete_byte_offset == 904,
+        candidate.complete_byte_offset == exact_length,
         "lineage-zero temp length changed"
     );
     journal_crashpoint("initialization_after_temp_reread");
@@ -3622,48 +3834,12 @@ pub fn divergence_marker_path(directory: &JournalDirectory) -> PathBuf {
     directory.path().join(DIVERGENCE_MARKER_FILE)
 }
 
-pub(crate) fn write_divergence_marker_at(
-    directory: &JournalDirectory,
-    tip: BlockNumHash,
-    next_sequence: u64,
-    input: &ArbEngineInput,
-    error: &str,
-) -> eyre::Result<()> {
-    if directory.entry_exists(DIVERGENCE_MARKER_FILE)? {
-        return Ok(());
-    }
-    let value = serde_json::json!({
-        "version": 3,
-        "detected_unix_seconds": SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        "tip_block_number": tip.number,
-        "tip_block_hash": tip.hash,
-        "next_sequence": next_sequence,
-        "incoming_source": input.source(),
-        "incoming_message": input.message(),
-        "error": error,
-    });
-    let mut file = directory.create_new(DIVERGENCE_MARKER_FILE, false)?;
-    serde_json::to_writer_pretty(&mut file, &value)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    directory.sync_parent()
-}
-
-pub fn clear_divergence_marker_at(directory: &JournalDirectory) -> eyre::Result<()> {
-    if directory.entry_exists(DIVERGENCE_MARKER_FILE)? {
-        directory.remove_entry(DIVERGENCE_MARKER_FILE)?;
-    }
-    Ok(())
-}
-
 #[derive(Debug, Default)]
 struct AdmissionState {
     work: usize,
     records: usize,
     bytes: usize,
+    authority_items: usize,
 }
 
 #[derive(Debug)]
@@ -3735,6 +3911,7 @@ impl Admission {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let available = !self.closed.load(Ordering::Acquire)
+            && state.authority_items < AUTHORITY_QUEUE_MAX_ITEMS
             && state.work < JOURNAL_WORK_ITEM_CAPACITY - PROTECTED_EXECUTION_WORK_FLOOR
             && state.records.checked_add(records).is_some_and(|total| {
                 total <= JOURNAL_RECORD_LIABILITY_CAPACITY - PROTECTED_EXECUTION_RECORD_FLOOR
@@ -3749,6 +3926,7 @@ impl Admission {
         state.work += 1;
         state.records += records;
         state.bytes += bytes;
+        state.authority_items += 1;
         drop(state);
         Ok(Some(AuthorityStorageReservation {
             admission: self.clone(),
@@ -3814,7 +3992,17 @@ struct AuthorityStorageReservation {
 
 impl Drop for AuthorityStorageReservation {
     fn drop(&mut self) {
-        self.admission.retire(1, self.records, self.bytes);
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.work -= 1;
+        state.records -= self.records;
+        state.bytes -= self.bytes;
+        state.authority_items -= 1;
+        drop(state);
+        self.admission.notify.notify_waiters();
     }
 }
 
@@ -3936,8 +4124,14 @@ pub(crate) fn test_persistence_observer() -> PersistenceObserver {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Work {
     Executed(MessageJournalEntry, ExecutionReservation),
+    Authority(
+        AuthorityCandidateV3,
+        AuthorityStorageReservation,
+        crossbeam_channel::Sender<eyre::Result<AuthorityAcknowledgementV3>>,
+    ),
     Drain(crossbeam_channel::Sender<eyre::Result<MessageJournalAnchor>>),
 }
 
@@ -4006,6 +4200,28 @@ impl JournalClient {
         self.work
             .try_send(Work::Executed(entry, reservation))
             .map_err(|error| eyre!("reserved journal enqueue failed: {error}"))
+    }
+
+    pub fn enqueue_authority(
+        &self,
+        candidate: AuthorityCandidateV3,
+    ) -> eyre::Result<crossbeam_channel::Receiver<eyre::Result<AuthorityAcknowledgementV3>>> {
+        assert_authority_operation_allowed("authority-reservation-and-acknowledgement");
+        let count = candidate
+            .end_sequence
+            .checked_sub(candidate.start_sequence)
+            .and_then(|count| count.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| eyre!("authority candidate count overflow"))?;
+        let reservation = self
+            .admission
+            .try_reserve_authority_storage(count)?
+            .ok_or_else(|| eyre!("authority reservation is unavailable"))?;
+        let (send, receive) = crossbeam_channel::bounded(1);
+        self.work
+            .try_send(Work::Authority(candidate, reservation, send))
+            .map_err(|error| eyre!("reserved authority enqueue failed: {error}"))?;
+        Ok(receive)
     }
 
     pub fn drain(&self) -> eyre::Result<MessageJournalAnchor> {
@@ -4398,6 +4614,223 @@ fn append_entry(
     Ok(())
 }
 
+fn build_authority_payload(
+    inspection: &MessageJournalInspection,
+    candidate: AuthorityCandidateV3,
+    generation: u64,
+) -> eyre::Result<(AuthorityRecordV3, Vec<u8>)> {
+    if inspection.authority_fence()? != candidate.fence {
+        return Err(eyre::Report::new(AuthorityCandidateStale));
+    }
+    let expected_start = candidate
+        .fence
+        .verified
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| eyre!("authority start overflows V"))?;
+    ensure!(
+        candidate.start_sequence == expected_start
+            && candidate.end_sequence >= candidate.start_sequence
+            && candidate.end_sequence <= candidate.fence.journal.sequence,
+        "authority candidate range is not V+1..=J"
+    );
+    let count = candidate
+        .end_sequence
+        .checked_sub(candidate.start_sequence)
+        .and_then(|count| count.checked_add(1))
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| eyre!("authority candidate count overflow"))?;
+    ensure!(
+        (1..=AUTHORITY_MAX_RECORDS).contains(&count),
+        "authority candidate count is outside 1..=256"
+    );
+    candidate.observation.validate()?;
+    let canonical = production_canonical_context();
+    ensure!(
+        candidate.observation.context_id == canonical.context_id
+            && candidate.observation.context_digest == canonical.digest()?
+            && candidate.observation.promoted_start_sequence == candidate.start_sequence
+            && candidate.observation.promoted_end_sequence == candidate.end_sequence,
+        "authority observation context/promoted range mismatch"
+    );
+
+    let mut promoted = Vec::with_capacity(count);
+    let mut bitmap = [0u8; 32];
+    let mut transitions = 0u16;
+    for (index, sequence) in (candidate.start_sequence..=candidate.end_sequence).enumerate() {
+        let mut entry = inspection
+            .entry(sequence)
+            .ok_or_else(|| eyre!("authority candidate sequence {sequence} is not retained"))?;
+        if entry.source == ArbEngineInputSource::Feed {
+            bitmap[index / 8] |= 1 << (7 - index % 8);
+            transitions = transitions
+                .checked_add(1)
+                .ok_or_else(|| eyre!("authority transition count overflow"))?;
+        }
+        entry.source = ArbEngineInputSource::L1;
+        promoted.push(entry);
+    }
+    let promoted_digest = identities_digest(&promoted);
+    let terminal = promoted
+        .last()
+        .expect("nonempty authority range validated above");
+    ensure!(
+        candidate.observation.promoted_identities_digest == promoted_digest
+            && candidate.observation.terminal_l2_block_number == terminal.block_number
+            && candidate.observation.terminal_l2_block_hash == terminal.block_hash
+            && candidate.observation.terminal_delayed_count == terminal.delayed_messages_read,
+        "authority observation terminal identity/digest mismatch"
+    );
+    let locator = candidate.observation.locator();
+    ensure!(
+        locator.terminal_sequence == candidate.end_sequence,
+        "authority locator does not terminate at candidate end"
+    );
+    let unsealed = AuthorityRecordV3 {
+        kind: AuthorityKind::Promotion,
+        operation_generation: generation,
+        authority_chain_position: candidate
+            .fence
+            .authority_chain_position
+            .checked_add(1)
+            .ok_or_else(|| eyre!("authority position overflow"))?,
+        predecessor_authority_id: candidate.fence.latest_authority_id,
+        start_sequence: candidate.start_sequence,
+        end_sequence: candidate.end_sequence,
+        record_count: u16::try_from(count).expect("authority count fits u16"),
+        feed_transition_count: transitions,
+        feed_transition_bitmap: bitmap,
+        promoted_identities_digest: promoted_digest,
+        evidence_digest: candidate.observation.evidence_digest(),
+        locator,
+        predecessor_authority_chain_digest: candidate.fence.latest_authority_chain_digest,
+        authority_id: B256::ZERO,
+    };
+    let record = decode_authority_record(&encode_authority_record(unsealed))?;
+    let mut payload = Vec::with_capacity(AUTHORITY_RECORD_LEN + count * IDENTITY_LEN);
+    payload.extend_from_slice(&encode_authority_record(record));
+    for entry in promoted {
+        payload.extend_from_slice(&encode_identity(entry));
+    }
+    Ok((record, payload))
+}
+
+fn append_authority_candidate(
+    directory: &JournalDirectory,
+    context: StorageContextV3,
+    inspection: &mut MessageJournalInspection,
+    candidate: AuthorityCandidateV3,
+) -> eyre::Result<AuthorityRecordV3> {
+    let generation = inspection
+        .last_operation_generation
+        .checked_add(1)
+        .ok_or_else(|| eyre!("operation generation wrap"))?;
+    let (record, payload) = build_authority_payload(inspection, candidate, generation)?;
+    let frame = encode_frame(
+        FrameKind::Authority,
+        generation,
+        inspection.last_commit_digest,
+        &payload,
+    )?;
+    ensure!(
+        inspection
+            .complete_byte_offset
+            .checked_add(frame.len() as u64)
+            .is_some_and(|length| length <= JOURNAL_HARD_FILE_LIMIT),
+        "journal selected-file hard limit reached"
+    );
+    let name = inspection
+        .path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| eyre!("selected journal has no fixed name"))?
+        .to_owned();
+    let mut file = directory.open_existing(&name, true, true)?;
+    let offset = file.metadata()?.len();
+    journal_crashpoint("authority_append_before_write");
+    let mut ambiguous = None;
+    match journal_write_all("authority_append_write", &mut file, &frame) {
+        Ok(()) => {}
+        Err(JournalIoFailure::Known(error)) => {
+            return Err(rollback_known_append(&file, offset, error));
+        }
+        Err(JournalIoFailure::AmbiguousAfterSuccess(error)) => ambiguous = Some(error),
+    }
+    journal_crashpoint("authority_append_after_write");
+    journal_crashpoint("authority_append_before_flush");
+    match journal_io_classified("authority_append_flush", || file.flush()) {
+        Ok(()) => {}
+        Err(JournalIoFailure::Known(error)) => {
+            return Err(rollback_known_append(&file, offset, error));
+        }
+        Err(JournalIoFailure::AmbiguousAfterSuccess(error)) => {
+            ambiguous.get_or_insert(error);
+        }
+    }
+    journal_crashpoint("authority_append_after_flush");
+    journal_crashpoint("authority_append_before_sync");
+    match journal_io_classified("authority_append_sync", || file.sync_data()) {
+        Ok(()) => {}
+        Err(JournalIoFailure::Known(error)) => {
+            return Err(rollback_known_append(&file, offset, error));
+        }
+        Err(JournalIoFailure::AmbiguousAfterSuccess(error)) => {
+            ambiguous.get_or_insert(error);
+        }
+    }
+    journal_crashpoint("authority_append_after_sync");
+    let mut reread = vec![0u8; frame.len()];
+    file.seek(SeekFrom::Start(offset))?;
+    journal_crashpoint("authority_append_before_reread");
+    let reread_ambiguous =
+        match journal_io_classified("authority_append_reread", || file.read_exact(&mut reread)) {
+            Ok(()) => false,
+            Err(JournalIoFailure::Known(error)) => {
+                return Err(rollback_known_append(&file, offset, error));
+            }
+            Err(JournalIoFailure::AmbiguousAfterSuccess(error)) => {
+                ambiguous.get_or_insert(error);
+                true
+            }
+        };
+    if reread_ambiguous {
+        reread.fill(0);
+    }
+    if reread != frame {
+        let mut reopened = directory.open_existing(&name, false, false)?;
+        reopened.seek(SeekFrom::Start(offset))?;
+        if let Err(error) = reopened.read_exact(&mut reread) {
+            return Err(ambiguous
+                .map(eyre::Report::new)
+                .unwrap_or_else(|| eyre::Report::new(error)));
+        }
+        ensure!(reread == frame, "authority append reread mismatch");
+    }
+    let decoded = decode_complete_frame(&reread)?;
+    ensure!(
+        decoded.kind == FrameKind::Authority
+            && decoded.operation_generation == generation
+            && decoded.previous_commit_digest == inspection.last_commit_digest,
+        "authority append changed on reread"
+    );
+    journal_crashpoint("authority_append_after_reread");
+    drop(file);
+    drop(ambiguous);
+    journal_crashpoint("authority_append_before_full_validation");
+    let selected = inspect_message_journal(directory, context)?;
+    ensure!(
+        selected
+            .v
+            .is_some_and(|v| v.sequence == candidate.end_sequence)
+            && selected.latest_authority_id == record.authority_id
+            && selected.authority_operation_count == record.authority_chain_position,
+        "authority full reread acknowledgement mismatch"
+    );
+    *inspection = selected;
+    journal_crashpoint("authority_append_after_ack");
+    Ok(record)
+}
+
 fn snapshot_state_for_compaction(
     inspection: &mut MessageJournalInspection,
 ) -> eyre::Result<SnapshotState> {
@@ -4724,7 +5157,7 @@ fn try_pending_compaction(
         return Ok(());
     };
     if let Some(reservation) = admission.try_reserve_maintenance(pending.charged_bytes) {
-        compact_lineage(directory, context, inspection, PRODUCTION_POLICY)?;
+        compact_lineage(directory, context, inspection, production_policy())?;
         drop(reservation);
         *maintenance = None;
     } else {
@@ -4865,6 +5298,31 @@ fn run_worker(
                         set_fatal(&admission, &fatal, format!("{error:#}"));
                     }
                 }
+                Ok(Work::Authority(candidate, reservation, response)) => {
+                    let result = if admission.closed.load(Ordering::Acquire) {
+                        Err(eyre!("journal admission is closed"))
+                    } else {
+                        append_authority_candidate(
+                            &directory,
+                            context,
+                            &mut inspection,
+                            candidate,
+                        )
+                        .and_then(|record| {
+                            Ok(AuthorityAcknowledgementV3 {
+                                fence: inspection.authority_fence()?,
+                                record,
+                            })
+                        })
+                    };
+                    drop(reservation);
+                    if let Err(error) = &result
+                        && !is_authority_candidate_stale(error)
+                    {
+                        set_fatal(&admission, &fatal, format!("{error:#}"));
+                    }
+                    let _ = response.send(result);
+                }
                 Ok(Work::Drain(response)) => {
                     let result = process_pending(
                         &directory, context, &mut inspection, &mut pending, &persistence,
@@ -4901,7 +5359,7 @@ pub fn create_recovery_truncation_lineage(
         selected_source_root,
         target,
         truncation_plan_digest,
-        PRODUCTION_POLICY,
+        production_policy(),
     )
 }
 
@@ -5615,8 +6073,42 @@ mod tests {
             entry(context().anchor, ArbEngineInputSource::Feed),
         )
         .unwrap();
-        compact_lineage(directory, context(), &mut inspection, PRODUCTION_POLICY).unwrap();
+        compact_lineage(directory, context(), &mut inspection, production_policy()).unwrap();
         assert_eq!(inspection.header.lineage_generation, 1);
+    }
+
+    fn prepare_production_authority_source(
+        directory: &JournalDirectory,
+    ) -> MessageJournalInspection {
+        let context = production_storage_context();
+        let mut inspection = initialize_approved_snapshot_journal_v3(directory, context).unwrap();
+        let mut next = entry(inspection.watermark, ArbEngineInputSource::Feed);
+        next.delayed_messages_read =
+            crate::decode_production_bootstrap_observation().terminal_delayed_count;
+        append_entry(directory, context, &mut inspection, next).unwrap();
+        inspection
+    }
+
+    fn production_authority_candidate(
+        inspection: &MessageJournalInspection,
+    ) -> AuthorityCandidateV3 {
+        let fence = inspection.authority_fence().unwrap();
+        let start = fence.verified.sequence + 1;
+        let terminal = inspection.entry(start).unwrap();
+        let mut observation = crate::decode_production_bootstrap_observation();
+        observation.terminal_message_ordinal += 1;
+        observation.promoted_start_sequence = start;
+        observation.promoted_end_sequence = start;
+        observation.terminal_l2_block_number = terminal.block_number;
+        observation.terminal_l2_block_hash = terminal.block_hash;
+        observation.promoted_identities_digest =
+            inspection.promoted_identities_digest(start, start).unwrap();
+        AuthorityCandidateV3 {
+            fence,
+            start_sequence: start,
+            end_sequence: start,
+            observation,
+        }
     }
 
     #[test]
@@ -5634,9 +6126,30 @@ mod tests {
                     journal_crashpoint("append_after_ack");
                 })
             }
+            "authority" => {
+                let context = production_storage_context();
+                let inspection = inspect_message_journal(&directory, context).unwrap();
+                let candidate = production_authority_candidate(&inspection);
+                let runtime = JournalRuntime::open(
+                    directory.clone(),
+                    context,
+                    BlockNumHash {
+                        number: inspection.watermark.block_number,
+                        hash: inspection.watermark.block_hash,
+                    },
+                )
+                .unwrap();
+                let result = runtime
+                    .client
+                    .enqueue_authority(candidate)
+                    .and_then(|ack| ack.recv().map_err(|error| eyre!(error))?)
+                    .map(|_| ());
+                let _ = runtime.shutdown();
+                result
+            }
             "compaction" => {
                 let mut inspection = inspect_message_journal(&directory, context()).unwrap();
-                compact_lineage(&directory, context(), &mut inspection, PRODUCTION_POLICY)
+                compact_lineage(&directory, context(), &mut inspection, production_policy())
             }
             "truncation" => {
                 let contexts = [canonical_context()];
@@ -5758,6 +6271,147 @@ mod tests {
                 "incomplete fault {fault}"
             );
             assert!(!repair, "known fault left a recoverable tail: {fault}");
+        }
+    }
+
+    #[test]
+    fn authority_worker_ack_stale_and_crash_fault_matrix() {
+        let success = tempfile::tempdir().unwrap();
+        let directory = JournalDirectory::open(success.path()).unwrap();
+        let inspection = prepare_production_authority_source(&directory);
+        let candidate = production_authority_candidate(&inspection);
+        let runtime = JournalRuntime::open(
+            directory.clone(),
+            production_storage_context(),
+            BlockNumHash {
+                number: inspection.watermark.block_number,
+                hash: inspection.watermark.block_hash,
+            },
+        )
+        .unwrap();
+        let acknowledgement = runtime
+            .client
+            .enqueue_authority(candidate)
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            acknowledgement.record.start_sequence,
+            candidate.start_sequence
+        );
+        let stale = runtime
+            .client
+            .enqueue_authority(candidate)
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap_err();
+        assert!(is_authority_candidate_stale(&stale));
+        runtime.client.drain().unwrap();
+        runtime.shutdown().unwrap();
+        let committed = inspect_message_journal(&directory, production_storage_context()).unwrap();
+        assert_eq!(committed.v.unwrap().sequence, candidate.end_sequence);
+        assert_eq!(
+            committed.latest_authority_id,
+            acknowledgement.record.authority_id
+        );
+
+        for (point, committed) in [
+            ("authority_append_before_write", false),
+            ("authority_append_after_write", true),
+            ("authority_append_before_flush", true),
+            ("authority_append_after_flush", true),
+            ("authority_append_before_sync", true),
+            ("authority_append_after_sync", true),
+            ("authority_append_before_reread", true),
+            ("authority_append_after_reread", true),
+            ("authority_append_before_full_validation", true),
+            ("authority_append_after_ack", true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let directory = JournalDirectory::open(dir.path()).unwrap();
+            let source = prepare_production_authority_source(&directory);
+            drop(directory);
+            let status = run_journal_subprocess(
+                dir.path(),
+                "authority",
+                "ARB_RETH_JOURNAL_CRASHPOINT",
+                point,
+                false,
+            );
+            assert_eq!(status.code(), Some(86), "authority crashpoint {point}");
+            let reopened = JournalDirectory::open(dir.path()).unwrap();
+            let after = inspect_message_journal(&reopened, production_storage_context()).unwrap();
+            assert_eq!(
+                after.v.unwrap().sequence,
+                if committed {
+                    source.watermark.sequence
+                } else {
+                    source.anchor().sequence
+                },
+                "authority crashpoint {point}"
+            );
+        }
+
+        for fault in [
+            "authority_append_write:after:5",
+            "authority_append_flush:after:5",
+            "authority_append_sync:after:5",
+            "authority_append_reread:after:5",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let directory = JournalDirectory::open(dir.path()).unwrap();
+            let source = prepare_production_authority_source(&directory);
+            drop(directory);
+            assert!(
+                run_journal_subprocess(
+                    dir.path(),
+                    "authority",
+                    "ARB_RETH_JOURNAL_IO_FAULT",
+                    fault,
+                    false,
+                )
+                .success(),
+                "authority ambiguous fault {fault}"
+            );
+            let reopened = JournalDirectory::open(dir.path()).unwrap();
+            assert_eq!(
+                inspect_message_journal(&reopened, production_storage_context())
+                    .unwrap()
+                    .v
+                    .unwrap()
+                    .sequence,
+                source.watermark.sequence
+            );
+        }
+
+        for fault in [
+            "authority_append_write:before:28",
+            "authority_append_write:short:5",
+            "authority_append_flush:before:28",
+            "authority_append_sync:before:5",
+            "authority_append_reread:before:5",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let directory = JournalDirectory::open(dir.path()).unwrap();
+            let source = prepare_production_authority_source(&directory);
+            drop(directory);
+            assert!(
+                run_journal_subprocess(
+                    dir.path(),
+                    "authority",
+                    "ARB_RETH_JOURNAL_IO_FAULT",
+                    fault,
+                    true,
+                )
+                .success(),
+                "authority known fault {fault}"
+            );
+            let reopened = JournalDirectory::open(dir.path()).unwrap();
+            let after = inspect_message_journal(&reopened, production_storage_context()).unwrap();
+            assert_eq!(after.v.unwrap().sequence, source.anchor().sequence);
+            assert_eq!(after.watermark, source.watermark);
         }
     }
 
@@ -6394,8 +7048,14 @@ mod tests {
 
     #[test]
     fn lineage_zero_is_exact_storage_only_and_context_bound() {
-        assert!(PRODUCTION_POLICY.contexts.is_empty());
-        assert!(PRODUCTION_POLICY.bootstrap_certificates.is_empty());
+        assert_eq!(
+            production_policy().contexts,
+            [production_canonical_context().clone()]
+        );
+        assert_eq!(
+            production_policy().bootstrap_certificates,
+            PRODUCTION_BOOTSTRAP_CERTIFICATES
+        );
         let dir = tempfile::tempdir().unwrap();
         let directory = JournalDirectory::open(dir.path()).unwrap();
         let inspection = initialize_journal_v3(&directory, context()).unwrap();
@@ -6422,6 +7082,55 @@ mod tests {
     }
 
     #[test]
+    fn production_context_bootstrap_and_approved_lineage_match_frozen_vectors() {
+        let context = production_canonical_context();
+        let encoded = context.encode().unwrap();
+        assert_eq!(encoded.len(), 308);
+        assert_eq!(
+            context.digest().unwrap(),
+            b256!("eb0d03086218827bd1b8e4afafe6612f29a009c4dac82920c7084936d4f8c64f")
+        );
+        let storage = production_storage_context();
+        assert_eq!(
+            storage.digest(),
+            b256!("68a7fa94cf4188ba7976796d51d91daf6adf2ec9cb8bc6c335665e22673e1631")
+        );
+        let bootstrap = production_bootstrap_authority();
+        assert_eq!(
+            bootstrap.authority_id,
+            b256!("5448a1c37cf918dad6e9330d6138b428f85013a8f60acdfa07b68e161d084e71")
+        );
+        assert_eq!(
+            authority_chain_digest(bootstrap),
+            b256!("7906b73cf19b08de4353d15379042476a7a668eb0c66097be6b6544229f0229d")
+        );
+        assert_eq!(
+            bootstrap_certificate_digest(bootstrap),
+            PRODUCTION_BOOTSTRAP_CERTIFICATES[0]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let directory = JournalDirectory::open(dir.path()).unwrap();
+        let inspection = initialize_approved_snapshot_journal_v3(&directory, storage).unwrap();
+        assert_eq!(inspection.complete_byte_offset, 1_416);
+        assert_eq!(inspection.watermark, storage.anchor);
+        assert_eq!(inspection.v, Some(storage.anchor));
+        assert_eq!(inspection.authority_operation_count, 1);
+        assert_eq!(inspection.latest_authority_id, bootstrap.authority_id);
+        assert!(inspection.entries.is_empty());
+
+        let existing = std::fs::read(&inspection.path).unwrap();
+        assert!(initialize_approved_snapshot_journal_v3(&directory, storage).is_err());
+        assert_eq!(std::fs::read(&inspection.path).unwrap(), existing);
+        let mut changed = storage;
+        changed.anchor.block_hash = B256::repeat_byte(0xff);
+        let mismatch = tempfile::tempdir().unwrap();
+        let mismatch_directory = JournalDirectory::open(mismatch.path()).unwrap();
+        assert!(initialize_approved_snapshot_journal_v3(&mismatch_directory, changed).is_err());
+        assert!(mismatch_directory.entry_names().unwrap().is_empty());
+    }
+
+    #[test]
     fn core_inspection_binds_final_and_temp_names_to_authenticated_generation() {
         let zero_final = tempfile::tempdir().unwrap();
         let directory = JournalDirectory::open(zero_final.path()).unwrap();
@@ -6434,7 +7143,7 @@ mod tests {
                 &directory,
                 &exact_journal_name(1, "log"),
                 context(),
-                PRODUCTION_POLICY,
+                production_policy(),
             )
             .unwrap_err()
             .to_string()
@@ -6454,11 +7163,11 @@ mod tests {
                 &directory,
                 &exact_journal_name(1, "tmp"),
                 context(),
-                PRODUCTION_POLICY,
+                production_policy(),
             )
             .is_err()
         );
-        assert!(inspect_stopped_with_policy(&directory, context(), PRODUCTION_POLICY).is_err());
+        assert!(inspect_stopped_with_policy(&directory, context(), production_policy()).is_err());
 
         let public_final = tempfile::tempdir().unwrap();
         let directory = JournalDirectory::open(public_final.path()).unwrap();
@@ -6473,8 +7182,8 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
         for result in [
-            inspect_message_with_policy(&directory, context(), PRODUCTION_POLICY).map(|_| ()),
-            inspect_stopped_with_policy(&directory, context(), PRODUCTION_POLICY).map(|_| ()),
+            inspect_message_with_policy(&directory, context(), production_policy()).map(|_| ()),
+            inspect_stopped_with_policy(&directory, context(), production_policy()).map(|_| ()),
         ] {
             assert!(
                 result
@@ -6495,7 +7204,7 @@ mod tests {
                 &directory,
                 &exact_journal_name(2, "log"),
                 context(),
-                PRODUCTION_POLICY,
+                production_policy(),
             )
             .is_err()
         );
@@ -6543,7 +7252,7 @@ mod tests {
         let certificates = [bootstrap_certificate_digest(bootstrap())];
         let policy = policy(&contexts, &certificates);
         validate_bootstrap(bootstrap(), context().anchor, policy).unwrap();
-        assert!(validate_bootstrap(bootstrap(), context().anchor, PRODUCTION_POLICY).is_err());
+        assert!(validate_bootstrap(bootstrap(), context().anchor, production_policy()).is_err());
 
         let mut one = bootstrap_state(entries(3));
         let (first_l1, frame) = promotion_frame(&one, 11, 1, 1, B256::ZERO);
@@ -6980,6 +7689,7 @@ mod tests {
                         - PROTECTED_EXECUTION_RECORD_FLOOR
                         - records,
                     bytes: JOURNAL_OUTSTANDING_BYTE_CAPACITY - charge,
+                    authority_items: 0,
                 }),
                 closed: AtomicBool::new(false),
                 journaled_sequence: AtomicU64::new(0),
@@ -7012,6 +7722,7 @@ mod tests {
                         work: JOURNAL_WORK_ITEM_CAPACITY - PROTECTED_EXECUTION_WORK_FLOOR,
                         records: 0,
                         bytes: 0,
+                        authority_items: 0,
                     },
                     false,
                 ),
@@ -7023,6 +7734,7 @@ mod tests {
                             - records
                             + 1,
                         bytes: 0,
+                        authority_items: 0,
                     },
                     false,
                 ),
@@ -7031,6 +7743,7 @@ mod tests {
                         work: 0,
                         records: 0,
                         bytes: JOURNAL_OUTSTANDING_BYTE_CAPACITY - charge + 1,
+                        authority_items: 0,
                     },
                     false,
                 ),
@@ -7077,7 +7790,7 @@ mod tests {
                 &directory,
                 context(),
                 &mut operation_wrap,
-                PRODUCTION_POLICY
+                production_policy()
             )
             .unwrap_err()
             .to_string()

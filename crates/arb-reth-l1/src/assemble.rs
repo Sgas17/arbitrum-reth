@@ -17,9 +17,14 @@ use arbitrum_alloy_sequencer::sequencer::feed::{BatchDataStats, BroadcastFeedMes
 
 use arb_reth_derive::message::DerivedMessage;
 
-use crate::batch_serialize::{batch_data_hash, batch_data_stats, report_data_hash, serialize_batch};
+use crate::batch_serialize::{
+    batch_data_hash, batch_data_stats, report_data_hash, serialize_batch,
+};
 use crate::reader::DeliveredBatch;
-use crate::{decode_payload_messages, derived_to_feed_message, derived_to_feed_message_with_stats, L1Error};
+use crate::{
+    L1Error, decode_payload_messages, decode_payload_messages_cancellable, derived_to_feed_message,
+    derived_to_feed_message_with_stats,
+};
 
 /// L1 message kind for a batch posting report.
 pub const KIND_BATCH_POSTING_REPORT: u8 = 13;
@@ -32,12 +37,11 @@ pub fn derived_to_feed(
     report_stats: &BTreeMap<B256, BatchDataStats>,
 ) -> Result<BroadcastFeedMessage, L1Error> {
     if m.header.kind == KIND_BATCH_POSTING_REPORT {
-        let dh =
-            report_data_hash(&m.l2_msg).ok_or(L1Error::Missing("batch posting report data_hash"))?;
-        let stats = report_stats
-            .get(&dh)
-            .cloned()
-            .ok_or(L1Error::Missing("batch posting report stats (batch not seen)"))?;
+        let dh = report_data_hash(&m.l2_msg)
+            .ok_or(L1Error::Missing("batch posting report data_hash"))?;
+        let stats = report_stats.get(&dh).cloned().ok_or(L1Error::Missing(
+            "batch posting report stats (batch not seen)",
+        ))?;
         Ok(derived_to_feed_message_with_stats(m, seq, Some(stats)))
     } else {
         Ok(derived_to_feed_message(m, seq))
@@ -64,6 +68,35 @@ pub fn batch_to_feed_messages(
     let mut out = Vec::with_capacity(msgs.len());
     for (i, m) in msgs.iter().enumerate() {
         out.push(derived_to_feed(m, seq_start + i as u64, report_stats)?);
+    }
+    Ok(out)
+}
+
+/// As [`batch_to_feed_messages`], with bounded cancellable Brotli decoding.
+pub fn batch_to_feed_messages_cancellable(
+    batch: &DeliveredBatch,
+    payload: &[u8],
+    before_delayed_count: u64,
+    delayed: &dyn DelayedSource,
+    report_stats: &BTreeMap<B256, BatchDataStats>,
+    seq_start: u64,
+    cancelled: impl FnMut() -> bool,
+) -> Result<Vec<BroadcastFeedMessage>, L1Error> {
+    let header = batch.event.batch_header();
+    let msgs = decode_payload_messages_cancellable(
+        &header,
+        payload,
+        before_delayed_count,
+        delayed,
+        cancelled,
+    )?;
+    let mut out = Vec::with_capacity(msgs.len());
+    for (index, message) in msgs.iter().enumerate() {
+        out.push(derived_to_feed(
+            message,
+            seq_start + index as u64,
+            report_stats,
+        )?);
     }
     Ok(out)
 }
@@ -101,7 +134,10 @@ pub fn assemble_feed_messages_with_seed(
     let mut out = Vec::new();
 
     for (batch, payload) in resolved {
-        report_stats.insert(batch_data_hash(batch), batch_data_stats(&serialize_batch(batch)));
+        report_stats.insert(
+            batch_data_hash(batch),
+            batch_data_stats(&serialize_batch(batch)),
+        );
         let after = batch.event.after_delayed_messages_read;
 
         let msgs = batch_to_feed_messages(batch, payload, before, delayed, &report_stats, seq)?;

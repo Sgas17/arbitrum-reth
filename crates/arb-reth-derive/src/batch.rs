@@ -6,9 +6,16 @@
 //! log data of the `SequencerBatchDelivered` event into a [`BatchHeader`], freeing
 //! callers from ABI-layout arithmetic.
 
+use std::io::Read as _;
+
 use alloy_primitives::B256;
 use alloy_rlp::Header;
+#[cfg(test)]
 use arb_revm::brotli;
+
+/// Frozen B2 upper bound for one decompressed batch.
+pub const MAX_DECOMPRESSED_BATCH_BYTES: usize = 64 * 1024 * 1024;
+const DECOMPRESSION_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Header-flag bytes (`nitro/daprovider/util.go`). The flag is the first byte of
 /// the post-timeBounds payload.
@@ -71,6 +78,10 @@ pub enum BatchError {
     UnsupportedFlag(u8),
     /// Brotli decompression failed.
     Brotli,
+    /// The caller cancelled decompression at a bounded chunk boundary.
+    Cancelled,
+    /// Decompressed bytes exceeded the supplied finite ceiling.
+    DecompressedLimit,
     /// Malformed RLP in the segment stream.
     Rlp(&'static str),
     /// `SequencerBatchDelivered` event log data has wrong length (expected 224).
@@ -134,7 +145,9 @@ impl SequencerBatchDeliveredData {
 ///
 /// The three indexed topics (`batchSeqNum`, `beforeAcc`, `afterAcc`) are already
 /// present in the log's `topics` field and are not part of `log_data`.
-pub fn parse_sequencer_batch_delivered(log_data: &[u8]) -> Result<SequencerBatchDeliveredData, BatchError> {
+pub fn parse_sequencer_batch_delivered(
+    log_data: &[u8],
+) -> Result<SequencerBatchDeliveredData, BatchError> {
     const EXPECTED: usize = 7 * 32; // 224 bytes
     if log_data.len() != EXPECTED {
         return Err(BatchError::EventDataWrongLen(log_data.len()));
@@ -170,10 +183,48 @@ pub fn parse_sequencer_batch_delivered(log_data: &[u8]) -> Result<SequencerBatch
 /// after that resolution the recovered bytes re-enter here starting at their own
 /// flag byte (mainnet sequencer batches use `0x00` brotli).
 pub fn decompress_payload(payload: &[u8]) -> Result<Vec<u8>, BatchError> {
+    decompress_payload_bounded(payload, MAX_DECOMPRESSED_BATCH_BYTES, || false)
+}
+
+/// Incrementally decompress a Brotli payload with an exact output cap and cooperative
+/// cancellation between fixed 64-KiB chunks.
+///
+/// The crates.io decoder implements the same RFC 7932 stream as Nitro's empty-dictionary decoder.
+/// Tests compare both implementations byte-for-byte. No partial output is returned on failure.
+pub fn decompress_payload_bounded(
+    payload: &[u8],
+    maximum: usize,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Vec<u8>, BatchError> {
     let (&flag, body) = payload.split_first().ok_or(BatchError::Truncated)?;
     match flag {
         flag::BROTLI => {
-            brotli::decompress(body, brotli::Dictionary::Empty).map_err(|_| BatchError::Brotli)
+            let mut decoder = brotli_crates_io::Decompressor::new(
+                std::io::Cursor::new(body),
+                DECOMPRESSION_CHUNK_BYTES,
+            );
+            let mut output = Vec::new();
+            let mut chunk = [0u8; DECOMPRESSION_CHUNK_BYTES];
+            loop {
+                if cancelled() {
+                    return Err(BatchError::Cancelled);
+                }
+                let read = decoder.read(&mut chunk).map_err(|_| BatchError::Brotli)?;
+                if read == 0 {
+                    return Ok(output);
+                }
+                let next = output
+                    .len()
+                    .checked_add(read)
+                    .ok_or(BatchError::DecompressedLimit)?;
+                if next > maximum {
+                    return Err(BatchError::DecompressedLimit);
+                }
+                output
+                    .try_reserve_exact(read)
+                    .map_err(|_| BatchError::DecompressedLimit)?;
+                output.extend_from_slice(&chunk[..read]);
+            }
         }
         other => Err(BatchError::UnsupportedFlag(other)),
     }
@@ -190,9 +241,21 @@ pub struct Segment {
 /// each one segment whose first byte is the [`segment_kind`]. Matches Nitro's
 /// `rlp.NewStream(...).Decode(&segment)` loop. Empty (zero-length) items are
 /// skipped, as in Nitro.
-pub fn parse_segments(mut buf: &[u8]) -> Result<Vec<Segment>, BatchError> {
+pub fn parse_segments(buf: &[u8]) -> Result<Vec<Segment>, BatchError> {
+    parse_segments_cancellable(buf, || false)
+}
+
+/// Parse the bounded RLP segment stream with cancellation checks before every header and every
+/// fixed-size copy chunk. No partially parsed segment vector is returned after cancellation.
+pub fn parse_segments_cancellable(
+    mut buf: &[u8],
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Vec<Segment>, BatchError> {
     let mut segs = Vec::new();
     while !buf.is_empty() {
+        if cancelled() {
+            return Err(BatchError::Cancelled);
+        }
         let header = Header::decode(&mut buf).map_err(|_| BatchError::Rlp("segment header"))?;
         if header.list {
             return Err(BatchError::Rlp("segment is a list, expected string"));
@@ -203,7 +266,17 @@ pub fn parse_segments(mut buf: &[u8]) -> Result<Vec<Segment>, BatchError> {
         let (seg, rest) = buf.split_at(header.payload_length);
         buf = rest;
         if let Some((&kind, data)) = seg.split_first() {
-            segs.push(Segment { kind, data: data.to_vec() });
+            let mut copied = Vec::new();
+            copied
+                .try_reserve_exact(data.len())
+                .map_err(|_| BatchError::DecompressedLimit)?;
+            for chunk in data.chunks(DECOMPRESSION_CHUNK_BYTES) {
+                if cancelled() {
+                    return Err(BatchError::Cancelled);
+                }
+                copied.extend_from_slice(chunk);
+            }
+            segs.push(Segment { kind, data: copied });
         }
     }
     Ok(segs)
@@ -216,7 +289,11 @@ mod tests {
 
     fn rlp_string(data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        Header { list: false, payload_length: data.len() }.encode(&mut out);
+        Header {
+            list: false,
+            payload_length: data.len(),
+        }
+        .encode(&mut out);
         out.extend_from_slice(data);
         out
     }
@@ -245,12 +322,28 @@ mod tests {
     #[test]
     fn brotli_payload_roundtrips() {
         let segments_body = b"the quick brown fox jumps over the lazy dog, repeatedly.".repeat(10);
-        let compressed =
-            brotli::compress(&segments_body, 11, brotli::DEFAULT_WINDOW_SIZE, brotli::Dictionary::Empty)
-                .unwrap();
+        let compressed = brotli::compress(
+            &segments_body,
+            11,
+            brotli::DEFAULT_WINDOW_SIZE,
+            brotli::Dictionary::Empty,
+        )
+        .unwrap();
         let mut payload = vec![flag::BROTLI];
         payload.extend_from_slice(&compressed);
         assert_eq!(decompress_payload(&payload).unwrap(), segments_body);
+        assert_eq!(
+            decompress_payload(&payload).unwrap(),
+            brotli::decompress(&compressed, brotli::Dictionary::Empty).unwrap()
+        );
+        assert_eq!(
+            decompress_payload_bounded(&payload, segments_body.len() - 1, || false),
+            Err(BatchError::DecompressedLimit)
+        );
+        assert_eq!(
+            decompress_payload_bounded(&payload, MAX_DECOMPRESSED_BATCH_BYTES, || true),
+            Err(BatchError::Cancelled)
+        );
     }
 
     #[test]
@@ -266,7 +359,7 @@ mod tests {
         // An AdvanceTimestamp segment (kind 3 + rlp(u64) delta) then an L2Message (kind 0 + body).
         let advance = {
             let mut s = vec![segment_kind::ADVANCE_TIMESTAMP];
-            s.extend_from_slice(&rlp_string(&[]) ); // placeholder inner; multiplexer decodes data itself
+            s.extend_from_slice(&rlp_string(&[])); // placeholder inner; multiplexer decodes data itself
             s
         };
         let l2 = {
@@ -354,7 +447,10 @@ mod tests {
         // batch_header() conversion
         let hdr = parsed.batch_header();
         assert_eq!(hdr.min_timestamp, parsed.min_timestamp);
-        assert_eq!(hdr.after_delayed_messages, parsed.after_delayed_messages_read);
+        assert_eq!(
+            hdr.after_delayed_messages,
+            parsed.after_delayed_messages_read
+        );
     }
 
     /// Parse the `SequencerBatchDelivered` log data for the calldata batch
@@ -381,5 +477,22 @@ mod tests {
         assert_eq!(parsed.min_l1_block, 18_994_255);
         assert_eq!(parsed.max_l1_block, 19_000_027);
         assert_eq!(parsed.data_location, data_location::TX_INPUT);
+    }
+
+    #[test]
+    fn segment_parser_cancels_without_partial_output() {
+        let encoded = [
+            rlp_string(&[segment_kind::L2_MESSAGE, 1]),
+            rlp_string(&[segment_kind::L2_MESSAGE, 2]),
+        ]
+        .concat();
+        let mut checks = 0;
+        assert_eq!(
+            parse_segments_cancellable(&encoded, || {
+                checks += 1;
+                checks == 3
+            }),
+            Err(BatchError::Cancelled)
+        );
     }
 }

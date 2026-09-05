@@ -1053,6 +1053,7 @@ dependencies = [
  "alloy-rlp",
  "arb-revm",
  "arbitrum-alloy-sequencer",
+ "brotli 8.0.4",
  "serde_json",
 ]
 
@@ -1185,6 +1186,7 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-serde",
  "alloy-trie",
+ "arb-reth-derive",
  "arb-reth-engine",
  "arb-reth-evm",
  "arb-reth-genesis",
@@ -1196,6 +1198,7 @@ dependencies = [
  "arbitrum-alloy-network",
  "arbitrum-alloy-rpc-types",
  "arbitrum-alloy-sequencer",
+ "c-kzg",
  "clap 4.6.6",
  "crossbeam-channel",
  "eyre",

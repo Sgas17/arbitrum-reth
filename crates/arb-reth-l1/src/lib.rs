@@ -16,30 +16,83 @@
 pub mod assemble;
 pub mod batch_serialize;
 pub mod beacon;
+pub mod canonical;
 pub mod contracts;
 pub mod delayed;
 pub mod feed;
 pub mod reader;
 pub mod sync;
 
-use alloy_sol_types::SolCall;
-use arb_reth_derive::batch::{self, data_location, BatchError};
+use alloy_primitives::{B256, U256};
+use alloy_sol_types::{SolCall, SolEvent};
+use arb_reth_derive::batch::{self, BatchError};
 use arb_reth_derive::delayed::DelayedSource;
 use arb_reth_derive::message::DerivedMessage;
-use arb_reth_derive::multiplexer::{extract_messages, MultiplexerError};
+use arb_reth_derive::multiplexer::{MultiplexerError, extract_messages};
 
+pub use arb_reth_derive::batch::{
+    SequencerBatchDeliveredData, data_location, parse_sequencer_batch_delivered,
+};
+pub use arb_reth_derive::blob::BYTES_PER_BLOB;
+pub use arb_reth_derive::delayed::{DelayedMap, DelayedMessage};
+pub use assemble::{
+    assemble_feed_messages, assemble_feed_messages_with_seed, batch_to_feed_messages,
+    batch_to_feed_messages_cancellable,
+};
+pub use batch_serialize::{
+    batch_data_hash, batch_data_stats, report_batch_num, report_data_hash, serialize_batch,
+};
 pub use beacon::BeaconClient;
+pub use canonical::{
+    CanonicalBeaconClient, CanonicalBlobSidecar, CanonicalCancellation, CanonicalError,
+    CanonicalExecutionClient, CanonicalExecutionHeader, CanonicalExecutionLog,
+    CanonicalExecutionReceipt, CanonicalExecutionTransaction, CanonicalMemoryBudget,
+    CanonicalMemoryReservation, CanonicalRpcClient, ObservationDeadlines, ReservedValue,
+    RetryDisposition, decode_canonical_blob_payload, sequencer_accumulator,
+    validate_ordered_blob_commitments,
+};
 pub use contracts::{
     BRIDGE_MAINNET, NITRO_GENESIS_BLOCK_MAINNET, SEQUENCER_INBOX_DEPLOY_BLOCK_MAINNET,
     SEQUENCER_INBOX_MAINNET,
 };
-pub use assemble::{assemble_feed_messages, assemble_feed_messages_with_seed, batch_to_feed_messages};
-pub use batch_serialize::{
-    batch_data_hash, batch_data_stats, report_batch_num, report_data_hash, serialize_batch,
-};
-pub use delayed::{verify_accumulator_chain, DelayedInboxReader};
+pub use delayed::{DelayedInboxReader, verify_accumulator_chain};
+pub use delayed::{parse_inbox_message_data, parse_message_delivered};
 pub use feed::{derived_to_feed_message, derived_to_feed_message_with_stats};
+pub use reader::decode_separate_batch_event_data;
 pub use reader::{BatchPayload, DeliveredBatch, SequencerInboxReader};
+
+pub const SEQUENCER_BATCH_DELIVERED_TOPIC: B256 =
+    contracts::SequencerBatchDelivered::SIGNATURE_HASH;
+pub const SEQUENCER_BATCH_DATA_TOPIC: B256 = contracts::SequencerBatchData::SIGNATURE_HASH;
+pub const MESSAGE_DELIVERED_TOPIC: B256 = contracts::MessageDelivered::SIGNATURE_HASH;
+pub const INBOX_MESSAGE_DELIVERED_TOPIC: B256 = contracts::InboxMessageDelivered::SIGNATURE_HASH;
+pub const INBOX_MESSAGE_DELIVERED_FROM_ORIGIN_TOPIC: B256 =
+    contracts::InboxMessageDeliveredFromOrigin::SIGNATURE_HASH;
+
+pub fn encode_sequencer_accumulator_call(sequence: u64) -> Vec<u8> {
+    contracts::bridge_accumulators::sequencerInboxAccsCall {
+        batchSequence: U256::from(sequence),
+    }
+    .abi_encode()
+}
+
+pub fn encode_delayed_accumulator_call(index: u64) -> Vec<u8> {
+    contracts::bridge_accumulators::delayedInboxAccsCall {
+        messageIndex: U256::from(index),
+    }
+    .abi_encode()
+}
+
+/// Decode the body of an `InboxMessageDeliveredFromOrigin` posting transaction.
+pub fn decode_from_origin_message(input: &[u8]) -> Result<Vec<u8>, L1Error> {
+    let call = contracts::from_origin::sendL2MessageFromOriginCall::abi_decode(input)?;
+    if call.abi_encode() != input {
+        return Err(L1Error::Missing(
+            "sendL2MessageFromOrigin calldata is not canonical ABI",
+        ));
+    }
+    Ok(call.messageData.to_vec())
+}
 
 /// Errors from the L1 fetch + decode glue.
 #[derive(Debug)]
@@ -70,7 +123,11 @@ impl core::fmt::Display for L1Error {
         match self {
             L1Error::CalldataTooShort(n) => write!(f, "calldata too short: {n} bytes"),
             L1Error::UnknownSelector(s) => {
-                write!(f, "unknown batch-poster selector: 0x{}", alloy_primitives::hex::encode(s))
+                write!(
+                    f,
+                    "unknown batch-poster selector: 0x{}",
+                    alloy_primitives::hex::encode(s)
+                )
             }
             L1Error::Abi(e) => write!(f, "abi decode: {e}"),
             L1Error::Batch(e) => write!(f, "batch decode: {e:?}"),
@@ -105,15 +162,34 @@ pub fn extract_calldata_payload(input: &[u8]) -> Result<Vec<u8>, L1Error> {
 
     if selector == contracts::origin::addSequencerL2BatchFromOriginCall::SELECTOR {
         let call = contracts::origin::addSequencerL2BatchFromOriginCall::abi_decode(input)?;
+        if call.abi_encode() != input {
+            return Err(L1Error::Missing(
+                "batch posting calldata is not canonical ABI",
+            ));
+        }
         return Ok(call.data.to_vec());
     }
     if selector == contracts::origin_legacy::addSequencerL2BatchFromOriginCall::SELECTOR {
         let call = contracts::origin_legacy::addSequencerL2BatchFromOriginCall::abi_decode(input)?;
+        if call.abi_encode() != input {
+            return Err(L1Error::Missing(
+                "batch posting calldata is not canonical ABI",
+            ));
+        }
         return Ok(call.data.to_vec());
     }
-    if selector == contracts::origin_delay_proof::addSequencerL2BatchFromOriginDelayProofCall::SELECTOR
+    if selector
+        == contracts::origin_delay_proof::addSequencerL2BatchFromOriginDelayProofCall::SELECTOR
     {
-        let call = contracts::origin_delay_proof::addSequencerL2BatchFromOriginDelayProofCall::abi_decode(input)?;
+        let call =
+            contracts::origin_delay_proof::addSequencerL2BatchFromOriginDelayProofCall::abi_decode(
+                input,
+            )?;
+        if call.abi_encode() != input {
+            return Err(L1Error::Missing(
+                "batch posting calldata is not canonical ABI",
+            ));
+        }
         return Ok(call.data.to_vec());
     }
     Err(L1Error::UnknownSelector(selector))
@@ -147,6 +223,28 @@ pub fn decode_payload_messages(
     extract_messages(header, &segments, before_delayed_count, delayed).map_err(L1Error::Mux)
 }
 
+/// Decode with the B2 output bound and cooperative Brotli cancellation.
+pub fn decode_payload_messages_cancellable(
+    header: &arb_reth_derive::batch::BatchHeader,
+    payload: &[u8],
+    before_delayed_count: u64,
+    delayed: &dyn DelayedSource,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Vec<DerivedMessage>, L1Error> {
+    let segments = if payload.is_empty() {
+        Vec::new()
+    } else {
+        let seg_bytes = batch::decompress_payload_bounded(
+            payload,
+            canonical::MAX_DECOMPRESSED_BATCH_BYTES,
+            &mut cancelled,
+        )
+        .map_err(L1Error::Batch)?;
+        batch::parse_segments_cancellable(&seg_bytes, &mut cancelled).map_err(L1Error::Batch)?
+    };
+    extract_messages(header, &segments, before_delayed_count, delayed).map_err(L1Error::Mux)
+}
+
 /// Decode a resolved calldata batch into its `DerivedMessage` stream.
 ///
 /// Blob batches must first be resolved to a payload via
@@ -161,10 +259,15 @@ pub fn decode_batch_messages(
         BatchPayload::Calldata(p) => p.as_slice(),
         BatchPayload::None => return Ok(Vec::new()),
         BatchPayload::Blob { .. } => {
-            return Err(L1Error::UnsupportedDataLocation(data_location::BLOB_HASHES))
+            return Err(L1Error::UnsupportedDataLocation(data_location::BLOB_HASHES));
         }
     };
-    decode_payload_messages(&batch.event.batch_header(), payload, before_delayed_count, delayed)
+    decode_payload_messages(
+        &batch.event.batch_header(),
+        payload,
+        before_delayed_count,
+        delayed,
+    )
 }
 
 #[cfg(test)]

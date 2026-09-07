@@ -1416,20 +1416,6 @@ impl ArbLauncher {
                                     %error,
                                     "engine driver stopped while reconciling L1 chunk",
                                 );
-                                if arb_reth_engine::is_message_divergence(&error) {
-                                    let failed = arb_reth_engine::message_divergence_sequence(&error)
-                                        .and_then(|sequence| {
-                                            batch.iter().find(|input| {
-                                                input.sequence_number() == sequence
-                                            })
-                                        })
-                                        .unwrap_or(&batch[0]);
-                                    driver
-                                        .as_ref()
-                                        .expect("driver exists after reconciliation failure")
-                                        .write_divergence_marker_for_error(failed, &error)
-                                        .wrap_err("failed to persist divergence marker before shutdown")?;
-                                }
                                 return Err(error);
                             }
                         }
@@ -1465,13 +1451,6 @@ impl ArbLauncher {
                                 %error,
                                 "engine driver stopped while applying message",
                             );
-                            if arb_reth_engine::is_message_divergence(&error) {
-                                driver
-                                    .as_ref()
-                                    .expect("driver exists after apply failure")
-                                    .write_divergence_marker_for_error(&input, &error)
-                                    .wrap_err("failed to persist divergence marker before shutdown")?;
-                            }
                             return Err(error);
                         }
                         #[cfg(test)]
@@ -3764,7 +3743,6 @@ mod tests {
             Some("sequencer feed block hash mismatch at sequence 1"),
             false,
             Some(0),
-            Some(ArbEngineInputSource::Feed),
         )
         .await;
     }
@@ -3785,7 +3763,6 @@ mod tests {
             Some("sequencer feed block hash mismatch at sequence 2"),
             false,
             Some(1),
-            Some(ArbEngineInputSource::Feed),
         )
         .await;
     }
@@ -3803,7 +3780,6 @@ mod tests {
             Some("feed/L1 message disagreement at applied sequence 1"),
             false,
             Some(1),
-            Some(ArbEngineInputSource::L1),
         )
         .await;
     }
@@ -3819,7 +3795,6 @@ mod tests {
             Some("canonical L1 authority promotion is unavailable in phase A at sequence 1"),
             false,
             Some(1),
-            None,
         )
         .await;
     }
@@ -3837,7 +3812,6 @@ mod tests {
             Some("canonical L1 authority promotion is unavailable in phase A at sequence 1"),
             false,
             Some(1),
-            None,
         )
         .await;
     }
@@ -3853,7 +3827,6 @@ mod tests {
             Some("L1 reconciliation starts after the next executable sequence"),
             false,
             Some(0),
-            Some(ArbEngineInputSource::L1),
         )
         .await;
     }
@@ -3877,7 +3850,6 @@ mod tests {
             Some("feed/L1 message disagreement at sequence 2"),
             true,
             Some(0),
-            Some(ArbEngineInputSource::Feed),
         )
         .await;
     }
@@ -3898,7 +3870,6 @@ mod tests {
             Some("sequencer feed block hash mismatch at sequence 2"),
             true,
             Some(1),
-            Some(ArbEngineInputSource::Feed),
         )
         .await;
     }
@@ -3927,7 +3898,6 @@ mod tests {
             Some("feed/L1 message disagreement at sequence 3"),
             true,
             Some(1),
-            Some(ArbEngineInputSource::Feed),
         )
         .await;
     }
@@ -3949,7 +3919,6 @@ mod tests {
             Some("L1 overlap starts after the contiguous authority frontier"),
             false,
             Some(4),
-            Some(ArbEngineInputSource::L1),
         )
         .await;
     }
@@ -3973,7 +3942,6 @@ mod tests {
             Some("canonical L1 authority promotion is unavailable in phase A at sequence 1"),
             false,
             Some(3),
-            None,
         )
         .await;
     }
@@ -3989,7 +3957,6 @@ mod tests {
         expected_error: Option<&str>,
         wait_for_feed_dequeue: bool,
         expected_error_tip: Option<u64>,
-        expected_marker_source: Option<ArbEngineInputSource>,
     ) {
         const ERROR_CHILD: &str = "ARB_RETH_DRIVER_ERROR_TEST_CHILD";
         let error_child = std::env::var_os(ERROR_CHILD).is_some();
@@ -4207,25 +4174,8 @@ mod tests {
                         "CanonicalL1PhaseUnavailable mutated journal authority"
                     );
                 } else {
-                    let divergence_sequence = arb_reth_engine::message_divergence_sequence(&error)
+                    arb_reth_engine::message_divergence_sequence(&error)
                         .expect("deterministic message failure must identify its sequence");
-                    let marker: serde_json::Value = serde_json::from_slice(
-                        &std::fs::read(&marker_path).expect("divergence marker must be readable"),
-                    )
-                    .expect("divergence marker must contain JSON");
-                    assert_eq!(
-                        marker["incoming_message"]["sequenceNumber"].as_u64(),
-                        Some(divergence_sequence),
-                        "marker must retain the exact input that caused a buffered failure",
-                    );
-                    assert_eq!(
-                        marker["incoming_source"].as_str(),
-                        expected_marker_source.map(|source| match source {
-                            ArbEngineInputSource::Feed => "feed",
-                            ArbEngineInputSource::L1 => "l1",
-                        }),
-                        "marker must retain the exact source representation that diverged",
-                    );
                 }
                 if let Some(expected_tip) = expected_error_tip {
                     assert_eq!(
@@ -4244,10 +4194,9 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            marker_path.exists(),
-            expected_marker_source.is_some(),
-            "only deterministic message failures create the startup-blocking marker",
+        assert!(
+            !marker_path.exists(),
+            "ordinary node execution cannot manufacture fenced V4 authority",
         );
         assert_eq!(
             driver_test_observations

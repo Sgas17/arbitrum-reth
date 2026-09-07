@@ -18,6 +18,10 @@ alloy-rlp = { workspace = true }
 # brotli is re-exported from arb_revm (which vendors it) so both crates share one brotli
 # source and avoid a lockfile collision. BUSL-licensed; see the arb_revm NOTICE.
 arb-revm.workspace = true
+# B2 uses the already locked crates.io decoder's incremental Read interface so cancellation and
+# the decompressed-byte ceiling are checked between bounded output chunks. The existing Nitro
+# decoder remains the byte-equivalence oracle in tests.
+brotli-crates-io = { package = "brotli", version = "=8.0.4" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

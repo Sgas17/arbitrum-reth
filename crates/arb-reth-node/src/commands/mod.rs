@@ -2,6 +2,7 @@
 //! `Args` struct and `run` entrypoint for one command; the binary's dispatcher parses the top-level
 //! CLI and calls into these.
 
+pub mod canonical_observe;
 pub mod dump_blocks;
 pub mod genesis;
 pub mod journal_init;

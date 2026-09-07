@@ -6,13 +6,12 @@
 //! [`arb_reth_derive::batch::parse_sequencer_batch_delivered`]; here `sol!` is used
 //! only to derive the canonical topic-0 hash and the call selectors.
 
-use alloy_primitives::{address, Address};
+use alloy_primitives::{Address, address};
 use alloy_sol_types::sol;
 
 /// Arbitrum One `SequencerInbox` proxy (verified against the `to` of batch-poster
 /// txns, e.g. batch seq 497980 at L1 block 19000015).
-pub const SEQUENCER_INBOX_MAINNET: Address =
-    address!("0x1c479675ad559dc151f6ec7ed3fbf8cee79582b6");
+pub const SEQUENCER_INBOX_MAINNET: Address = address!("0x1c479675ad559dc151f6ec7ed3fbf8cee79582b6");
 
 /// L1 block where the Arbitrum One `SequencerInbox` was deployed and posted batch 0
 /// (verified: first block with code == first `SequencerBatchDelivered` seq 0). This is
@@ -78,6 +77,17 @@ sol! {
 
     /// Emitted by an inbox when the body lives in the tx calldata instead.
     event InboxMessageDeliveredFromOrigin(uint256 indexed messageNum);
+}
+
+/// Exact Bridge accumulator getters used by the stopped canonical observer with an EIP-1898
+/// block-hash selector. These calls are not used by the ordinary synchronizer.
+pub mod bridge_accumulators {
+    use alloy_sol_types::sol;
+
+    sol! {
+        function sequencerInboxAccs(uint256 batchSequence) external view returns (bytes32);
+        function delayedInboxAccs(uint256 messageIndex) external view returns (bytes32);
+    }
 }
 
 /// `sendL2MessageFromOrigin(bytes messageData)`: the inbox call backing

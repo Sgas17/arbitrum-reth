@@ -30,6 +30,7 @@ libc = "=0.2.189"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = "=0.10.9"
+c-kzg = { version = "=2.1.8", default-features = false, features = ["ethereum_kzg_settings", "std"] }
 
 # reth node types + storage surface
 reth-node-types = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
@@ -143,6 +144,7 @@ keccak-cache-global = [
 gmp = ["reth-revm/gmp", "revm/gmp"]
 
 [dev-dependencies]
+arb-reth-derive = { path = "../arb-reth-derive" }
 serde_json = { workspace = true }
 reth-provider = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0", features = ["test-utils"] }
 reth-chainspec = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
@@ -154,4 +156,4 @@ arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", r
 reth-db-common = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 
 # engine_spike / engine: Tier-1 engine-tree deps live in [dependencies] now (used by engine.rs).
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "test-util"] }

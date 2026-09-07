@@ -29,7 +29,7 @@ use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
-use eyre::{WrapErr as _, eyre};
+use eyre::{WrapErr as _, ensure, eyre};
 use metrics::{Counter, Histogram};
 use std::{
     error::Error,
@@ -81,7 +81,7 @@ use revm::context_interface::ContextTr as _;
 
 use crate::message_journal::{
     JournalClient, JournalDirectory, JournalRuntime, MessageJournalEntry, StorageContextV3,
-    inspect_message_journal, validate_runtime_capacity, write_divergence_marker_at,
+    inspect_message_journal, validate_runtime_capacity,
 };
 use crate::native_payload::ArbPayloadJobGenerator;
 use crate::{
@@ -267,6 +267,154 @@ fn merge_same_sequence_inputs(
 struct AppliedOverlapPlan {
     overlap_len: usize,
     promotions: Vec<(u64, AppliedMessageIdentity)>,
+}
+
+/// Complete-batch comparison result. A caller must build every split only after this result exists,
+/// so a mismatch later in the journal-covered part of the batch blocks all earlier publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalBatchComparison {
+    pub batch_start_sequence: u64,
+    pub batch_end_sequence: u64,
+    pub covered_start_sequence: Option<u64>,
+    pub covered_end_sequence: Option<u64>,
+}
+
+impl CanonicalBatchComparison {
+    /// Split the already-completely-compared covered range at the exact B1 256-record/recovery-grid
+    /// boundaries. The stopped observer publishes these one at a time and refences after each ack.
+    pub fn authority_splits(&self, anchor_sequence: u64) -> eyre::Result<Vec<(u64, u64)>> {
+        let (Some(mut start), Some(end)) = (self.covered_start_sequence, self.covered_end_sequence)
+        else {
+            return Ok(Vec::new());
+        };
+        ensure!(
+            start > anchor_sequence,
+            "authority split starts at/before bootstrap"
+        );
+        let mut splits = Vec::new();
+        while start <= end {
+            let offset = start
+                .checked_sub(anchor_sequence)
+                .and_then(|offset| offset.checked_sub(1))
+                .ok_or_else(|| eyre!("authority split offset underflow"))?;
+            let grid_end = anchor_sequence
+                .checked_add(
+                    offset
+                        .checked_div(crate::message_journal::AUTHORITY_MAX_RECORDS as u64)
+                        .and_then(|group| group.checked_add(1))
+                        .and_then(|group| {
+                            group.checked_mul(crate::message_journal::AUTHORITY_MAX_RECORDS as u64)
+                        })
+                        .ok_or_else(|| eyre!("authority grid boundary overflow"))?,
+                )
+                .ok_or_else(|| eyre!("authority grid boundary overflow"))?;
+            let split_end = end.min(grid_end);
+            splits.push((start, split_end));
+            start = split_end
+                .checked_add(1)
+                .ok_or_else(|| eyre!("authority split sequence overflow"))?;
+        }
+        Ok(splits)
+    }
+}
+
+/// Compare one complete dependency-closed L1 batch against every durable identity from that batch
+/// through J. This reuses the engine driver's exact fingerprint and source-transition planner.
+/// Material beyond J is bounded scratch and cannot appear in the returned authority range.
+pub fn compare_complete_l1_batch(
+    journal: &crate::MessageJournalInspection,
+    inputs: &[ArbEngineInput],
+) -> eyre::Result<CanonicalBatchComparison> {
+    let first = inputs
+        .first()
+        .ok_or_else(|| eyre!("canonical comparison batch is empty"))?;
+    let last = inputs.last().expect("nonempty above");
+    ensure!(
+        inputs.len() <= 4_096,
+        "canonical comparison batch exceeds 4096 messages"
+    );
+    let fence = journal.authority_fence()?;
+    let next_seq = fence
+        .journal
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| eyre!("journal sequence overflows"))?;
+    let _plan = plan_applied_l1_chunk(
+        inputs,
+        next_seq,
+        journal.anchor().sequence,
+        fence.verified.sequence,
+        None,
+        |sequence| {
+            journal.entry(sequence).map(|entry| AppliedMessageIdentity {
+                fingerprint: entry.fingerprint,
+                source: entry.source,
+                block_number: entry.block_number,
+                block_hash: entry.block_hash,
+                parent_hash: entry.parent_hash,
+                delayed_messages_read: entry.delayed_messages_read,
+            })
+        },
+    )?;
+
+    let covered_start = first.sequence_number().max(
+        fence
+            .verified
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| eyre!("V sequence overflows"))?,
+    );
+    let covered_end = last.sequence_number().min(fence.journal.sequence);
+    let covered = (covered_start <= covered_end).then_some((covered_start, covered_end));
+    if let Some((start, end)) = covered {
+        let expected_start = fence
+            .verified
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| eyre!("V sequence overflows"))?;
+        ensure!(
+            start == expected_start,
+            "complete batch does not begin at the next authority sequence"
+        );
+        for sequence in start..=end {
+            let entry = journal
+                .entry(sequence)
+                .ok_or_else(|| eyre!("journal-covered batch sequence {sequence} is absent"))?;
+            ensure!(
+                entry.block_number == sequence,
+                "Robinhood sequence/L2 mapping changed at {sequence}"
+            );
+            let first_after_anchor = journal
+                .anchor()
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| eyre!("journal anchor sequence overflows"))?;
+            if sequence > first_after_anchor {
+                let previous = journal.identity(sequence - 1).ok_or_else(|| {
+                    eyre!(
+                        "journal predecessor {sequence_minus_one} is absent",
+                        sequence_minus_one = sequence - 1
+                    )
+                })?;
+                ensure!(
+                    entry.parent_hash == previous.block_hash,
+                    "journal-covered parent identity changed at {sequence}"
+                );
+            }
+        }
+        return Ok(CanonicalBatchComparison {
+            batch_start_sequence: first.sequence_number(),
+            batch_end_sequence: last.sequence_number(),
+            covered_start_sequence: Some(start),
+            covered_end_sequence: Some(end),
+        });
+    }
+    Ok(CanonicalBatchComparison {
+        batch_start_sequence: first.sequence_number(),
+        batch_end_sequence: last.sequence_number(),
+        covered_start_sequence: None,
+        covered_end_sequence: None,
+    })
 }
 
 fn plan_applied_l1_chunk(
@@ -1494,7 +1642,6 @@ where
     journal_anchor_sequence: u64,
     journal: JournalClient,
     journal_runtime: Mutex<Option<JournalRuntime>>,
-    journal_directory: JournalDirectory,
     /// Last sequence observed from the ordered L1 chunk stream in this process.
     last_l1_sequence: Option<u64>,
     #[cfg(debug_assertions)]
@@ -1980,7 +2127,6 @@ where
             journal_anchor_sequence,
             journal,
             journal_runtime: Mutex::new(Some(journal_runtime)),
-            journal_directory,
             last_l1_sequence: None,
             #[cfg(debug_assertions)]
             reconciliation_calls: 0,
@@ -2278,32 +2424,6 @@ where
             };
             self.recent_messages.remove(&oldest);
         }
-    }
-
-    /// Durably block automatic restart after any fail-closed driver error.
-    pub fn write_divergence_marker(&self, input: &ArbEngineInput, error: &str) -> eyre::Result<()> {
-        write_divergence_marker_at(
-            &self.journal_directory,
-            alloy_eips::BlockNumHash {
-                number: self.tip.number,
-                hash: self.tip.hash(),
-            },
-            self.next_seq,
-            input,
-            error,
-        )
-    }
-
-    /// Persist a divergence marker using the exact buffered message identified by the typed error.
-    pub fn write_divergence_marker_for_error(
-        &self,
-        fallback: &ArbEngineInput,
-        error: &eyre::Report,
-    ) -> eyre::Result<()> {
-        let input = message_divergence_sequence(error)
-            .and_then(|sequence| self.pending.get(&sequence))
-            .unwrap_or(fallback);
-        self.write_divergence_marker(input, &format!("{error:#}"))
     }
 
     /// Drive Reth's local payload lifecycle for one already-ordered Arbitrum message.
@@ -3336,6 +3456,27 @@ mod reconciliation_tests {
         assert_eq!(whole.promotions.len(), 3);
         assert_eq!(second.promotions.len(), 2);
         assert_eq!(second.promotions.last().unwrap().0, 3);
+    }
+
+    #[test]
+    fn complete_comparison_splits_only_at_exact_recovery_grid_boundaries() {
+        let comparison = CanonicalBatchComparison {
+            batch_start_sequence: 9,
+            batch_end_sequence: 600,
+            covered_start_sequence: Some(11),
+            covered_end_sequence: Some(600),
+        };
+        assert_eq!(
+            comparison.authority_splits(10).unwrap(),
+            vec![(11, 266), (267, 522), (523, 600)]
+        );
+        let none = CanonicalBatchComparison {
+            batch_start_sequence: 1,
+            batch_end_sequence: 2,
+            covered_start_sequence: None,
+            covered_end_sequence: None,
+        };
+        assert!(none.authority_splits(10).unwrap().is_empty());
     }
 
     #[test]

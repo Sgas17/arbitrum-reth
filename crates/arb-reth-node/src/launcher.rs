@@ -20,9 +20,7 @@ use futures_util::StreamExt;
 use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
 use reth_evm::ConfigureEvm;
-use reth_node_api::{
-    AddOnsContext, FullNodeTypes, NodeAddOns, NodeTypes, NodeTypesWithDBAdapter,
-};
+use reth_node_api::{AddOnsContext, FullNodeTypes, NodeAddOns, NodeTypes, NodeTypesWithDBAdapter};
 use reth_node_builder::hooks::NodeHooks;
 use reth_node_builder::{
     AddOns, LaunchContext, LaunchNode, Node, NodeAdapter, NodeBuilderWithComponents,
@@ -108,30 +106,168 @@ enum MessageSource {
     Feed,
 }
 
-/// Receives the next message, preferring the authoritative L1 path whenever both sources are
-/// ready. This is only an ingress scheduling decision: the engine driver remains the single
-/// sequence-reconciliation point and still deduplicates both sources by message index.
-async fn recv_next_message(
-    feed_messages: &mut tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
-    l1_messages: &mut tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
-    feed_open: &mut bool,
-    l1_open: &mut bool,
-) -> Option<(MessageSource, BroadcastFeedMessage)> {
-    loop {
-        if !*feed_open && !*l1_open {
-            return None;
-        }
+const MAX_MESSAGE_BATCH: usize = 64;
 
-        tokio::select! {
-            biased;
-            message = l1_messages.recv(), if *l1_open => match message {
-                Some(message) => return Some((MessageSource::L1, message)),
-                None => *l1_open = false,
-            },
-            message = feed_messages.recv(), if *feed_open => match message {
-                Some(message) => return Some((MessageSource::Feed, message)),
-                None => *feed_open = false,
-            },
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchKind {
+    Ordinary,
+    GapCloser,
+}
+
+struct SelectedBatch {
+    source: MessageSource,
+    messages: Vec<BroadcastFeedMessage>,
+    kind: BatchKind,
+}
+
+/// Deterministic, work-conserving bounded-fair arbitration over the two ingress channels.
+struct IngressScheduler {
+    feed_messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    l1_messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    feed_pending: Option<BroadcastFeedMessage>,
+    l1_pending: Option<BroadcastFeedMessage>,
+    feed_open: bool,
+    l1_open: bool,
+    owed: MessageSource,
+}
+
+impl IngressScheduler {
+    fn new(
+        feed_messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+        l1_messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    ) -> Self {
+        Self {
+            feed_messages,
+            l1_messages,
+            feed_pending: None,
+            l1_pending: None,
+            feed_open: true,
+            l1_open: true,
+            owed: MessageSource::Feed,
+        }
+    }
+
+    fn try_fill_head(&mut self, source: MessageSource) {
+        let (open, pending, messages) = match source {
+            MessageSource::Feed => (
+                &mut self.feed_open,
+                &mut self.feed_pending,
+                &mut self.feed_messages,
+            ),
+            MessageSource::L1 => (
+                &mut self.l1_open,
+                &mut self.l1_pending,
+                &mut self.l1_messages,
+            ),
+        };
+        if !*open || pending.is_some() {
+            return;
+        }
+        match messages.try_recv() {
+            Ok(message) => *pending = Some(message),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => *open = false,
+        }
+    }
+
+    async fn wait_for_head(&mut self) {
+        let received = match self.owed {
+            MessageSource::Feed => {
+                tokio::select! {
+                    biased;
+                    message = self.feed_messages.recv(), if self.feed_open => (MessageSource::Feed, message),
+                    message = self.l1_messages.recv(), if self.l1_open => (MessageSource::L1, message),
+                }
+            }
+            MessageSource::L1 => {
+                tokio::select! {
+                    biased;
+                    message = self.l1_messages.recv(), if self.l1_open => (MessageSource::L1, message),
+                    message = self.feed_messages.recv(), if self.feed_open => (MessageSource::Feed, message),
+                }
+            }
+        };
+        match received {
+            (MessageSource::Feed, Some(message)) => self.feed_pending = Some(message),
+            (MessageSource::L1, Some(message)) => self.l1_pending = Some(message),
+            (MessageSource::Feed, None) => self.feed_open = false,
+            (MessageSource::L1, None) => self.l1_open = false,
+        }
+    }
+
+    async fn next_batch(&mut self, next_sequence: u64) -> Option<SelectedBatch> {
+        loop {
+            self.try_fill_head(MessageSource::Feed);
+            self.try_fill_head(MessageSource::L1);
+            if self.feed_pending.is_none() && self.l1_pending.is_none() {
+                if !self.feed_open && !self.l1_open {
+                    return None;
+                }
+                self.wait_for_head().await;
+                continue;
+            }
+
+            let gap_closer = matches!(
+                (&self.feed_pending, &self.l1_pending),
+                (Some(feed), Some(l1))
+                    if l1.sequence_number == next_sequence && feed.sequence_number > next_sequence
+            );
+            let source = if gap_closer {
+                MessageSource::L1
+            } else {
+                match (self.feed_pending.is_some(), self.l1_pending.is_some()) {
+                    (true, true) => self.owed,
+                    (true, false) => MessageSource::Feed,
+                    (false, true) => MessageSource::L1,
+                    (false, false) => unreachable!(),
+                }
+            };
+            let kind = if gap_closer {
+                BatchKind::GapCloser
+            } else {
+                BatchKind::Ordinary
+            };
+            let first = match source {
+                MessageSource::Feed => self.feed_pending.take().unwrap(),
+                MessageSource::L1 => self.l1_pending.take().unwrap(),
+            };
+            let mut messages = Vec::with_capacity(MAX_MESSAGE_BATCH);
+            messages.push(first);
+
+            if kind == BatchKind::Ordinary {
+                while messages.len() < MAX_MESSAGE_BATCH {
+                    let (open, receiver) = match source {
+                        MessageSource::Feed => (&mut self.feed_open, &mut self.feed_messages),
+                        MessageSource::L1 => (&mut self.l1_open, &mut self.l1_messages),
+                    };
+                    match receiver.try_recv() {
+                        Ok(message) => messages.push(message),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            *open = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            return Some(SelectedBatch {
+                source,
+                messages,
+                kind,
+            });
+        }
+    }
+
+    fn complete_batch(&mut self, source: MessageSource, kind: BatchKind) {
+        match kind {
+            BatchKind::GapCloser => self.owed = MessageSource::Feed,
+            BatchKind::Ordinary if source == self.owed => {
+                self.owed = match source {
+                    MessageSource::Feed => MessageSource::L1,
+                    MessageSource::L1 => MessageSource::Feed,
+                };
+            }
+            BatchKind::Ordinary => {}
         }
     }
 }
@@ -404,8 +540,7 @@ impl ArbLauncher {
         )?;
 
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
-        let mut feed_messages = feed_messages;
-        let mut l1_messages = l1_messages;
+        let mut scheduler = IngressScheduler::new(feed_messages, l1_messages);
 
         task_executor.spawn_critical_task("arb-engine-driver", async move {
             let res: eyre::Result<()> = async {
@@ -419,18 +554,21 @@ impl ArbLauncher {
                 let mut status_last_applied_sequence: Option<u64> = None;
                 let mut status_window = std::time::Instant::now();
                 const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-                const MAX_MESSAGE_BATCH: usize = 64;
-                let mut feed_open = true;
-                let mut l1_open = true;
                 loop {
                     let __r = std::time::Instant::now();
-                    let Some((source, first)) = recv_next_message(
-                        &mut feed_messages,
-                        &mut l1_messages,
-                        &mut feed_open,
-                        &mut l1_open,
-                    )
-                    .await
+                    // An L1 message may bypass the normal 64-item bound only when it closes the
+                    // exact gap ahead of a feed head. Ordinary batches alternate while both
+                    // sources are ready, starting with Feed.
+                    let next_sequence = driver
+                        .tip()
+                        .number
+                        .saturating_sub(genesis_block)
+                        .saturating_add(1);
+                    let Some(SelectedBatch {
+                        source,
+                        messages: batch,
+                        kind,
+                    }) = scheduler.next_batch(next_sequence).await
                     else {
                         break;
                     };
@@ -440,28 +578,6 @@ impl ArbLauncher {
                     // the receiver's racy `is_empty()` hint: historical catch-up can overlap the
                     // final FCU of every non-tail message, while a one-message live-feed batch
                     // remains fully settled before the next frame arrives.
-                    let mut batch = Vec::with_capacity(MAX_MESSAGE_BATCH);
-                    batch.push(first);
-                    let mut source_closed = false;
-                    while batch.len() < MAX_MESSAGE_BATCH {
-                        let receiver = match source {
-                            MessageSource::L1 => &mut l1_messages,
-                            MessageSource::Feed => &mut feed_messages,
-                        };
-                        match receiver.try_recv() {
-                            Ok(msg) => batch.push(msg),
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                match source {
-                                    MessageSource::L1 => l1_open = false,
-                                    MessageSource::Feed => feed_open = false,
-                                }
-                                source_closed = true;
-                                break;
-                            }
-                        }
-                    }
-
                     let batch_len = batch.len();
                     for (index, msg) in batch.into_iter().enumerate() {
                         let driver_dequeued_at = std::time::Instant::now();
@@ -518,9 +634,7 @@ impl ArbLauncher {
                         }
                     }
 
-                    if source_closed && !feed_open && !l1_open {
-                        break;
-                    }
+                    scheduler.complete_batch(source, kind);
                 }
                 driver.shutdown().await;
                 Ok(())
@@ -592,34 +706,110 @@ mod tests {
 
     use crate::ArbNode;
 
+    fn scheduler_with(
+        feed: impl IntoIterator<Item = u64>,
+        l1: impl IntoIterator<Item = u64>,
+    ) -> IngressScheduler {
+        let feed = feed.into_iter().collect::<Vec<_>>();
+        let l1 = l1.into_iter().collect::<Vec<_>>();
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/deposit_message_only.json"),
+        )
+        .expect("read scheduler fixture");
+        let message: BroadcastFeedMessage =
+            serde_json::from_str(&fixture).expect("parse scheduler fixture");
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(feed.len().max(1));
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(l1.len().max(1));
+        for sequence_number in feed {
+            let mut input = message.clone();
+            input.sequence_number = sequence_number;
+            feed_tx.try_send(input).expect("queue feed input");
+        }
+        for sequence_number in l1 {
+            let mut input = message.clone();
+            input.sequence_number = sequence_number;
+            l1_tx.try_send(input).expect("queue L1 input");
+        }
+        drop((feed_tx, l1_tx));
+        IngressScheduler::new(feed_rx, l1_rx)
+    }
+
     #[tokio::test]
-    async fn l1_ingress_preempts_a_ready_feed_backlog() {
-        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let json = std::fs::read_to_string(fixtures_dir.join("deposit_message_only.json"))
-            .expect("read fixture");
-        let mut feed_message: BroadcastFeedMessage =
-            serde_json::from_str(&json).expect("parse feed fixture");
-        let mut l1_message = feed_message.clone();
-        feed_message.sequence_number = 2;
-        l1_message.sequence_number = 1;
+    async fn both_ready_is_feed_first_then_bounded_fair_at_exact_quantum() {
+        let mut scheduler = scheduler_with(1..=65, 100..=164);
 
-        let (feed_tx, mut feed_rx) = tokio::sync::mpsc::channel(4);
-        let (l1_tx, mut l1_rx) = tokio::sync::mpsc::channel(4);
-        feed_tx
-            .send(feed_message)
-            .await
-            .expect("queue feed message");
-        l1_tx.send(l1_message).await.expect("queue L1 message");
+        let feed = scheduler.next_batch(1_000).await.unwrap();
+        assert_eq!(feed.source, MessageSource::Feed);
+        assert_eq!(feed.kind, BatchKind::Ordinary);
+        assert_eq!(feed.messages.len(), MAX_MESSAGE_BATCH);
+        assert_eq!(feed.messages[0].sequence_number, 1);
+        assert_eq!(feed.messages[63].sequence_number, 64);
+        scheduler.complete_batch(feed.source, feed.kind);
 
-        let mut feed_open = true;
-        let mut l1_open = true;
-        let (source, message) =
-            recv_next_message(&mut feed_rx, &mut l1_rx, &mut feed_open, &mut l1_open)
-                .await
-                .expect("one source must be ready");
+        let l1 = scheduler.next_batch(1_000).await.unwrap();
+        assert_eq!(l1.source, MessageSource::L1);
+        assert_eq!(l1.messages.len(), MAX_MESSAGE_BATCH);
+        assert_eq!(l1.messages[0].sequence_number, 100);
+        assert_eq!(l1.messages[63].sequence_number, 163);
+        scheduler.complete_batch(l1.source, l1.kind);
+        assert_eq!(scheduler.owed, MessageSource::Feed);
+    }
 
-        assert_eq!(source, MessageSource::L1);
-        assert_eq!(message.sequence_number, 1);
+    #[tokio::test]
+    async fn open_empty_peer_never_delays_ready_source() {
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/deposit_message_only.json"),
+        )
+        .expect("read scheduler fixture");
+        let mut message: BroadcastFeedMessage =
+            serde_json::from_str(&fixture).expect("parse scheduler fixture");
+        message.sequence_number = 10;
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
+        l1_tx.try_send(message).expect("queue L1 input");
+        let mut scheduler = IngressScheduler::new(feed_rx, l1_rx);
+
+        let l1 = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            scheduler.next_batch(1_000),
+        )
+        .await
+        .expect("open-empty Feed must not delay L1")
+        .unwrap();
+        assert_eq!(l1.source, MessageSource::L1);
+        scheduler.complete_batch(l1.source, l1.kind);
+        assert_eq!(scheduler.owed, MessageSource::Feed);
+
+        let mut feed = l1.messages[0].clone();
+        feed.sequence_number = 11;
+        feed_tx.try_send(feed).expect("queue Feed input");
+        let feed = scheduler.next_batch(1_000).await.unwrap();
+        assert_eq!(feed.source, MessageSource::Feed);
+        drop((feed_tx, l1_tx));
+    }
+
+    #[tokio::test]
+    async fn one_item_l1_gap_closer_rearbitrates_to_feed() {
+        let mut scheduler = scheduler_with([2], [1, 2]);
+        let closer = scheduler.next_batch(1).await.unwrap();
+        assert_eq!(closer.source, MessageSource::L1);
+        assert_eq!(closer.kind, BatchKind::GapCloser);
+        assert_eq!(closer.messages.len(), 1);
+        scheduler.complete_batch(closer.source, closer.kind);
+
+        let feed = scheduler.next_batch(2).await.unwrap();
+        assert_eq!(feed.source, MessageSource::Feed);
+        assert_eq!(feed.messages[0].sequence_number, 2);
+    }
+
+    #[tokio::test]
+    async fn l1_overlap_does_not_suppress_contiguous_feed() {
+        let mut scheduler = scheduler_with([5], [4]);
+        let selected = scheduler.next_batch(5).await.unwrap();
+        assert_eq!(selected.source, MessageSource::Feed);
+        assert_eq!(selected.messages[0].sequence_number, 5);
     }
 
     /// `ArbLauncher` boots over reth's `LaunchContext` with full pruning, then persists two

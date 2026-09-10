@@ -715,6 +715,7 @@ async fn launch(
         chain_id: effective_chain_id,
         genesis_block: rollup.l2_genesis_block,
         tuning,
+        mode: crate::launcher::ArbLaunchMode::Ordinary,
         feed_messages: feed_rx,
         l1_messages: l1_rx,
         feed_latency: feed_latency.clone(),

@@ -105,6 +105,37 @@ fn sparse_root_hazards(state: &revm::state::EvmState, preserve_created_empty_acc
     hazards
 }
 
+/// A failed engine-tree termination acknowledgement.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ArbEngineShutdownError {
+    /// Shutdown was already requested, or the tree input channel was closed before requesting it.
+    TerminationChannelClosed,
+    /// The tree did not acknowledge termination before the configured deadline.
+    TimedOut {
+        timeout: Duration,
+        target_block: BlockNumber,
+    },
+}
+
+impl core::fmt::Display for ArbEngineShutdownError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TerminationChannelClosed => {
+                f.write_str("engine termination channel closed before acknowledgement")
+            }
+            Self::TimedOut {
+                timeout,
+                target_block,
+            } => write!(
+                f,
+                "timed out after {timeout:?} waiting for engine termination at block {target_block}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ArbEngineShutdownError {}
+
 /// Ensures every driver exit asks the engine tree to flush and release persistence handles.
 struct EngineTerminationGuard {
     to_tree: ToTree,
@@ -119,9 +150,9 @@ impl EngineTerminationGuard {
         }
     }
 
-    fn request(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    fn request(&self) -> Result<tokio::sync::oneshot::Receiver<()>, ArbEngineShutdownError> {
         if self.requested.swap(true, Ordering::AcqRel) {
-            return None;
+            return Err(ArbEngineShutdownError::TerminationChannelClosed);
         }
 
         let (terminated_tx, terminated_rx) = tokio::sync::oneshot::channel();
@@ -129,14 +160,30 @@ impl EngineTerminationGuard {
             .send(FromEngine::Event(FromOrchestrator::Terminate {
                 tx: terminated_tx,
             }))
-            .ok()?;
-        Some(terminated_rx)
+            .map_err(|_| ArbEngineShutdownError::TerminationChannelClosed)?;
+        Ok(terminated_rx)
     }
 }
 
 impl Drop for EngineTerminationGuard {
     fn drop(&mut self) {
         let _ = self.request();
+    }
+}
+
+async fn shutdown_engine_tree(
+    termination_guard: &EngineTerminationGuard,
+    target_block: BlockNumber,
+    timeout: Duration,
+) -> Result<(), ArbEngineShutdownError> {
+    let terminated_rx = termination_guard.request()?;
+    match tokio::time::timeout(timeout, terminated_rx).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(ArbEngineShutdownError::TerminationChannelClosed),
+        Err(_) => Err(ArbEngineShutdownError::TimedOut {
+            timeout,
+            target_block,
+        }),
     }
 }
 
@@ -1894,28 +1941,13 @@ where
     }
 
     /// Ask the engine tree to persist its in-memory tail and terminate.
-    pub async fn shutdown(&self) {
-        let Some(terminated_rx) = self.engine_termination_guard.request() else {
-            tracing::warn!(
-                target: "arb-reth::engine",
-                "engine termination was already requested or the engine channel is closed",
-            );
-            return;
-        };
-
-        match tokio::time::timeout(Duration::from_secs(10), terminated_rx).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::warn!(
-                target: "arb-reth::engine",
-                %err,
-                "engine termination response channel closed",
-            ),
-            Err(_) => tracing::warn!(
-                target: "arb-reth::engine",
-                target_block = self.tip.number,
-                "timed out waiting for engine termination",
-            ),
-        }
+    pub async fn shutdown(&self) -> Result<(), ArbEngineShutdownError> {
+        shutdown_engine_tree(
+            &self.engine_termination_guard,
+            self.tip.number,
+            Duration::from_secs(10),
+        )
+        .await
     }
 }
 
@@ -1936,6 +1968,47 @@ mod termination_tests {
         };
         // The guard intentionally drops the acknowledgement receiver after requesting shutdown.
         assert!(tx.send(()).is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_closed_termination_ack() {
+        let (to_tree, from_driver) = crossbeam_channel::unbounded();
+        let guard = EngineTerminationGuard::new(to_tree);
+        let shutdown = tokio::spawn(async move {
+            shutdown_engine_tree(&guard, 7, Duration::from_millis(50)).await
+        });
+
+        let message = tokio::task::spawn_blocking(move || {
+            from_driver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("termination event")
+        })
+        .await
+        .expect("termination receiver task");
+        let FromEngine::Event(FromOrchestrator::Terminate { tx }) = message else {
+            panic!("unexpected engine message")
+        };
+        drop(tx);
+
+        assert_eq!(
+            shutdown.await.expect("shutdown task"),
+            Err(ArbEngineShutdownError::TerminationChannelClosed)
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_timeout_without_waiting_default_deadline() {
+        let (to_tree, _from_driver) = crossbeam_channel::unbounded();
+        let guard = EngineTerminationGuard::new(to_tree);
+        let timeout = Duration::from_millis(1);
+
+        assert_eq!(
+            shutdown_engine_tree(&guard, 9, timeout).await,
+            Err(ArbEngineShutdownError::TimedOut {
+                timeout,
+                target_block: 9,
+            })
+        );
     }
 }
 

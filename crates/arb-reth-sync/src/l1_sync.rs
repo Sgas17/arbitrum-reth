@@ -72,6 +72,17 @@ pub enum L1SyncError {
     InvalidRpcUrl,
     /// A prefetched range task panicked or was cancelled unexpectedly.
     PrefetchTask { from: u64, to: u64 },
+    /// The bounded L1 range ended before it derived the requested absolute L2 frontier.
+    FrontierNotReached { frontier: u64, last_derived: u64 },
+}
+
+/// Terminal state of an L1 derivation run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum L1SyncCompletion {
+    /// A normally bounded L1 range was consumed without an L2 frontier.
+    Exhausted,
+    /// The requested absolute L2 frontier was enqueued exactly.
+    FrontierReached { frontier: u64 },
 }
 
 impl L1SyncError {
@@ -151,6 +162,13 @@ impl core::fmt::Display for L1SyncError {
                     "L1 range prefetch task [{from}, {to}] terminated unexpectedly"
                 )
             }
+            Self::FrontierNotReached {
+                frontier,
+                last_derived,
+            } => write!(
+                f,
+                "L1 derivation ended at L2 block {last_derived} before requested frontier {frontier}"
+            ),
         }
     }
 }
@@ -191,6 +209,9 @@ pub struct L1SyncConfig {
     /// so they are dropped rather than re-sent to the driver (which would produce them again). The
     /// first message sent is always block `db_tip_l2 + 1`.
     pub db_tip_l2: u64,
+    /// Optional absolute L2 block at which to stop delivery. The frontier message is delivered,
+    /// but no later message from that same derived L1 window is ever enqueued.
+    pub l2_frontier: Option<u64>,
     /// The L2 block number of Nitro genesis (Arbitrum One: 22207817; a fresh chain: 0). Feed/derived
     /// messages are numbered by *message index* (`block - genesis_block`), which is what the driver's
     /// sequence-reconciliation expects. Absolute block numbers only equal the index when this is 0
@@ -226,6 +247,7 @@ impl L1SyncConfig {
             start_delayed_count,
             start_l2_block: 0,
             db_tip_l2: 0,
+            l2_frontier: None,
             genesis_block: 0,
             checkpoint_path: None,
             batch_window: 1_000,
@@ -327,6 +349,39 @@ where
     }
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+struct WindowDelivery {
+    skipped: u64,
+    frontier_reached: Option<L1SyncCompletion>,
+}
+
+/// Number and enqueue one derived L1 window, stopping immediately after the exact frontier.
+async fn enqueue_derived_window(
+    messages: Vec<BroadcastFeedMessage>,
+    next_l2: &mut u64,
+    db_tip_l2: u64,
+    genesis_block: u64,
+    frontier: Option<u64>,
+    feed_tx: &Sender<BroadcastFeedMessage>,
+) -> Result<WindowDelivery, ()> {
+    let mut delivery = WindowDelivery::default();
+    for mut msg in messages {
+        let bn = *next_l2;
+        *next_l2 += 1;
+        if bn <= db_tip_l2 {
+            delivery.skipped += 1;
+            continue;
+        }
+        msg.sequence_number = bn - genesis_block;
+        feed_tx.send(msg).await.map_err(|_| ())?;
+        if frontier == Some(bn) {
+            delivery.frontier_reached = Some(L1SyncCompletion::FrontierReached { frontier: bn });
+            return Ok(delivery);
+        }
+    }
+    Ok(delivery)
+}
+
 /// Supervise L1 derivation for the lifetime of the node.
 ///
 /// Retryable execution RPC and beacon failures restart from the latest durable checkpoint with
@@ -338,7 +393,7 @@ pub async fn supervise_l1_sync<F, S>(
     feed_tx: Sender<BroadcastFeedMessage>,
     persisted_tip: F,
     shutdown: S,
-) -> Result<(), L1SyncError>
+) -> Result<L1SyncCompletion, L1SyncError>
 where
     F: Fn() -> u64 + Send + Sync,
     S: Future + Send,
@@ -361,7 +416,7 @@ async fn supervise_l1_sync_with_backoff<F, S>(
     shutdown: S,
     initial_delay: Duration,
     maximum_delay: Duration,
-) -> Result<(), L1SyncError>
+) -> Result<L1SyncCompletion, L1SyncError>
 where
     F: Fn() -> u64 + Send + Sync,
     S: Future + Send,
@@ -384,12 +439,12 @@ where
         first_attempt = false;
         let result = tokio::select! {
             biased;
-            _ = &mut shutdown => return Ok(()),
+            _ = &mut shutdown => return Ok(L1SyncCompletion::Exhausted),
             result = run_l1_sync(cfg, feed_tx.clone(), &persisted_tip) => result,
         };
 
         match result {
-            Ok(()) => return Ok(()),
+            Ok(completion) => return Ok(completion),
             Err(err) if !err.is_retryable() => return Err(err),
             Err(err) => {
                 let made_progress = progress(&base_cfg, persisted_tip()) != attempt_start;
@@ -409,7 +464,7 @@ where
                     "transient L1 provider failure; restarting from durable checkpoint",
                 );
                 if !retry_delay_or_shutdown(delay, shutdown.as_mut()).await {
-                    return Ok(());
+                    return Ok(L1SyncCompletion::Exhausted);
                 }
             }
         }
@@ -427,7 +482,7 @@ pub async fn run_l1_sync<F>(
     cfg: L1SyncConfig,
     feed_tx: Sender<BroadcastFeedMessage>,
     persisted_tip: F,
-) -> Result<(), L1SyncError>
+) -> Result<L1SyncCompletion, L1SyncError>
 where
     F: Fn() -> u64 + Send,
 {
@@ -463,6 +518,12 @@ where
     // message produces; blocks `<= db_tip_l2` are already persisted and get dropped.
     let mut next_l2 = cfg.start_l2_block + 1;
     let db_tip_l2 = cfg.db_tip_l2;
+    let frontier = cfg.l2_frontier;
+    if frontier.is_some_and(|frontier| frontier <= db_tip_l2) {
+        return Ok(L1SyncCompletion::FrontierReached {
+            frontier: frontier.expect("checked above"),
+        });
+    }
     let genesis_block = cfg.genesis_block;
     // Window boundaries awaiting durability before they can be appended to the resume log.
     // Ascending in both `l1_block` and `l2_block`; drained front-to-back as `persisted_tip` rises.
@@ -646,24 +707,29 @@ where
         // when genesis is block 0. Sending absolute numbers on a chain with a non-zero genesis (e.g.
         // Arbitrum One at 22207817) makes every message land far above the driver's `next_seq`, so it
         // buffers/drops them all and never applies any block.
-        let mut skipped = 0u64;
-        for mut msg in derived.messages {
-            let bn = next_l2;
-            next_l2 += 1;
-            if bn <= db_tip_l2 {
-                skipped += 1;
-                continue;
-            }
-            msg.sequence_number = bn - genesis_block;
-            if feed_tx.send(msg).await.is_err() {
+        let delivery = enqueue_derived_window(
+            derived.messages,
+            &mut next_l2,
+            db_tip_l2,
+            genesis_block,
+            frontier,
+            &feed_tx,
+        )
+        .await;
+        let delivery = match delivery {
+            Ok(delivery) => delivery,
+            Err(()) => {
                 tracing::warn!(target: "arb-reth::l1-sync", "feed channel closed; stopping L1 sync");
-                return Ok(());
+                return Ok(L1SyncCompletion::Exhausted);
             }
+        };
+        if let Some(completion) = delivery.frontier_reached {
+            return Ok(completion);
         }
-        if skipped > 0 {
+        if delivery.skipped > 0 {
             tracing::debug!(
                 target: "arb-reth::l1-sync",
-                from, to, skipped, resumed_at = db_tip_l2 + 1,
+                from, to, skipped = delivery.skipped, resumed_at = db_tip_l2 + 1,
                 "dropped already-persisted blocks on resume",
             );
         }
@@ -690,7 +756,13 @@ where
     }
 
     tracing::info!(target: "arb-reth::l1-sync", final_block = consume_cursor.saturating_sub(1), "L1 sync reached end block");
-    Ok(())
+    match frontier {
+        Some(frontier) => Err(L1SyncError::FrontierNotReached {
+            frontier,
+            last_derived: next_l2.saturating_sub(1),
+        }),
+        None => Ok(L1SyncCompletion::Exhausted),
+    }
 }
 
 /// Append every durable window boundary to the resume log and rewrite it.
@@ -874,6 +946,74 @@ mod tests {
         cfg.prefetch_windows = 1;
         cfg.poll_interval = Duration::from_millis(1);
         cfg
+    }
+
+    #[tokio::test]
+    async fn exact_frontier_stops_a_single_derived_window_without_sending_its_tail() {
+        let fixture = include_str!("../../arb-reth-node/tests/fixtures/deposit_message_only.json");
+        let message: BroadcastFeedMessage = serde_json::from_str(fixture).unwrap();
+        let messages = vec![
+            message.clone(),
+            message.clone(),
+            message.clone(),
+            message.clone(),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut next_l2 = 10;
+
+        let delivery = enqueue_derived_window(messages, &mut next_l2, 0, 0, Some(12), &tx)
+            .await
+            .expect("receiver remains open");
+        assert_eq!(
+            delivery.frontier_reached,
+            Some(L1SyncCompletion::FrontierReached { frontier: 12 })
+        );
+        let sent = [
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+        ]
+        .map(|message| message.sequence_number);
+        assert_eq!(sent, [10, 11, 12]);
+        assert!(rx.try_recv().is_err(), "frontier + 1 must not be enqueued");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut next_l2 = 10;
+        let delivery = enqueue_derived_window(
+            vec![message.clone(), message.clone(), message.clone(), message],
+            &mut next_l2,
+            0,
+            0,
+            None,
+            &tx,
+        )
+        .await
+        .expect("receiver remains open");
+        assert_eq!(delivery.frontier_reached, None);
+        let sent = [
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+        ]
+        .map(|message| message.sequence_number);
+        assert_eq!(sent, [10, 11, 12, 13], "ordinary mode stays unrestricted");
+    }
+
+    #[test]
+    fn exhausted_bounded_range_returns_typed_frontier_failure() {
+        let err = L1SyncError::FrontierNotReached {
+            frontier: 12,
+            last_derived: 11,
+        };
+        assert!(matches!(
+            err,
+            L1SyncError::FrontierNotReached {
+                frontier: 12,
+                last_derived: 11
+            }
+        ));
+        assert!(!err.is_retryable());
     }
 
     /// The gate only appends boundaries whose L2 blocks are durable, always advances the log's

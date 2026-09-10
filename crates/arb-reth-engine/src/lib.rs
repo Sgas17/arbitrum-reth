@@ -29,7 +29,10 @@ pub mod native_payload;
 mod storage_v2;
 mod tx_log_stream;
 
-pub use engine::{ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, wait_for_head};
+pub use engine::{
+    ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineShutdownError, ArbEngineTuning,
+    wait_for_head,
+};
 pub use engine_spike::ArbPayloadValidator;
 pub use native_payload::ArbPayloadBuilder;
 pub use tx_log_stream::{

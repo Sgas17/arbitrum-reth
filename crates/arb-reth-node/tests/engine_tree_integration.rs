@@ -167,6 +167,9 @@ mod tests {
         }
         assert_eq!(canonicalized, (1..=TARGET).collect::<Vec<_>>());
 
-        driver.shutdown().await;
+        driver
+            .shutdown()
+            .await
+            .expect("engine shutdown acknowledgement");
     }
 }

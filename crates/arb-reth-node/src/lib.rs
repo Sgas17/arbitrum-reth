@@ -62,6 +62,8 @@ mod mev_frontier_rpc;
 mod metrics;
 pub use metrics::FeedLatencyTracker;
 
+pub mod trusted_l2;
+
 pub mod executor;
 pub use executor::ArbExecutorBuilder;
 

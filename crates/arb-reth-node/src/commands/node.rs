@@ -29,6 +29,9 @@ use std::{
 use crate::feed;
 use crate::launcher::ArbLauncher;
 use crate::metrics::FeedLatencyTracker;
+use crate::trusted_l2::{
+    Comparison, HeaderObservation, POLL_INTERVAL, TrustedL2Monitor, first_unchecked_height,
+};
 use crate::{
     ARB_ONE_CHAIN_ID, ArbNode, L1ResumeLog, arb_chain_spec, arbos_init_from_chain_config_json,
     arbos_init_from_parsed,
@@ -144,6 +147,10 @@ pub struct ArbNodeArgs {
     /// transaction executes. An enclosing block can still fail before becoming canonical.
     #[arg(long = "mev-tx-log-ipc", value_name = "PATH")]
     mev_tx_log_ipc: Option<PathBuf>,
+
+    /// Trusted L2 JSON-RPC endpoint used to stop this node if its durable tip diverges.
+    #[arg(long = "canonical-l2-rpc", value_name = "URL")]
+    canonical_l2_rpc: Option<String>,
 
     /// Live sequencer-feed relay to follow, e.g. `ws://127.0.0.1:9642` (a nitro-testnode) or
     /// `wss://arb1.arbitrum.io/feed` (Arbitrum One). Repeat the option to race distinct relays. The
@@ -318,6 +325,24 @@ where
     Ok(provider
         .sealed_header(block)?
         .map(|header| u64::from_be_bytes(header.nonce.0)))
+}
+
+fn durable_header_at<P>(provider: &P, number: u64) -> eyre::Result<Option<HeaderObservation>>
+where
+    P: HeaderProvider<Header = alloy_consensus::Header>,
+{
+    Ok(provider.sealed_header(number)?.map(|header| HeaderObservation {
+        number,
+        hash: header.hash(),
+        state_root: header.state_root,
+    }))
+}
+
+fn durable_header<P>(provider: &P) -> eyre::Result<Option<HeaderObservation>>
+where
+    P: BlockNumReader + HeaderProvider<Header = alloy_consensus::Header>,
+{
+    durable_header_at(provider, provider.last_block_number()?)
 }
 
 /// Resolve the rollup deployment from the CLI, with Nitro-like set/unset semantics:
@@ -656,6 +681,12 @@ async fn launch(
     } = bootstrap;
 
     let data_dir = builder.config().datadir();
+    let trusted_l2_monitor = match args.canonical_l2_rpc.as_deref() {
+        Some(rpc_url) => Some(
+            TrustedL2Monitor::start(data_dir.data_dir(), rpc_url, effective_chain_id).await?,
+        ),
+        None => None,
+    };
 
     // Resolve the L1-derivation resume log path before `data_dir` is moved into the launcher.
     let resume_checkpoint_path = L1ResumeLog::path_in(data_dir.data_dir());
@@ -705,6 +736,91 @@ async fn launch(
             ipc.serve(shutdown).await;
         });
         info!(target: "arb-reth::mev", path = %path.display(), "MEV transaction-log IPC listening");
+    }
+
+    let (trusted_l2_fatal_tx, trusted_l2_fatal_rx) = tokio::sync::oneshot::channel::<eyre::Report>();
+    if let Some(monitor) = trusted_l2_monitor {
+        let provider = handle.provider.clone();
+        task_executor.spawn_with_graceful_shutdown_signal(|mut shutdown| async move {
+            let mut last_checked: Option<HeaderObservation> = None;
+            let mut poll = tokio::time::interval(POLL_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return,
+                    _ = poll.tick() => {}
+                }
+                let local = match durable_header(&provider) {
+                    Ok(Some(header)) => header,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        let _ = trusted_l2_fatal_tx.send(error);
+                        return;
+                    }
+                };
+                let start = match last_checked {
+                    Some(last) if local.number > last.number => {
+                        match durable_header_at(&provider, last.number) {
+                            Ok(Some(current_last)) if current_last == last => last
+                                .number
+                                .checked_add(1)
+                                .expect("a newer durable tip proves the block number can advance"),
+                            Ok(Some(_)) | Ok(None) => last.number,
+                            Err(error) => {
+                                let _ = trusted_l2_fatal_tx.send(error);
+                                return;
+                            }
+                        }
+                    }
+                    _ => match first_unchecked_height(last_checked, local) {
+                        Ok(Some(number)) => number,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            let _ = trusted_l2_fatal_tx.send(error);
+                            return;
+                        }
+                    },
+                };
+
+                for number in start..=local.number {
+                    let local = if number == local.number {
+                        local
+                    } else {
+                        match durable_header_at(&provider, number) {
+                            Ok(Some(header)) => header,
+                            Ok(None) => {
+                                let _ = trusted_l2_fatal_tx.send(eyre::eyre!(
+                                    "durable L2 header {number} disappeared while monitoring"
+                                ));
+                                return;
+                            }
+                            Err(error) => {
+                                let _ = trusted_l2_fatal_tx.send(error);
+                                return;
+                            }
+                        }
+                    };
+                    let canonical = match monitor.canonical_header(number).await {
+                        Ok(Some(header)) => header,
+                        Ok(None) | Err(_) => {
+                            reth_tracing::tracing::warn!(target: "arb-reth::trusted-l2", block = number, "trusted L2 block unavailable; will retry");
+                            break;
+                        }
+                    };
+                    match monitor.compare_and_record(local, canonical) {
+                        Ok(Comparison::Match) => last_checked = Some(local),
+                        Ok(Comparison::Mismatch) => {
+                            let _ = trusted_l2_fatal_tx
+                                .send(eyre::eyre!("trusted L2 divergence incident recorded"));
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = trusted_l2_fatal_tx.send(error);
+                            return;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     if let Some(feed_path) = args.replay_feed {
@@ -962,6 +1078,7 @@ async fn launch(
     tokio::select! {
         result = handle.wait_for_node_exit() => result,
         Ok(err) = l1_fatal_rx => Err(eyre::eyre!("L1 derivation stopped and cannot resume: {err}")),
+        Ok(err) = trusted_l2_fatal_rx => Err(eyre::eyre!("trusted L2 monitor stopped: {err}")),
     }
 }
 

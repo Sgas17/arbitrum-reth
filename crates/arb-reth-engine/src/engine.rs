@@ -105,8 +105,8 @@ fn sparse_root_hazards(state: &revm::state::EvmState, preserve_created_empty_acc
     hazards
 }
 
-/// A failed engine-tree termination acknowledgement.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// A failed finite-engine shutdown operation.
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ArbEngineShutdownError {
     /// Shutdown was already requested, or the tree input channel was closed before requesting it.
     TerminationChannelClosed,
@@ -115,6 +115,39 @@ pub enum ArbEngineShutdownError {
         timeout: Duration,
         target_block: BlockNumber,
     },
+    /// The persistence-proxy OS thread panicked while terminating.
+    PersistenceProxyThreadPanicked,
+    /// The task owning the persistence-proxy join was cancelled.
+    PersistenceProxyJoinCancelled,
+    /// The engine event-drain task panicked while terminating.
+    EventDrainTaskPanicked,
+    /// The engine event-drain task was cancelled while terminating.
+    EventDrainTaskCancelled,
+    /// The payload-builder OS thread panicked while terminating.
+    PayloadServiceThreadPanicked,
+    /// The task owning the payload-builder thread join was cancelled.
+    PayloadServiceJoinCancelled,
+    /// More than one teardown step failed; the first observed failure is primary.
+    Aggregate {
+        primary: Box<ArbEngineShutdownError>,
+        secondary: Vec<ArbEngineShutdownError>,
+    },
+}
+
+impl ArbEngineShutdownError {
+    fn aggregate(mut errors: Vec<Self>) -> Result<(), Self> {
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.pop().expect("one shutdown error")),
+            _ => {
+                let primary = errors.remove(0);
+                Err(Self::Aggregate {
+                    primary: Box::new(primary),
+                    secondary: errors,
+                })
+            }
+        }
+    }
 }
 
 impl core::fmt::Display for ArbEngineShutdownError {
@@ -130,11 +163,62 @@ impl core::fmt::Display for ArbEngineShutdownError {
                 f,
                 "timed out after {timeout:?} waiting for engine termination at block {target_block}"
             ),
+            Self::PersistenceProxyThreadPanicked => {
+                f.write_str("persistence-proxy thread panicked")
+            }
+            Self::PersistenceProxyJoinCancelled => {
+                f.write_str("persistence-proxy join task was cancelled")
+            }
+            Self::EventDrainTaskPanicked => f.write_str("engine event-drain task panicked"),
+            Self::EventDrainTaskCancelled => f.write_str("engine event-drain task was cancelled"),
+            Self::PayloadServiceThreadPanicked => {
+                f.write_str("payload-builder service thread panicked")
+            }
+            Self::PayloadServiceJoinCancelled => {
+                f.write_str("payload-builder service join task was cancelled")
+            }
+            Self::Aggregate { primary, secondary } => write!(
+                f,
+                "shutdown failed: {primary}; {} additional teardown failure(s)",
+                secondary.len()
+            ),
         }
     }
 }
 
 impl std::error::Error for ArbEngineShutdownError {}
+
+/// A finite engine could not complete construction after persistence began.
+#[derive(Debug)]
+pub enum ArbEngineSpawnError {
+    /// The payload service OS thread could not be spawned after the persistence proxy started.
+    PayloadServiceThreadSpawn { source: std::io::Error },
+    /// The payload thread spawn failed and the explicitly joined persistence proxy also panicked.
+    PayloadServiceThreadSpawnAndPersistenceProxyPanic { source: std::io::Error },
+}
+
+impl core::fmt::Display for ArbEngineSpawnError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::PayloadServiceThreadSpawn { source } => {
+                write!(f, "spawn finite payload service thread: {source}")
+            }
+            Self::PayloadServiceThreadSpawnAndPersistenceProxyPanic { source } => write!(
+                f,
+                "spawn finite payload service thread: {source}; persistence-proxy thread panicked during cleanup"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ArbEngineSpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PayloadServiceThreadSpawn { source }
+            | Self::PayloadServiceThreadSpawnAndPersistenceProxyPanic { source } => Some(source),
+        }
+    }
+}
 
 /// Ensures every driver exit asks the engine tree to flush and release persistence handles.
 struct EngineTerminationGuard {
@@ -184,6 +268,26 @@ async fn shutdown_engine_tree(
             timeout,
             target_block,
         }),
+    }
+}
+
+async fn join_event_drain(
+    event_drain: tokio::task::JoinHandle<()>,
+) -> Result<(), ArbEngineShutdownError> {
+    match event_drain.await {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_panic() => Err(ArbEngineShutdownError::EventDrainTaskPanicked),
+        Err(_) => Err(ArbEngineShutdownError::EventDrainTaskCancelled),
+    }
+}
+
+async fn join_payload_service(
+    payload_service: std::thread::JoinHandle<()>,
+) -> Result<(), ArbEngineShutdownError> {
+    match tokio::task::spawn_blocking(move || payload_service.join()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(ArbEngineShutdownError::PayloadServiceThreadPanicked),
+        Err(_) => Err(ArbEngineShutdownError::PayloadServiceJoinCancelled),
     }
 }
 
@@ -1172,13 +1276,19 @@ where
 {
     provider: BlockchainProvider<N>,
     tip: SealedHeader<Header>,
-    to_tree: ToTree,
+    to_tree: Option<ToTree>,
     // Sends termination on error and panic paths before the persistence proxy is joined.
-    engine_termination_guard: EngineTerminationGuard,
-    // Declared after both tree senders so they drop before this joins the proxy thread.
-    _persistence_proxy_guard: crate::storage_v2::PersistenceProxyGuard,
+    engine_termination_guard: Option<EngineTerminationGuard>,
+    // Taken only after the tree and payload handles have been released.
+    persistence_proxy_guard: Option<crate::storage_v2::PersistenceProxyGuard>,
     /// Reth's local payload-builder service for deterministic ArbOS message payloads.
-    payload_builder: PayloadBuilderHandle<ArbPayloadTypes>,
+    payload_builder: Option<PayloadBuilderHandle<ArbPayloadTypes>>,
+    /// The service owns provider state independently of the driver and must be joined on finite exit.
+    payload_service: Option<std::thread::JoinHandle<()>>,
+    /// Stops only this payload service; it deliberately does not signal the shared runtime.
+    payload_service_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Drains the engine-tree event channel and must observe its closure before finite success.
+    event_drain: Option<tokio::task::JoinHandle<()>>,
     canonical: CanonicalInMemoryState<ArbPrimitives>,
     obs_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, B256)>,
     /// The final FCU for the most recently produced block. Historical catch-up may leave this in
@@ -1235,6 +1345,10 @@ where
         prune_builder: Option<PrunerBuilder>,
         tx_log_stream: Option<ArbTxLogBroadcaster>,
         engine_events: reth_tokio_util::EventSender<ConsensusEngineEvent<ArbPrimitives>>,
+        finite: bool,
+        // These are only enabled by arb-reth-node's cfg(test) finite launcher seams.
+        payload_service_panics: bool,
+        payload_service_spawn_fails: bool,
     ) -> eyre::Result<Self> {
         // ---- persistence service (real MDBX writer; pruner from --prune.* flags) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
@@ -1299,11 +1413,62 @@ where
             generator,
             provider.canonical_state_stream(),
         );
-        runtime.spawn_critical_os_thread(
-            "arb-payload-service",
-            "arb native payload builder service",
-            service,
-        );
+        let (payload_service_shutdown, payload_service_shutdown_rx) =
+            tokio::sync::oneshot::channel();
+        let payload_service_task = async move {
+            if payload_service_panics {
+                panic!("injected payload service panic");
+            }
+            tokio::select! {
+                _ = payload_service_shutdown_rx => {}
+                _ = service => {}
+            }
+        };
+        let payload_service = if finite {
+            // Finite teardown owns this exact OS thread. Do not use Reth's critical-task
+            // wrappers: they report a service panic to the shared runtime and hide it from the
+            // join below. The cloned Handle preserves Tokio context for the payload service.
+            let handle = runtime.handle().clone();
+            let spawn = if payload_service_spawn_fails {
+                Err(std::io::Error::other(
+                    "injected finite payload service spawn failure",
+                ))
+            } else {
+                std::thread::Builder::new()
+                    .name("arb-payload-service".to_owned())
+                    .spawn(move || {
+                        let _entered = handle.enter();
+                        handle.block_on(payload_service_task);
+                    })
+            };
+            match spawn {
+                Ok(payload_service) => payload_service,
+                Err(source) => {
+                    // `persistence` keeps the proxy receiver alive. Drop it before joining the
+                    // proxy, rather than relying on reverse-drop ordering through its Drop impl.
+                    drop(persistence);
+                    return match persistence_proxy_guard.join_blocking() {
+                        Ok(()) => Err(eyre!(ArbEngineSpawnError::PayloadServiceThreadSpawn {
+                            source,
+                        })),
+                        Err(crate::storage_v2::PersistenceProxyJoinError::ThreadPanicked) => {
+                            Err(eyre!(
+                                ArbEngineSpawnError::PayloadServiceThreadSpawnAndPersistenceProxyPanic { source }
+                            ))
+                        }
+                        Err(crate::storage_v2::PersistenceProxyJoinError::JoinTaskCancelled) => {
+                            unreachable!("blocking persistence proxy join cannot be cancelled")
+                        }
+                    };
+                }
+            }
+        } else {
+            runtime.spawn_critical_os_thread(
+                "arb-payload-service",
+                "arb native payload builder service",
+                payload_service_task,
+            )
+        };
 
         let (to_tree, mut from_tree) = EngineApiTreeHandler::spawn_new(
             provider.clone(),
@@ -1323,7 +1488,7 @@ where
         // committed-chain events: `CanonicalBlockAdded` is emitted when an executed block is
         // inserted as pending and is not proof that RPC-visible canonical state has advanced.
         let (obs_tx, obs_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, B256)>();
-        tokio::spawn(async move {
+        let event_drain = tokio::spawn(async move {
             while let Some(ev) = from_tree.recv().await {
                 if let EngineApiEvent::BeaconConsensus(event) = ev {
                     if let ConsensusEngineEvent::CanonicalChainCommitted(header, _) = &event {
@@ -1340,10 +1505,13 @@ where
         Ok(Self {
             provider,
             tip: genesis_tip,
-            engine_termination_guard: EngineTerminationGuard::new(to_tree.clone()),
-            to_tree,
-            _persistence_proxy_guard: persistence_proxy_guard,
-            payload_builder,
+            engine_termination_guard: Some(EngineTerminationGuard::new(to_tree.clone())),
+            to_tree: Some(to_tree),
+            persistence_proxy_guard: Some(persistence_proxy_guard),
+            payload_builder: Some(payload_builder),
+            payload_service: Some(payload_service),
+            payload_service_shutdown: Some(payload_service_shutdown),
+            event_drain: Some(event_drain),
             canonical,
             obs_rx,
             pending_applied: None,
@@ -1463,7 +1631,11 @@ where
         msg: &BroadcastFeedMessage,
         started_at: Instant,
     ) -> eyre::Result<(B256, Option<(u64, ArbAppliedMessageTiming)>)> {
-        let payload_builder = self.payload_builder.clone();
+        let payload_builder = self
+            .payload_builder
+            .as_ref()
+            .expect("payload builder is present while driver is running")
+            .clone();
         let parent = self.tip.hash();
         let phase_started_at = Instant::now();
         let attributes = self.native_payload_attributes(msg);
@@ -1474,6 +1646,8 @@ where
         let payload_job_started_at = Instant::now();
         let (fcu_tx, fcu_rx) = tokio::sync::oneshot::channel();
         self.to_tree
+            .as_ref()
+            .expect("engine tree sender is present while driver is running")
             .send(FromEngine::Request(EngineApiRequest::Beacon(
                 BeaconEngineMessage::ForkchoiceUpdated {
                     state: alloy_rpc_types_engine::ForkchoiceState {
@@ -1573,6 +1747,8 @@ where
         let engine_handoff_started_at = Instant::now();
         let phase_started_at = Instant::now();
         self.to_tree
+            .as_ref()
+            .expect("engine tree sender is present while driver is running")
             .send(FromEngine::Request(EngineApiRequest::InsertExecutedBlock(
                 built,
             )))
@@ -1588,6 +1764,8 @@ where
             finalized_block_hash: B256::ZERO,
         };
         self.to_tree
+            .as_ref()
+            .expect("engine tree sender is present while driver is running")
             .send(FromEngine::Request(EngineApiRequest::Beacon(
                 BeaconEngineMessage::ForkchoiceUpdated {
                     state: fcu_state,
@@ -1940,14 +2118,60 @@ where
         self.canonical.clone()
     }
 
-    /// Ask the engine tree to persist its in-memory tail and terminate.
-    pub async fn shutdown(&self) -> Result<(), ArbEngineShutdownError> {
-        shutdown_engine_tree(
-            &self.engine_termination_guard,
+    /// Persist the in-memory tail, then release and join every engine-owned finite resource.
+    pub async fn shutdown(mut self) -> Result<(), ArbEngineShutdownError> {
+        const TREE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+        let mut errors = Vec::new();
+
+        // The acknowledgement is bounded, but failure cannot short-circuit teardown: every
+        // resource below may still own provider state after a closed or timed-out tree request.
+        if let Err(error) = shutdown_engine_tree(
+            self.engine_termination_guard
+                .as_ref()
+                .expect("engine termination guard is present before shutdown"),
             self.tip.number,
-            Duration::from_secs(10),
+            TREE_ACK_TIMEOUT,
         )
         .await
+        {
+            errors.push(error);
+        }
+
+        // Release all senders before joins. The private payload stop deliberately does not touch
+        // the shared Runtime, so ordinary serving behavior remains unchanged.
+        drop(self.payload_builder.take());
+        let _ = self
+            .payload_service_shutdown
+            .take()
+            .expect("payload service shutdown sender is present before shutdown")
+            .send(());
+        drop(self.to_tree.take());
+        drop(self.engine_termination_guard.take());
+
+        if let Some(persistence_proxy_guard) = self.persistence_proxy_guard.take()
+            && let Err(error) = persistence_proxy_guard.join().await
+        {
+            errors.push(match error {
+                crate::storage_v2::PersistenceProxyJoinError::ThreadPanicked => {
+                    ArbEngineShutdownError::PersistenceProxyThreadPanicked
+                }
+                crate::storage_v2::PersistenceProxyJoinError::JoinTaskCancelled => {
+                    ArbEngineShutdownError::PersistenceProxyJoinCancelled
+                }
+            });
+        }
+        if let Some(event_drain) = self.event_drain.take()
+            && let Err(error) = join_event_drain(event_drain).await
+        {
+            errors.push(error);
+        }
+        if let Some(payload_service) = self.payload_service.take()
+            && let Err(error) = join_payload_service(payload_service).await
+        {
+            errors.push(error);
+        }
+
+        ArbEngineShutdownError::aggregate(errors)
     }
 }
 
@@ -2007,6 +2231,30 @@ mod termination_tests {
             Err(ArbEngineShutdownError::TimedOut {
                 timeout,
                 target_block: 9,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_event_drain_panic() {
+        let event_drain = tokio::spawn(async { panic!("event drain panic") });
+
+        assert_eq!(
+            join_event_drain(event_drain).await,
+            Err(ArbEngineShutdownError::EventDrainTaskPanicked)
+        );
+    }
+
+    #[test]
+    fn shutdown_aggregates_primary_and_secondary_failures() {
+        assert_eq!(
+            ArbEngineShutdownError::aggregate(vec![
+                ArbEngineShutdownError::TerminationChannelClosed,
+                ArbEngineShutdownError::PersistenceProxyThreadPanicked,
+            ]),
+            Err(ArbEngineShutdownError::Aggregate {
+                primary: Box::new(ArbEngineShutdownError::TerminationChannelClosed),
+                secondary: vec![ArbEngineShutdownError::PersistenceProxyThreadPanicked],
             })
         );
     }

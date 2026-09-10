@@ -722,7 +722,7 @@ async fn launch(
         tx_log_stream: mev_tx_log_ipc.as_ref().map(MevTxLogIpc::broadcaster),
     };
 
-    let handle = node_builder.launch_with(launcher).await?;
+    let mut handle = node_builder.launch_with(launcher).await?;
 
     match handle.http_url() {
         Some(url) => info!(target: "arb-reth", %url, "arb-reth node started; eth_* RPC serving"),

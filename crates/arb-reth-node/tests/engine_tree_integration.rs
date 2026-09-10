@@ -96,11 +96,7 @@ mod tests {
         factory
     }
 
-    async fn drive_replay_native(
-        factory: TestFactory,
-        chain_id: u64,
-        tuning: ArbEngineTuning,
-    ) {
+    async fn drive_replay_native(factory: TestFactory, chain_id: u64, tuning: ArbEngineTuning) {
         const TARGET: u64 = 17;
         const FEED: &str = include_str!("../tests/fixtures/testnode_feed_seq0_17.ndjson");
         const BLOCKS: &str = include_str!("../tests/fixtures/testnode_blocks_0_17.json");
@@ -130,6 +126,9 @@ mod tests {
             None,
             None,
             reth_tokio_util::EventSender::default(),
+            true,
+            false,
+            false,
         )
         .expect("spawn native payload driver");
 

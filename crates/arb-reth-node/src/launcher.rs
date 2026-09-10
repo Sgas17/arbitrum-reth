@@ -12,6 +12,7 @@
 use core::{future::Future, pin::Pin};
 use std::{
     collections::VecDeque,
+    panic::AssertUnwindSafe,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -23,7 +24,7 @@ use alloy_consensus::Header;
 use arbitrum_alloy_consensus::reth::ArbPrimitives;
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::eyre;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
 use reth_evm::ConfigureEvm;
@@ -47,7 +48,10 @@ use reth_storage_api::{
 };
 use reth_storage_overlay::OverlayManager;
 use reth_tasks::TaskExecutor;
-use tokio::sync::oneshot;
+use tokio::{
+    sync::{Notify, oneshot},
+    task::JoinHandle,
+};
 
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, reth::ArbBlock};
 
@@ -60,7 +64,15 @@ use arb_reth_engine::{ArbEngineDriver, ArbEngineTuning, ArbTxLogBroadcaster};
 pub struct ArbNodeHandle<P> {
     /// The blockchain provider: cloneable and queryable.
     pub provider: P,
-    exit_rx: oneshot::Receiver<eyre::Result<()>>,
+    exit_rx: Option<oneshot::Receiver<eyre::Result<()>>>,
+    /// Shared, cancellation-safe completion published by the finite supervisor owner.
+    finite_completion: Option<Arc<FiniteCompletion>>,
+    /// Retains the independent owner task as a panic/cancellation diagnostic.
+    ///
+    /// This task exclusively owns and awaits the raw finite-supervisor join handle. Public
+    /// completion never awaits or takes this handle, so cancelling a public wait cannot detach
+    /// the consuming shutdown owner.
+    _finite_supervisor_owner: Option<JoinHandle<()>>,
     /// Running RPC server handle. Dropping this shuts down the HTTP server.
     pub rpc_handle: Option<RpcServerHandle>,
     finite_frontier: Option<u64>,
@@ -73,13 +85,30 @@ pub struct ArbNodeHandle<P> {
 /// receiver, rejecting retained producers and discarding their queued tail.
 struct FiniteInputClose {
     closed: Arc<AtomicBool>,
-    close_tx: oneshot::Sender<()>,
+    close_tx: Option<oneshot::Sender<()>>,
 }
 
 impl FiniteInputClose {
-    fn close(self) {
+    fn close(&mut self) {
         self.closed.store(true, Ordering::Release);
-        let _ = self.close_tx.send(());
+        if let Some(close_tx) = self.close_tx.take() {
+            let _ = close_tx.send(());
+        }
+    }
+}
+
+impl Drop for FiniteInputClose {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Closes finite input if a public completion future is cancelled before its explicit close.
+struct FiniteInputCloseGuard<'a>(&'a mut FiniteInputClose);
+
+impl Drop for FiniteInputCloseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -88,25 +117,167 @@ struct FiniteInputCloseReceiver {
     close_rx: oneshot::Receiver<()>,
 }
 
+/// A finite supervisor result that remains awaitable when any public waiter is cancelled.
+///
+/// Success is repeat-observable. A typed failure is deliberately consumed only after completion,
+/// preserving its downcastable `eyre::Report`; a later wait reports that the completed failure was
+/// already observed. There is no cancellation point between taking that completed failure and
+/// returning it.
+struct FiniteCompletion {
+    state: std::sync::Mutex<FiniteCompletionState>,
+    notify: Notify,
+}
+
+enum FiniteCompletionState {
+    Pending,
+    Succeeded,
+    Failed(eyre::Report),
+    FailedAlreadyObserved,
+}
+
+impl FiniteCompletion {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(FiniteCompletionState::Pending),
+            notify: Notify::new(),
+        }
+    }
+
+    fn complete(&self, result: eyre::Result<()>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = match result {
+            Ok(()) => FiniteCompletionState::Succeeded,
+            Err(error) => FiniteCompletionState::Failed(error),
+        };
+        drop(state);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) -> eyre::Result<()> {
+        loop {
+            let mut notified = std::pin::pin!(self.notify.notified());
+            // Register before observing pending state so `notify_waiters` cannot race this wait.
+            notified.as_mut().enable();
+            let result = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match &mut *state {
+                    FiniteCompletionState::Pending => None,
+                    FiniteCompletionState::Succeeded => Some(Ok(())),
+                    FiniteCompletionState::FailedAlreadyObserved => {
+                        Some(Err(eyre!("finite completion failure was already observed")))
+                    }
+                    FiniteCompletionState::Failed(_) => {
+                        let FiniteCompletionState::Failed(error) = std::mem::replace(
+                            &mut *state,
+                            FiniteCompletionState::FailedAlreadyObserved,
+                        ) else {
+                            unreachable!("finite completion state changed while locked");
+                        };
+                        Some(Err(error))
+                    }
+                }
+            };
+            if let Some(result) = result {
+                return result;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Launcher behavior for ordinary serving nodes and bounded recovery execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum ArbLaunchMode {
     /// The ordinary node: arbitrate live-feed and L1 inputs and honor configured RPC/metrics.
     Ordinary,
     /// A non-serving run which accepts only the bounded L1-derived input and stops at `frontier`.
     Finite { frontier: u64 },
+    /// Test-only finite launch whose payload service panics before it begins serving requests.
+    #[cfg(test)]
+    FiniteInjectedPayloadServicePanic { frontier: u64 },
+    /// Test-only finite launch whose payload-service OS-thread spawn fails after persistence starts.
+    #[cfg(test)]
+    FiniteInjectedPayloadServiceSpawnFailure { frontier: u64 },
+    /// Test-only finite launch whose teardown pauses after input closure.
+    #[cfg(test)]
+    FiniteTeardownGated {
+        frontier: u64,
+        gate: FiniteTeardownGate,
+    },
 }
 
-impl ArbLaunchMode {
-    const fn frontier(self) -> Option<u64> {
-        match self {
-            Self::Ordinary => None,
-            Self::Finite { frontier } => Some(frontier),
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct FiniteTeardownGate {
+    teardown_started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(test)]
+impl Default for FiniteTeardownGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl FiniteTeardownGate {
+    pub fn new() -> Self {
+        Self {
+            teardown_started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
         }
     }
 
-    const fn is_serving(self) -> bool {
+    pub async fn wait_for_teardown(&self) {
+        self.teardown_started.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl ArbLaunchMode {
+    const fn frontier(&self) -> Option<u64> {
+        match self {
+            Self::Ordinary => None,
+            Self::Finite { frontier } => Some(*frontier),
+            #[cfg(test)]
+            Self::FiniteInjectedPayloadServicePanic { frontier } => Some(*frontier),
+            #[cfg(test)]
+            Self::FiniteInjectedPayloadServiceSpawnFailure { frontier } => Some(*frontier),
+            #[cfg(test)]
+            Self::FiniteTeardownGated { frontier, .. } => Some(*frontier),
+        }
+    }
+
+    const fn is_serving(&self) -> bool {
         matches!(self, Self::Ordinary)
+    }
+
+    #[cfg(test)]
+    const fn inject_payload_service_panic(&self) -> bool {
+        matches!(self, Self::FiniteInjectedPayloadServicePanic { .. })
+    }
+
+    #[cfg(test)]
+    const fn inject_payload_service_spawn_failure(&self) -> bool {
+        matches!(self, Self::FiniteInjectedPayloadServiceSpawnFailure { .. })
+    }
+
+    #[cfg(test)]
+    fn teardown_gate(&self) -> Option<FiniteTeardownGate> {
+        match self {
+            Self::FiniteTeardownGated { gate, .. } => Some(gate.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -172,7 +343,7 @@ enum EngineHandoffAdmission {
 }
 
 fn admit_engine_handoff(
-    mode: ArbLaunchMode,
+    mode: &ArbLaunchMode,
     sequence_number: u64,
     genesis_block: u64,
 ) -> Result<EngineHandoffAdmission, EngineHandoffAdmissionError> {
@@ -185,31 +356,48 @@ fn admit_engine_handoff(
     match mode {
         ArbLaunchMode::Ordinary => Ok(EngineHandoffAdmission::Admitted { block_number }),
         ArbLaunchMode::Finite { frontier } => {
-            if frontier < genesis_block {
-                return Err(EngineHandoffAdmissionError::FrontierBelowGenesis {
-                    frontier,
-                    genesis_block,
-                });
-            }
-            if block_number > frontier {
-                Ok(EngineHandoffAdmission::RejectedAboveFrontier {
-                    block_number,
-                    frontier,
-                })
-            } else {
-                Ok(EngineHandoffAdmission::Admitted { block_number })
-            }
+            finite_handoff_admission(block_number, *frontier, genesis_block)
+        }
+        #[cfg(test)]
+        ArbLaunchMode::FiniteInjectedPayloadServicePanic { frontier }
+        | ArbLaunchMode::FiniteInjectedPayloadServiceSpawnFailure { frontier } => {
+            finite_handoff_admission(block_number, *frontier, genesis_block)
+        }
+        #[cfg(test)]
+        ArbLaunchMode::FiniteTeardownGated { frontier, .. } => {
+            finite_handoff_admission(block_number, *frontier, genesis_block)
         }
     }
 }
 
+fn finite_handoff_admission(
+    block_number: u64,
+    frontier: u64,
+    genesis_block: u64,
+) -> Result<EngineHandoffAdmission, EngineHandoffAdmissionError> {
+    if frontier < genesis_block {
+        return Err(EngineHandoffAdmissionError::FrontierBelowGenesis {
+            frontier,
+            genesis_block,
+        });
+    }
+    if block_number > frontier {
+        Ok(EngineHandoffAdmission::RejectedAboveFrontier {
+            block_number,
+            frontier,
+        })
+    } else {
+        Ok(EngineHandoffAdmission::Admitted { block_number })
+    }
+}
+
 fn finite_max_sequence(
-    mode: ArbLaunchMode,
+    mode: &ArbLaunchMode,
     genesis_block: u64,
 ) -> Result<Option<u64>, EngineHandoffAdmissionError> {
-    match mode {
-        ArbLaunchMode::Ordinary => Ok(None),
-        ArbLaunchMode::Finite { frontier } => frontier.checked_sub(genesis_block).map(Some).ok_or(
+    match mode.frontier() {
+        None => Ok(None),
+        Some(frontier) => frontier.checked_sub(genesis_block).map(Some).ok_or(
             EngineHandoffAdmissionError::FrontierBelowGenesis {
                 frontier,
                 genesis_block,
@@ -229,13 +417,19 @@ fn next_driver_sequence(tip: u64, genesis_block: u64) -> Result<u64, EngineHando
 
 impl<P> ArbNodeHandle<P> {
     /// Wait for the driver task to exit, returning its result.
-    pub async fn wait_for_node_exit(self) -> eyre::Result<()> {
-        self.exit_rx.await?
+    pub async fn wait_for_node_exit(&mut self) -> eyre::Result<()> {
+        if let Some(completion) = &self.finite_completion {
+            return completion.wait().await;
+        }
+        self.exit_rx
+            .take()
+            .ok_or_else(|| eyre!("node exit wait requested after completion"))?
+            .await?
     }
 
     /// Wait for a finite run to flush and verify its durable tip is exactly the requested frontier.
     pub async fn wait_for_finite_execution(
-        self,
+        &mut self,
     ) -> eyre::Result<crate::trusted_l2::HeaderObservation>
     where
         P: Clone + BlockNumReader + HeaderProvider<Header = Header>,
@@ -265,7 +459,7 @@ impl<P> ArbNodeHandle<P> {
     /// verify the durable provider tip. Completion is deliberately separate from the producer:
     /// retained producer clones cannot keep the finite engine alive or extend its boundary.
     pub async fn finish_finite_l1_execution<F>(
-        mut self,
+        &mut self,
         derivation: F,
     ) -> eyre::Result<crate::trusted_l2::HeaderObservation>
     where
@@ -275,20 +469,34 @@ impl<P> ArbNodeHandle<P> {
         let frontier = self
             .finite_frontier
             .ok_or_else(|| eyre!("finite execution completion requested from ordinary launcher"))?;
-        match derivation.await.map_err(|error| eyre!(error))? {
-            arb_reth_sync::L1SyncCompletion::FrontierReached { frontier: reached }
-                if reached == frontier => {}
-            completion => {
-                return Err(eyre!(
+        let derivation_result = {
+            let close = self
+                .finite_input_close
+                .as_mut()
+                .ok_or_else(|| eyre!("finite input close requested from ordinary launcher"))?;
+            let close_guard = FiniteInputCloseGuard(close);
+            let result = match derivation.await.map_err(|error| eyre!(error)) {
+                Ok(arb_reth_sync::L1SyncCompletion::FrontierReached { frontier: reached })
+                    if reached == frontier =>
+                {
+                    Ok(())
+                }
+                Ok(completion) => Err(eyre!(
                     "finite derivation completed without requested frontier {frontier}: {completion:?}"
-                ));
-            }
+                )),
+                Err(error) => Err(error),
+            };
+            drop(close_guard);
+            result
+        };
+        let teardown = self.wait_for_finite_execution().await;
+        match (derivation_result, teardown) {
+            (Ok(()), result) => result,
+            (Err(primary), Ok(_)) => Err(primary),
+            (Err(primary), Err(teardown)) => Err(eyre!(
+                "finite derivation failed: {primary}; finite teardown also failed: {teardown}"
+            )),
         }
-        self.finite_input_close
-            .take()
-            .ok_or_else(|| eyre!("finite input close requested from ordinary launcher"))?
-            .close();
-        self.wait_for_finite_execution().await
     }
 
     /// Returns the HTTP URL of the running RPC server, or `None` if RPC was not enabled.
@@ -813,13 +1021,22 @@ impl ArbLauncher {
             })
             .flatten();
 
-        // Validate every fallible finite invariant before starting any engine task. From the
-        // successful `spawn` below through returning the handle, finite mode performs no
-        // fallible operation; therefore a launch error cannot strand a finite task.
-        let finite_max_sequence = finite_max_sequence(mode, genesis_block)?;
+        // Validate every fallible finite invariant before starting engine tasks. The only
+        // remaining fallible construction is driver spawn, which explicitly releases and joins
+        // persistence before it returns an error.
+        let finite_frontier = mode.frontier();
+        let finite_max_sequence = finite_max_sequence(&mode, genesis_block)?;
 
         // Stand up reth's engine tree (Tier-1 `InsertExecutedBlock` seam) and drive the
         // sequencer feed through it. Persistence to MDBX is async (tree background service).
+        #[cfg(not(test))]
+        let payload_service_panics = false;
+        #[cfg(test)]
+        let payload_service_panics = mode.inject_payload_service_panic();
+        #[cfg(not(test))]
+        let payload_service_spawn_fails = false;
+        #[cfg(test)]
+        let payload_service_spawn_fails = mode.inject_payload_service_spawn_failure();
         let mut driver: ArbEngineDriver<NodeTypesWithDBAdapter<N, DB>> = ArbEngineDriver::spawn(
             provider_factory,
             provider.clone(),
@@ -833,32 +1050,37 @@ impl ArbLauncher {
             prune_builder,
             serving.then_some(tx_log_stream).flatten(),
             engine_events.clone(),
+            !serving,
+            payload_service_panics,
+            payload_service_spawn_fails,
         )?;
 
-        let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
         let mut scheduler = if serving {
             IngressScheduler::new(feed_messages, l1_messages)
         } else {
             drop(feed_messages);
             IngressScheduler::l1_only(l1_messages)
         };
-        let (finite_input_close, mut finite_input_close_rx) = match mode {
-            ArbLaunchMode::Finite { .. } => {
-                let closed = Arc::new(AtomicBool::new(false));
-                let (close_tx, close_rx) = oneshot::channel();
-                (
-                    Some(FiniteInputClose {
-                        closed: Arc::clone(&closed),
-                        close_tx,
-                    }),
-                    Some(FiniteInputCloseReceiver { closed, close_rx }),
-                )
-            }
-            ArbLaunchMode::Ordinary => (None, None),
+        let (finite_input_close, mut finite_input_close_rx) = if mode.is_serving() {
+            (None, None)
+        } else {
+            let closed = Arc::new(AtomicBool::new(false));
+            let (close_tx, close_rx) = oneshot::channel();
+            (
+                Some(FiniteInputClose {
+                    closed: Arc::clone(&closed),
+                    close_tx: Some(close_tx),
+                }),
+                Some(FiniteInputCloseReceiver { closed, close_rx }),
+            )
         };
 
-        task_executor.spawn_critical_task("arb-engine-driver", async move {
-            let res: eyre::Result<()> = async {
+        #[cfg(test)]
+        let teardown_gate = mode.teardown_gate();
+        let supervise_driver = async move {
+            // Critical-task supervision alone drops the driver when this future panics. Catch it
+            // here so the owned driver is always consumed through its finite teardown path.
+            let drive = AssertUnwindSafe(async {
                 // Periodically summarize progress while distinguishing source wait from local
                 // production. Per-block and per-payload details remain available at DEBUG.
                 let mut status_recv_us: u128 = 0;
@@ -937,7 +1159,7 @@ impl ArbLauncher {
                         // already-selected batch cannot hand frontier + 1 to the engine, even if
                         // typed completion closes the receiver concurrently.
                         let EngineHandoffAdmission::Admitted { .. } = admit_engine_handoff(
-                            mode,
+                            &mode,
                             msg.sequence_number,
                             genesis_block,
                         )?
@@ -990,12 +1212,57 @@ impl ArbLauncher {
 
                     scheduler.complete_batch(source, kind);
                 }
-                driver.shutdown().await.map_err(|error| eyre!(error))?;
                 Ok(())
-            }
+            })
+            .catch_unwind()
             .await;
-            let _ = exit_tx.send(res); // ignore error if receiver was dropped
-        });
+            let res = match drive {
+                Ok(res) => res,
+                Err(_) => Err(eyre!("arb engine driver task panicked")),
+            };
+            #[cfg(test)]
+            if let Some(gate) = teardown_gate {
+                gate.teardown_started.notify_one();
+                gate.release.notified().await;
+            }
+            let shutdown = driver.shutdown().await.map_err(|error| eyre!(error));
+            match (res, shutdown) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(drive), Ok(())) => Err(drive),
+                (Ok(()), Err(shutdown)) => Err(shutdown),
+                (Err(drive), Err(shutdown)) => Err(eyre!(
+                    "engine drive failed: {drive}; shutdown also failed: {shutdown}"
+                )),
+            }
+        };
+        let (exit_rx, finite_supervisor_owner, finite_completion) = if serving {
+            let (exit_tx, exit_rx) = oneshot::channel();
+            task_executor.spawn_critical_task("arb-engine-driver", async move {
+                let _ = exit_tx.send(supervise_driver.await);
+            });
+            (Some(exit_rx), None, None)
+        } else {
+            // The raw supervisor owns `driver.shutdown()` and is moved exclusively into this
+            // independent owner task. The owner publishes only after awaiting that raw handle;
+            // public waits observe the shared completion and never take either join handle.
+            let finite_completion = Arc::new(FiniteCompletion::new());
+            let finite_supervisor = task_executor.handle().spawn(supervise_driver);
+            let completion = Arc::clone(&finite_completion);
+            let finite_supervisor_owner = task_executor.handle().spawn(async move {
+                let result = AssertUnwindSafe(async {
+                    finite_supervisor
+                        .await
+                        .map_err(|error| eyre!("finite driver supervisor failed: {error}"))?
+                })
+                .catch_unwind()
+                .await;
+                completion.complete(match result {
+                    Ok(result) => result,
+                    Err(_) => Err(eyre!("finite driver supervisor owner panicked")),
+                });
+            });
+            (None, Some(finite_supervisor_owner), Some(finite_completion))
+        };
 
         // Serve RPC through reth's canonical `RpcAddOns::launch_add_ons` (full fleet + ws +
         // subscriptions via `NodeConfig.rpc`), not the bespoke server. This node is self-driven
@@ -1038,8 +1305,10 @@ impl ArbLauncher {
         Ok(ArbNodeHandle {
             provider,
             exit_rx,
+            finite_completion,
+            _finite_supervisor_owner: finite_supervisor_owner,
             rpc_handle,
-            finite_frontier: mode.frontier(),
+            finite_frontier,
             finite_input_close,
         })
     }
@@ -1213,7 +1482,7 @@ mod tests {
             .iter()
             .map(|message| {
                 admit_engine_handoff(
-                    ArbLaunchMode::Finite { frontier: 4 },
+                    &ArbLaunchMode::Finite { frontier: 4 },
                     message.sequence_number,
                     0,
                 )
@@ -1236,14 +1505,14 @@ mod tests {
     #[test]
     fn finite_admission_reports_invalid_u64_domain() {
         assert_eq!(
-            admit_engine_handoff(ArbLaunchMode::Finite { frontier: 3 }, 0, 4),
+            admit_engine_handoff(&ArbLaunchMode::Finite { frontier: 3 }, 0, 4),
             Err(EngineHandoffAdmissionError::FrontierBelowGenesis {
                 frontier: 3,
                 genesis_block: 4,
             })
         );
         assert_eq!(
-            admit_engine_handoff(ArbLaunchMode::Finite { frontier: u64::MAX }, 1, u64::MAX),
+            admit_engine_handoff(&ArbLaunchMode::Finite { frontier: u64::MAX }, 1, u64::MAX),
             Err(EngineHandoffAdmissionError::SequenceNumberOverflow {
                 sequence_number: 1,
                 genesis_block: u64::MAX,
@@ -1366,7 +1635,7 @@ mod tests {
             tx_log_stream: None,
         };
 
-        let handle = launcher
+        let mut handle = launcher
             .launch_node(node_builder_with_components)
             .await
             .expect("launch must succeed");
@@ -1487,7 +1756,7 @@ mod tests {
             feed_latency: None,
             tx_log_stream: None,
         };
-        let handle = launcher
+        let mut handle = launcher
             .launch_node(node_builder_with_components)
             .await
             .expect("launch must succeed");

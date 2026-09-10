@@ -30,8 +30,8 @@ mod storage_v2;
 mod tx_log_stream;
 
 pub use engine::{
-    ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineShutdownError, ArbEngineTuning,
-    wait_for_head,
+    ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineShutdownError, ArbEngineSpawnError,
+    ArbEngineTuning, wait_for_head,
 };
 pub use engine_spike::ArbPayloadValidator;
 pub use native_payload::ArbPayloadBuilder;

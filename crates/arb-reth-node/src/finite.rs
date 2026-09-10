@@ -14,6 +14,8 @@ use reth_provider::{BlockNumReader, HeaderProvider};
 use reth_tasks::TaskExecutor;
 
 use crate::launcher::ArbLaunchMode;
+#[cfg(test)]
+use crate::launcher::FiniteTeardownGate;
 use crate::trusted_l2::HeaderObservation;
 use crate::{
     ArbEngineTuning, ArbLauncher, ArbNode, L1ResumeCheckpoint, L1SyncConfig, L1SyncError,
@@ -217,7 +219,7 @@ pub async fn run_stopped_finite(
         feed_latency: None,
         tx_log_stream: None,
     };
-    let handle = node_builder.launch_with(launcher).await?;
+    let mut handle = node_builder.launch_with(launcher).await?;
     let provider = handle.provider.clone();
     let persisted_tip = move || {
         provider
@@ -243,6 +245,11 @@ mod tests {
     use arb_revm::arbos_init::ArbosInitConfig;
     use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
     use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments};
+    use reth_node_types::NodeTypesWithDBAdapter;
+    use reth_provider::{
+        BlockNumReader, ProviderFactory,
+        providers::{RocksDBProvider, StaticFileProvider},
+    };
 
     use crate::L1SyncCompletion;
     use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
@@ -282,11 +289,8 @@ mod tests {
             feed_latency: None,
             tx_log_stream: None,
         };
-        node_builder
-            .launch_with(launcher)
-            .await?
-            .finish_finite_l1_execution(producer(l1_tx))
-            .await
+        let mut handle = node_builder.launch_with(launcher).await?;
+        handle.finish_finite_l1_execution(producer(l1_tx)).await
     }
 
     fn boot() -> ResolvedRollupBoot {
@@ -427,6 +431,44 @@ mod tests {
         .expect("persist fixture checkpoint");
         assert_eq!(checkpoint.number, CHECKPOINT);
 
+        // The first completion must release all engine-owned provider handles before a separate
+        // production provider can reopen the MDBX/static-files/RocksDB paths.
+        drop(db);
+        let reopened_db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("immediately reopen MDBX after first finite completion");
+        let reopened_static_files = StaticFileProvider::<
+            arbitrum_alloy_consensus::reth::ArbPrimitives,
+        >::read_write(static_files_path.clone())
+        .expect("immediately reopen static files after first finite completion");
+        let reopened_rocksdb = RocksDBProvider::builder(datadir.join("rocksdb"))
+            .with_default_tables()
+            .build()
+            .expect("immediately reopen RocksDB after first finite completion");
+        let reopened: ProviderFactory<NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>> =
+            ProviderFactory::new(
+                reopened_db,
+                testnode_chain_spec(),
+                reopened_static_files,
+                reopened_rocksdb,
+                runtime.clone(),
+            )
+            .expect("construct production provider after first finite completion");
+        assert_eq!(
+            reopened
+                .last_block_number()
+                .expect("read first reopened frontier"),
+            CHECKPOINT
+        );
+        drop(reopened);
+        let db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("reopen MDBX for second finite lifecycle");
+
         // A snapshot boot may use a nonzero imported-genesis floor. This foreign database has a
         // non-genesis checkpoint at 2, but its header at the selected boot floor (1) belongs to
         // the seeded chain, not the resolved boot. Validation must reject it before launch.
@@ -482,11 +524,8 @@ mod tests {
             "pre-start rejection must not begin launch tasks"
         );
 
-        // Terminate the completed launch's remaining Reth tasks before a new lifecycle opens
-        // its RocksDB provider over the durable checkpoint.
-        runtime.graceful_shutdown();
-        drop(runtime);
-        let runtime = Runtime::test();
+        // The first finite completion has already joined its engine-owned services, so the next
+        // lifecycle can immediately reopen the same MDBX/static-file store without runtime shutdown.
 
         let boot = ResolvedRollupBoot {
             chain_spec,
@@ -510,7 +549,7 @@ mod tests {
             frontier: FRONTIER,
         };
         let result = run_stopped_finite_with_producer(
-            StoppedFiniteRethLaunch::new(config, db.clone(), runtime),
+            StoppedFiniteRethLaunch::new(config, db.clone(), runtime.clone()),
             boot,
             finite,
             move |l1_tx| async move {
@@ -533,7 +572,7 @@ mod tests {
         );
         let static_files =
             StaticFileProvider::<arbitrum_alloy_consensus::reth::ArbPrimitives>::read_only(
-                static_files_path,
+                static_files_path.clone(),
             )
             .expect("open durable static files");
         assert!(
@@ -549,6 +588,491 @@ mod tests {
                 .expect("read same-window tail")
                 .is_none(),
             "frontier + 1 tail must not be durable"
+        );
+
+        // No sleep, retry, or runtime-wide shutdown: a fresh production provider opens the exact
+        // MDBX, static-files, and RocksDB paths immediately after finite success.
+        drop(static_files);
+        drop(db);
+        let reopened_db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("immediately reopen MDBX");
+        let reopened_static_files = StaticFileProvider::<
+            arbitrum_alloy_consensus::reth::ArbPrimitives,
+        >::read_write(static_files_path)
+        .expect("immediately reopen static files");
+        let reopened_rocksdb = RocksDBProvider::builder(datadir.join("rocksdb"))
+            .with_default_tables()
+            .build()
+            .expect("immediately reopen RocksDB");
+        let reopened: ProviderFactory<NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>> =
+            ProviderFactory::new(
+                reopened_db,
+                testnode_chain_spec(),
+                reopened_static_files,
+                reopened_rocksdb,
+                runtime.clone(),
+            )
+            .expect("construct production provider over finite store");
+        assert_eq!(
+            reopened
+                .last_block_number()
+                .expect("read reopened frontier"),
+            FRONTIER
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finite_payload_service_panic_is_typed_and_releases_all_resources() {
+        let runtime = Runtime::test();
+        let datadir = reth_db::test_utils::tempdir_path();
+        let maybe =
+            reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
+                datadir.clone(),
+            );
+        let chain_spec = testnode_chain_spec();
+        let config = NodeConfig::test()
+            .with_chain(chain_spec.clone())
+            .with_datadir_args(reth_node_core::args::DatadirArgs {
+                datadir: maybe.clone(),
+                ..Default::default()
+            });
+        let data_dir = maybe.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
+        let db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("open injected-panic database");
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
+        drop((feed_tx, l1_tx));
+
+        let error = ArbLauncher {
+            ctx: LaunchContext::new(runtime.clone(), data_dir.clone()),
+            chain_id: 412346,
+            genesis_block: 0,
+            tuning: ArbEngineTuning::reth_defaults(),
+            mode: ArbLaunchMode::FiniteInjectedPayloadServicePanic { frontier: 0 },
+            feed_messages: feed_rx,
+            l1_messages: l1_rx,
+            feed_latency: None,
+            tx_log_stream: None,
+        }
+        .launch_node(
+            NodeBuilder::new(config)
+                .with_database(db.clone())
+                .node(ArbNode),
+        )
+        .await
+        .expect("launch injected-panic finite driver")
+        .finish_finite_l1_execution(async { Ok(L1SyncCompletion::FrontierReached { frontier: 0 }) })
+        .await
+        .expect_err("payload service panic must fail finite execution");
+        assert!(matches!(
+            error.downcast_ref::<arb_reth_engine::ArbEngineShutdownError>(),
+            Some(arb_reth_engine::ArbEngineShutdownError::PayloadServiceThreadPanicked)
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                runtime.on_shutdown_signal().clone(),
+            )
+            .await
+            .is_err(),
+            "finite payload panic must not signal the shared runtime"
+        );
+
+        // The successful immediate reopen proves every finite-owned tree, persistence, event, and
+        // payload-thread owner was consumed before the typed failure was returned.
+        drop(db);
+        let reopened_db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("immediately reopen MDBX after payload panic");
+        let reopened_static_files = StaticFileProvider::<
+            arbitrum_alloy_consensus::reth::ArbPrimitives,
+        >::read_write(data_dir.static_files())
+        .expect("immediately reopen static files after payload panic");
+        let reopened_rocksdb = RocksDBProvider::builder(datadir.join("rocksdb"))
+            .with_default_tables()
+            .build()
+            .expect("immediately reopen RocksDB after payload panic");
+        let reopened: ProviderFactory<NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>> =
+            ProviderFactory::new(
+                reopened_db,
+                chain_spec,
+                reopened_static_files,
+                reopened_rocksdb,
+                runtime,
+            )
+            .expect("construct production provider after payload panic");
+        assert_eq!(
+            reopened
+                .last_block_number()
+                .expect("read reopened genesis frontier"),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finite_payload_service_spawn_failure_joins_persistence_and_releases_storage() {
+        let runtime = Runtime::test();
+        let datadir = reth_db::test_utils::tempdir_path();
+        let maybe =
+            reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
+                datadir.clone(),
+            );
+        let chain_spec = testnode_chain_spec();
+        let config = NodeConfig::test()
+            .with_chain(chain_spec.clone())
+            .with_datadir_args(reth_node_core::args::DatadirArgs {
+                datadir: maybe.clone(),
+                ..Default::default()
+            });
+        let data_dir = maybe.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
+        let db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("open injected-spawn-failure database");
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
+        drop((feed_tx, l1_tx));
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ArbLauncher {
+                ctx: LaunchContext::new(runtime.clone(), data_dir.clone()),
+                chain_id: 412346,
+                genesis_block: 0,
+                tuning: ArbEngineTuning::reth_defaults(),
+                mode: ArbLaunchMode::FiniteInjectedPayloadServiceSpawnFailure { frontier: 0 },
+                feed_messages: feed_rx,
+                l1_messages: l1_rx,
+                feed_latency: None,
+                tx_log_stream: None,
+            }
+            .launch_node(
+                NodeBuilder::new(config)
+                    .with_database(db.clone())
+                    .node(ArbNode),
+            ),
+        )
+        .await
+        .expect("finite spawn failure must return without hanging");
+        let error = match error {
+            Ok(_) => panic!("injected payload-service spawn must fail finite launch"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.downcast_ref::<arb_reth_engine::ArbEngineSpawnError>(),
+            Some(arb_reth_engine::ArbEngineSpawnError::PayloadServiceThreadSpawn { .. })
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("injected finite payload service spawn failure"),
+            "spawn failure classification must be preserved: {error:?}"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                runtime.on_shutdown_signal().clone(),
+            )
+            .await
+            .is_err(),
+            "finite spawn failure must not signal the shared runtime"
+        );
+
+        // Returning from launch is only valid after the persistence proxy has joined; this fresh
+        // production factory immediately reacquires the exact MDBX/static-files/RocksDB paths.
+        drop(db);
+        let reopened_db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("immediately reopen MDBX after payload spawn failure");
+        let reopened_static_files = StaticFileProvider::<
+            arbitrum_alloy_consensus::reth::ArbPrimitives,
+        >::read_write(data_dir.static_files())
+        .expect("immediately reopen static files after payload spawn failure");
+        let reopened_rocksdb = RocksDBProvider::builder(datadir.join("rocksdb"))
+            .with_default_tables()
+            .build()
+            .expect("immediately reopen RocksDB after payload spawn failure");
+        let reopened: ProviderFactory<NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>> =
+            ProviderFactory::new(
+                reopened_db,
+                chain_spec,
+                reopened_static_files,
+                reopened_rocksdb,
+                runtime,
+            )
+            .expect("construct production provider after payload spawn failure");
+        assert_eq!(
+            reopened
+                .last_block_number()
+                .expect("read reopened genesis frontier"),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finite_derivation_error_and_cancelled_completion_release_production_storage() {
+        let runtime = Runtime::test();
+        let datadir = reth_db::test_utils::tempdir_path();
+        let maybe =
+            reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
+                datadir.clone(),
+            );
+        let chain_spec = testnode_chain_spec();
+        let config = NodeConfig::test()
+            .with_chain(chain_spec.clone())
+            .with_datadir_args(reth_node_core::args::DatadirArgs {
+                datadir: maybe.clone(),
+                ..Default::default()
+            });
+        let data_dir = maybe.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
+
+        let db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("open derivation-error database");
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
+        drop((feed_tx, l1_tx));
+        let mut handle = ArbLauncher {
+            ctx: LaunchContext::new(runtime.clone(), data_dir.clone()),
+            chain_id: 412346,
+            genesis_block: 0,
+            tuning: ArbEngineTuning::reth_defaults(),
+            mode: ArbLaunchMode::Finite { frontier: 0 },
+            feed_messages: feed_rx,
+            l1_messages: l1_rx,
+            feed_latency: None,
+            tx_log_stream: None,
+        }
+        .launch_node(
+            NodeBuilder::new(config.clone())
+                .with_database(db.clone())
+                .node(ArbNode),
+        )
+        .await
+        .expect("launch finite driver for derivation error");
+        let error = handle
+            .finish_finite_l1_execution(async {
+                Err(arb_reth_sync::L1SyncError::Provider {
+                    operation: "deterministic-test-error",
+                    detail: "expected derivation failure".into(),
+                })
+            })
+            .await
+            .expect_err("derivation failure must be preserved after teardown");
+        assert!(error.to_string().contains("expected derivation failure"));
+        drop(handle);
+        drop(db);
+        let reopened_db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("immediately reopen MDBX after derivation error");
+        let reopened_static_files = StaticFileProvider::<
+            arbitrum_alloy_consensus::reth::ArbPrimitives,
+        >::read_write(data_dir.static_files())
+        .expect("immediately reopen static files after derivation error");
+        let reopened_rocksdb = RocksDBProvider::builder(datadir.join("rocksdb"))
+            .with_default_tables()
+            .build()
+            .expect("immediately reopen RocksDB after derivation error");
+        let reopened: ProviderFactory<NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>> =
+            ProviderFactory::new(
+                reopened_db,
+                chain_spec.clone(),
+                reopened_static_files,
+                reopened_rocksdb,
+                runtime.clone(),
+            )
+            .expect("construct production provider after derivation error");
+        assert_eq!(
+            reopened.last_block_number().expect("read reopened genesis"),
+            0
+        );
+        drop(reopened);
+
+        let db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("reopen MDBX for cancelled completion");
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
+        drop((feed_tx, l1_tx));
+        let mut handle = ArbLauncher {
+            ctx: LaunchContext::new(runtime.clone(), data_dir.clone()),
+            chain_id: 412346,
+            genesis_block: 0,
+            tuning: ArbEngineTuning::reth_defaults(),
+            mode: ArbLaunchMode::Finite { frontier: 0 },
+            feed_messages: feed_rx,
+            l1_messages: l1_rx,
+            feed_latency: None,
+            tx_log_stream: None,
+        }
+        .launch_node(
+            NodeBuilder::new(config)
+                .with_database(db.clone())
+                .node(ArbNode),
+        )
+        .await
+        .expect("launch finite driver for cancellation");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                handle.finish_finite_l1_execution(std::future::pending()),
+            )
+            .await
+            .is_err(),
+            "completion must be cancelled while derivation is pending"
+        );
+        handle
+            .wait_for_finite_execution()
+            .await
+            .expect("cancelled completion must close input and awaitable teardown");
+        drop(handle);
+        drop(db);
+        let reopened_db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("immediately reopen MDBX after cancelled completion");
+        let reopened_static_files = StaticFileProvider::<
+            arbitrum_alloy_consensus::reth::ArbPrimitives,
+        >::read_write(data_dir.static_files())
+        .expect("immediately reopen static files after cancelled completion");
+        let reopened_rocksdb = RocksDBProvider::builder(datadir.join("rocksdb"))
+            .with_default_tables()
+            .build()
+            .expect("immediately reopen RocksDB after cancelled completion");
+        let reopened: ProviderFactory<NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>> =
+            ProviderFactory::new(
+                reopened_db,
+                chain_spec,
+                reopened_static_files,
+                reopened_rocksdb,
+                runtime,
+            )
+            .expect("construct production provider after cancelled completion");
+        assert_eq!(
+            reopened.last_block_number().expect("read reopened genesis"),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_completion_after_input_close_remains_awaitable_and_releases_storage() {
+        let runtime = Runtime::test();
+        let datadir = reth_db::test_utils::tempdir_path();
+        let maybe =
+            reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
+                datadir.clone(),
+            );
+        let chain_spec = testnode_chain_spec();
+        let config = NodeConfig::test()
+            .with_chain(chain_spec.clone())
+            .with_datadir_args(reth_node_core::args::DatadirArgs {
+                datadir: maybe.clone(),
+                ..Default::default()
+            });
+        let data_dir = maybe.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
+        let db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("open post-close cancellation database");
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(1);
+        drop(feed_tx);
+        let gate = FiniteTeardownGate::new();
+        let mut handle = ArbLauncher {
+            ctx: LaunchContext::new(runtime.clone(), data_dir.clone()),
+            chain_id: 412346,
+            genesis_block: 0,
+            tuning: ArbEngineTuning::reth_defaults(),
+            mode: ArbLaunchMode::FiniteTeardownGated {
+                frontier: 0,
+                gate: gate.clone(),
+            },
+            feed_messages: feed_rx,
+            l1_messages: l1_rx,
+            feed_latency: None,
+            tx_log_stream: None,
+        }
+        .launch_node(
+            NodeBuilder::new(config)
+                .with_database(db.clone())
+                .node(ArbNode),
+        )
+        .await
+        .expect("launch gated finite driver");
+
+        {
+            let teardown_started = gate.wait_for_teardown();
+            tokio::pin!(teardown_started);
+            let completion = handle.finish_finite_l1_execution(async {
+                Ok(L1SyncCompletion::FrontierReached { frontier: 0 })
+            });
+            tokio::pin!(completion);
+            tokio::select! {
+                _ = &mut teardown_started => {}
+                result = &mut completion => panic!("completion returned before held teardown: {result:?}"),
+            }
+            assert!(
+                l1_tx.is_closed(),
+                "derivation success must close finite input before teardown is held"
+            );
+        }
+        // Dropping the public future above cancels it while the private, per-launch teardown gate
+        // holds the raw supervisor. The next wait must observe that same owner's completion.
+        gate.release();
+        handle
+            .wait_for_finite_execution()
+            .await
+            .expect("post-close cancelled completion must remain awaitable");
+
+        drop(handle);
+        drop(l1_tx);
+        drop(db);
+        let reopened_db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("immediately reopen MDBX after post-close cancellation");
+        let reopened_static_files = StaticFileProvider::<
+            arbitrum_alloy_consensus::reth::ArbPrimitives,
+        >::read_write(data_dir.static_files())
+        .expect("immediately reopen static files after post-close cancellation");
+        let reopened_rocksdb = RocksDBProvider::builder(datadir.join("rocksdb"))
+            .with_default_tables()
+            .build()
+            .expect("immediately reopen RocksDB after post-close cancellation");
+        let reopened: ProviderFactory<NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>> =
+            ProviderFactory::new(
+                reopened_db,
+                chain_spec,
+                reopened_static_files,
+                reopened_rocksdb,
+                runtime,
+            )
+            .expect("construct production provider after post-close cancellation");
+        assert_eq!(
+            reopened
+                .last_block_number()
+                .expect("read reopened genesis frontier"),
+            0
         );
     }
 

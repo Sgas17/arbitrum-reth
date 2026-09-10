@@ -47,8 +47,45 @@ use reth_trie::{
     ComputedTrieData, HashedPostStateSorted, HashedStorage, HashedStorageSorted, LazyTrieData,
 };
 
+/// Failure while explicitly joining the persistence proxy.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PersistenceProxyJoinError {
+    ThreadPanicked,
+    JoinTaskCancelled,
+}
+
 /// Joins the persistence proxy after the engine-tree request sender has been dropped.
 pub(crate) struct PersistenceProxyGuard(Option<JoinHandle<()>>);
+
+impl PersistenceProxyGuard {
+    /// Consume and join the proxy during synchronous construction cleanup.
+    ///
+    /// This is intentionally unbounded: returning before this thread exits would leave it owning
+    /// the database after a failed finite launch reports completion.
+    pub(crate) fn join_blocking(mut self) -> Result<(), PersistenceProxyJoinError> {
+        let handle = self
+            .0
+            .take()
+            .expect("persistence proxy handle is present before join");
+        handle
+            .join()
+            .map_err(|_| PersistenceProxyJoinError::ThreadPanicked)
+    }
+
+    /// Consume and join the proxy. This is intentionally unbounded: returning before this thread
+    /// exits would leave it owning the database after a finite lifecycle reports completion.
+    pub(crate) async fn join(mut self) -> Result<(), PersistenceProxyJoinError> {
+        let handle = self
+            .0
+            .take()
+            .expect("persistence proxy handle is present before join");
+        match tokio::task::spawn_blocking(move || handle.join()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(PersistenceProxyJoinError::ThreadPanicked),
+            Err(_) => Err(PersistenceProxyJoinError::JoinTaskCancelled),
+        }
+    }
+}
 
 /// The durable persistence frontiers confirmed by Reth's persistence service.
 ///
@@ -96,6 +133,7 @@ impl PersistenceFrontiers {
 impl Drop for PersistenceProxyGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.0.take() {
+            // Abnormal paths cannot report an error. Normal finite shutdown always uses `join`.
             let _ = handle.join();
         }
     }
@@ -798,6 +836,18 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_persistence_join_reports_thread_panic() {
+        let guard = PersistenceProxyGuard(Some(std::thread::spawn(|| {
+            panic!("persistence proxy panic")
+        })));
+
+        assert_eq!(
+            guard.join().await,
+            Err(PersistenceProxyJoinError::ThreadPanicked)
+        );
+    }
 
     #[derive(Debug, Clone, Default)]
     struct TestArbNode;

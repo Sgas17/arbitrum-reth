@@ -813,6 +813,11 @@ impl ArbLauncher {
             })
             .flatten();
 
+        // Validate every fallible finite invariant before starting any engine task. From the
+        // successful `spawn` below through returning the handle, finite mode performs no
+        // fallible operation; therefore a launch error cannot strand a finite task.
+        let finite_max_sequence = finite_max_sequence(mode, genesis_block)?;
+
         // Stand up reth's engine tree (Tier-1 `InsertExecutedBlock` seam) and drive the
         // sequencer feed through it. Persistence to MDBX is async (tree background service).
         let mut driver: ArbEngineDriver<NodeTypesWithDBAdapter<N, DB>> = ArbEngineDriver::spawn(
@@ -830,9 +835,6 @@ impl ArbLauncher {
             engine_events.clone(),
         )?;
 
-        // Validate the finite bound before starting the driver. The same immutable conversion is
-        // repeated by `admit_engine_handoff` immediately before every engine handoff.
-        let finite_max_sequence = finite_max_sequence(mode, genesis_block)?;
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
         let mut scheduler = if serving {
             IngressScheduler::new(feed_messages, l1_messages)

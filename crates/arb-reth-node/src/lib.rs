@@ -58,6 +58,12 @@ pub use arb_reth_sync::resume::{L1ResumeCheckpoint, L1ResumeLog};
 pub mod launcher;
 pub use launcher::{ArbLaunchMode, ArbLauncher, ArbNodeHandle};
 
+/// Bounded non-serving launch seam for a future recovery command.
+pub mod finite;
+pub use finite::{
+    ResolvedRollupBoot, StoppedFiniteConfig, StoppedFiniteRethLaunch, run_stopped_finite,
+};
+
 mod mev_tx_logs;
 mod mev_frontier_rpc;
 

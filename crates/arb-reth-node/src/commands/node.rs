@@ -1047,7 +1047,13 @@ async fn launch(
         // Read the durable L2 tip on demand so checkpoint writes only advance past blocks that are
         // actually on disk (`last_block_number`, not the in-memory canonical head).
         let tip_provider = handle.provider.clone();
-        let persisted_tip = move || tip_provider.last_block_number().unwrap_or(0);
+        let persisted_tip = move || {
+            tip_provider
+                .last_block_number()
+                .map_err(|error| crate::L1SyncError::PersistedTip {
+                    detail: error.to_string(),
+                })
+        };
 
         let tx = l1_tx.clone();
         let fatal_tx = l1_fatal_tx;

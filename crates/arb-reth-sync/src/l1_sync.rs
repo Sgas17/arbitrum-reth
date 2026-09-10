@@ -70,6 +70,8 @@ pub enum L1SyncError {
     },
     /// The configured execution RPC URL is invalid.
     InvalidRpcUrl,
+    /// A persisted L2 tip read failed, so sync cannot safely select or record a resume point.
+    PersistedTip { detail: String },
     /// A prefetched range task panicked or was cancelled unexpectedly.
     PrefetchTask { from: u64, to: u64 },
     /// The bounded L1 range ended before it derived the requested absolute L2 frontier.
@@ -156,6 +158,7 @@ impl core::fmt::Display for L1SyncError {
                 )
             }
             Self::InvalidRpcUrl => write!(f, "invalid L1 RPC URL"),
+            Self::PersistedTip { detail } => write!(f, "failed to read persisted L2 tip: {detail}"),
             Self::PrefetchTask { from, to } => {
                 write!(
                     f,
@@ -395,7 +398,7 @@ pub async fn supervise_l1_sync<F, S>(
     shutdown: S,
 ) -> Result<L1SyncCompletion, L1SyncError>
 where
-    F: Fn() -> u64 + Send + Sync,
+    F: Fn() -> Result<u64, L1SyncError> + Send + Sync,
     S: Future + Send,
 {
     supervise_l1_sync_with_backoff(
@@ -418,7 +421,7 @@ async fn supervise_l1_sync_with_backoff<F, S>(
     maximum_delay: Duration,
 ) -> Result<L1SyncCompletion, L1SyncError>
 where
-    F: Fn() -> u64 + Send + Sync,
+    F: Fn() -> Result<u64, L1SyncError> + Send + Sync,
     S: Future + Send,
 {
     tokio::pin!(shutdown);
@@ -426,7 +429,7 @@ where
     let mut first_attempt = true;
 
     loop {
-        let attempt_start = progress(&base_cfg, persisted_tip());
+        let attempt_start = progress(&base_cfg, persisted_tip()?);
         let cfg = if first_attempt {
             // Preserve the caller-selected initial resume point, especially an explicit
             // --l1-start-block override. Checkpoints take over only after that attempt fails.
@@ -447,7 +450,7 @@ where
             Ok(completion) => return Ok(completion),
             Err(err) if !err.is_retryable() => return Err(err),
             Err(err) => {
-                let made_progress = progress(&base_cfg, persisted_tip()) != attempt_start;
+                let made_progress = progress(&base_cfg, persisted_tip()?) != attempt_start;
                 let delay = backoff.next_delay(made_progress);
                 tracing::warn!(
                     target: "arb-reth::l1-sync",
@@ -484,7 +487,7 @@ pub async fn run_l1_sync<F>(
     persisted_tip: F,
 ) -> Result<L1SyncCompletion, L1SyncError>
 where
-    F: Fn() -> u64 + Send,
+    F: Fn() -> Result<u64, L1SyncError> + Send,
 {
     // Wrap the HTTP transport in a retry layer so a transient L1 RPC failure (429 rate limit, 5xx,
     // connect/timeout) is retried with backoff instead of propagating and killing the derivation
@@ -750,7 +753,7 @@ where
                 cfg.checkpoint_path.as_deref(),
                 &mut resume_log,
                 &mut pending_ckpt,
-                persisted_tip(),
+                persisted_tip()?,
             );
         }
     }
@@ -829,6 +832,9 @@ mod tests {
 
         for err in [
             L1SyncError::InvalidRpcUrl,
+            L1SyncError::PersistedTip {
+                detail: "test".into(),
+            },
             L1SyncError::PrefetchTask { from: 1, to: 2 },
         ] {
             assert!(
@@ -1165,7 +1171,7 @@ mod tests {
             supervise_l1_sync_with_backoff(
                 cfg,
                 feed_tx,
-                || 0,
+                || Ok(0),
                 std::future::pending::<()>(),
                 Duration::from_millis(1),
                 Duration::from_millis(5),
@@ -1192,7 +1198,7 @@ mod tests {
         let task = tokio::spawn(supervise_l1_sync_with_backoff(
             cfg,
             feed_tx,
-            || 0,
+            || Ok(0),
             shutdown_rx,
             Duration::from_secs(60),
             Duration::from_secs(60),

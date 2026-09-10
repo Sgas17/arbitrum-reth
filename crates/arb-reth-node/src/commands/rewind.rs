@@ -45,6 +45,17 @@ use reth_tracing::tracing::info;
 
 type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;
 
+/// Shared storage-v2 consistency gate before stopped destructive operations.
+pub(crate) fn require_storage_v2_consistency(factory: &ProviderFactory<ArbNodeTypesWithDB>) -> eyre::Result<()> {
+    factory.set_storage_settings_cache(StorageSettings::v2());
+    let (rocksdb_unwind, sf_unwind) = factory.check_consistency()
+        .map_err(|error| eyre::eyre!("static-file/db consistency check failed: {error}"))?;
+    if let Some(target) = [rocksdb_unwind, sf_unwind].into_iter().flatten().min() {
+        return Err(eyre::eyre!("datadir needs a pipeline unwind to block {target} before it is consistent"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "arb-rewind", about = "Unwind the arb-reth database to an earlier L2 block")]
 pub struct RewindArgs {

@@ -31,7 +31,12 @@
 //! and derivation resumes at a clean batch boundary; the L1-sync runtime drops any re-derived
 //! blocks it already has.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +60,7 @@ pub const HISTORICAL_CHECKPOINT_L2_INTERVAL: u64 = 100_000;
 /// has reached block `l2_block`. Resuming derivation from `l1_block` with `delayed_count` therefore
 /// produces block `l2_block + 1` next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L1ResumeCheckpoint {
     /// Next L1 block to derive from (the consumed window's `to + 1`).
     pub l1_block: u64,
@@ -68,6 +74,7 @@ pub struct L1ResumeCheckpoint {
 /// An ascending log of recent and compacted historical [`L1ResumeCheckpoint`]s, persisted as
 /// `arb-l1-resume.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L1ResumeLog {
     /// Boundaries in ascending `l2_block` order, with compacted history followed by a dense tail.
     pub checkpoints: Vec<L1ResumeCheckpoint>,
@@ -89,23 +96,65 @@ impl L1ResumeLog {
         }
         serde_json::from_slice::<L1ResumeCheckpoint>(&bytes)
             .ok()
-            .map(|cp| Self { checkpoints: vec![cp] })
+            .map(|cp| Self {
+                checkpoints: vec![cp],
+            })
     }
 
-    /// Atomically persist to `path` (write a sibling temp file, then rename over `path`) so a crash
-    /// mid-write can never leave a partially-written log.
+    /// Strict recovery reader: only the current wrapped schema, never `load`'s legacy bare checkpoint.
+    pub fn load_strict(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        let log: Self = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if log
+            .checkpoints
+            .windows(2)
+            .any(|pair| pair[0].l2_block >= pair[1].l2_block)
+        {
+            return Err("checkpoints are not strictly ascending by l2_block".into());
+        }
+        Ok(log)
+    }
+
+    /// Durably replace `path`: a unique sibling is fully synced, atomically renamed, then its
+    /// directory is synced. Callers may advance their own journal only after this returns.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let tmp = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec(self).expect("L1ResumeLog serializes");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, path)
+        let directory = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resume path has no parent",
+            )
+        })?;
+        fs::create_dir_all(directory)?;
+        let tmp = directory.join(format!(
+            ".{}-{}-{}.tmp",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("resume"),
+            std::process::id(),
+            unique_suffix(),
+        ));
+        let result = (|| {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            file.write_all(&serde_json::to_vec(self).expect("L1ResumeLog serializes"))?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp, path)?;
+            File::open(directory)?.sync_all()
+        })();
+        let _ = fs::remove_file(&tmp);
+        result
     }
 
     /// The newest boundary at or below `l2_block`, i.e. the furthest safe point to resume a chain
     /// whose durable tip is `l2_block`. `None` if every boundary is above it (rolled back further
     /// than the log reaches).
     pub fn resume_for(&self, l2_block: u64) -> Option<L1ResumeCheckpoint> {
-        self.checkpoints.iter().rev().find(|cp| cp.l2_block <= l2_block).copied()
+        self.checkpoints
+            .iter()
+            .rev()
+            .find(|cp| cp.l2_block <= l2_block)
+            .copied()
     }
 
     /// Append a boundary, keeping the log ascending and deduplicated by `l2_block`. Boundaries
@@ -115,7 +164,11 @@ impl L1ResumeLog {
     /// The recent tail remains dense. Older entries retain the earliest boundary in each fixed L2
     /// bucket so a deep rewind always has a safe starting point before its target.
     pub fn record(&mut self, cp: L1ResumeCheckpoint) {
-        if self.checkpoints.last().is_some_and(|last| last.l2_block == cp.l2_block) {
+        if self
+            .checkpoints
+            .last()
+            .is_some_and(|last| last.l2_block == cp.l2_block)
+        {
             *self.checkpoints.last_mut().unwrap() = cp;
         } else {
             self.checkpoints.push(cp);
@@ -152,12 +205,22 @@ impl L1ResumeLog {
     }
 }
 
+fn unique_suffix() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cp(l1: u64, l2: u64) -> L1ResumeCheckpoint {
-        L1ResumeCheckpoint { l1_block: l1, delayed_count: 0, l2_block: l2 }
+        L1ResumeCheckpoint {
+            l1_block: l1,
+            delayed_count: 0,
+            l2_block: l2,
+        }
     }
 
     #[test]
@@ -179,7 +242,11 @@ mod tests {
         log.record(cp(100, 10));
         log.record(cp(200, 20));
         log.record(cp(300, 30));
-        assert_eq!(log.resume_for(25), Some(cp(200, 20)), "newest boundary <= tip");
+        assert_eq!(
+            log.resume_for(25),
+            Some(cp(200, 20)),
+            "newest boundary <= tip"
+        );
         assert_eq!(log.resume_for(30), Some(cp(300, 30)), "exact match");
         assert_eq!(log.resume_for(5), None, "tip below every boundary");
     }
@@ -219,7 +286,11 @@ mod tests {
         log.record(cp(100, 10));
         log.record(cp(200, 20));
         log.record(cp(300, 30));
-        assert_eq!(log.truncate_to(20), Some(cp(200, 20)), "newest surviving boundary");
+        assert_eq!(
+            log.truncate_to(20),
+            Some(cp(200, 20)),
+            "newest surviving boundary"
+        );
         assert_eq!(log.checkpoints, vec![cp(100, 10), cp(200, 20)]);
         assert_eq!(log.truncate_to(5), None, "target predates the log");
         assert!(log.checkpoints.is_empty());

@@ -234,6 +234,192 @@ pub async fn run_stopped_finite(
 }
 
 #[cfg(test)]
+/// Test-only producer injection keeps the production entrypoint hardwired to `run_l1_sync`.
+pub(crate) async fn run_stopped_finite_with_producer<P, F>(
+    reth: StoppedFiniteRethLaunch,
+    boot: ResolvedRollupBoot,
+    finite: StoppedFiniteConfig,
+    producer: P,
+) -> eyre::Result<HeaderObservation>
+where
+    P: FnOnce(
+        tokio::sync::mpsc::Sender<arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage>,
+    ) -> F,
+    F: std::future::Future<Output = Result<crate::L1SyncCompletion, L1SyncError>>,
+{
+    finite.validate(&boot, &reth)?;
+    let StoppedFiniteRethLaunch { mut builder, .. } = reth;
+    builder.config_mut().rpc.disable_auth_server = true;
+    let tuning = ArbEngineTuning::from_tree_config(builder.config().tree_config());
+    let data_dir = builder.config().datadir();
+    let executor = builder.task_executor().clone();
+    let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(4096);
+    let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
+    drop(feed_tx);
+    let node_builder = builder.node(ArbNode);
+    let launcher = ArbLauncher {
+        ctx: LaunchContext::new(executor, data_dir),
+        chain_id: boot.chain_id,
+        genesis_block: boot.genesis_block,
+        tuning,
+        mode: ArbLaunchMode::Finite {
+            frontier: finite.frontier,
+        },
+        feed_messages: feed_rx,
+        l1_messages: l1_rx,
+        feed_latency: None,
+        tx_log_stream: None,
+    };
+    node_builder
+        .launch_with(launcher)
+        .await?
+        .finish_finite_l1_execution(producer(l1_tx))
+        .await
+}
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::{path::PathBuf, sync::Arc};
+
+    use alloy_primitives::{U256, address};
+    use arb_revm::arbos_init::ArbosInitConfig;
+    use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
+    use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments};
+    use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
+    use reth_tasks::Runtime;
+
+    use super::*;
+
+    pub(crate) struct StorageV2Fixture {
+        pub(crate) datadir: PathBuf,
+        pub(crate) boot: ResolvedRollupBoot,
+        /// A snapshot-head stream generated from the fixture's durable genesis header.
+        pub(crate) snapshot_head: PathBuf,
+    }
+
+    pub(crate) fn testnode_chain_spec() -> Arc<ChainSpec> {
+        testnode_chain_spec_with_genesis(412346, 0)
+    }
+
+    pub(crate) fn testnode_chain_spec_with_genesis(
+        chain_id: u64,
+        genesis_block_number: u64,
+    ) -> Arc<ChainSpec> {
+        let mut chain_config: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/testnode_l2_chain_config.json"
+        ))
+        .expect("parse testnode chain config");
+        chain_config["chainId"] = serde_json::json!(chain_id);
+        let init = ArbosInitConfig {
+            initial_arbos_version: 40,
+            initial_chain_owner: address!("5E1497dD1f08C87b2d8FE23e9AAB6c1De833D927"),
+            chain_id: U256::from(chain_id),
+            genesis_block_number,
+            initial_l1_base_fee: U256::from(167u64),
+            serialized_chain_config: serde_json::to_vec(&chain_config)
+                .expect("serialize testnode chain config"),
+            debug_precompiles: true,
+        };
+        Arc::new(crate::arb_chain_spec(&init).expect("build testnode chain spec"))
+    }
+
+    pub(crate) fn valid_deposit_message() -> BroadcastFeedMessage {
+        serde_json::from_str(include_str!("../tests/fixtures/deposit_message_only.json"))
+            .expect("valid launcher deposit fixture")
+    }
+
+    /// Seed exact consecutive headers through `tip` using the finite engine lifecycle, then drop
+    /// every node/database handle so recovery opens the same on-disk storage-v2 layout.
+    pub(crate) async fn storage_v2_fixture(chain_id: u64, tip: u64) -> StorageV2Fixture {
+        assert!(tip > 0, "fixture requires a non-genesis tip");
+        let runtime = Runtime::test();
+        let datadir = reth_db::test_utils::tempdir_path();
+        let maybe =
+            reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
+                datadir.clone(),
+            );
+        let chain_spec = testnode_chain_spec_with_genesis(chain_id, 0);
+        let config = NodeConfig::test()
+            .with_chain(chain_spec.clone())
+            .with_datadir_args(reth_node_core::args::DatadirArgs {
+                datadir: maybe.clone(),
+                ..Default::default()
+            });
+        let data_dir = maybe.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
+        let static_files_path = data_dir.static_files();
+        let db = init_db(
+            data_dir.db(),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect("open testnode database");
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(tip as usize);
+        for sequence_number in 1..=tip {
+            let mut message = valid_deposit_message();
+            message.sequence_number = sequence_number;
+            l1_tx.send(message).await.expect("seed input receiver");
+        }
+        drop((feed_tx, l1_tx));
+        let persisted = ArbLauncher {
+            ctx: LaunchContext::new(runtime.clone(), data_dir),
+            chain_id,
+            genesis_block: 0,
+            tuning: ArbEngineTuning::reth_defaults(),
+            mode: ArbLaunchMode::Finite { frontier: tip },
+            feed_messages: feed_rx,
+            l1_messages: l1_rx,
+            feed_latency: None,
+            tx_log_stream: None,
+        }
+        .launch_node(
+            NodeBuilder::new(config)
+                .with_database(db.clone())
+                .node(ArbNode),
+        )
+        .await
+        .expect("seed finite fixture")
+        .finish_finite_l1_execution(async {
+            Ok(crate::L1SyncCompletion::FrontierReached { frontier: tip })
+        })
+        .await
+        .expect("persist fixture headers");
+        assert_eq!(persisted.number, tip);
+        let genesis =
+            StaticFileProvider::<arbitrum_alloy_consensus::reth::ArbPrimitives>::read_only(
+                static_files_path,
+            )
+            .expect("open fixture static files")
+            .header_by_number(0)
+            .expect("read fixture genesis")
+            .expect("fixture genesis exists");
+        let snapshot_head = datadir.join("fixture-genesis-head.stream");
+        std::fs::write(
+            &snapshot_head,
+            format!(
+                "H 0 {:#x} {}\n",
+                genesis.hash_slow(),
+                alloy_primitives::hex::encode(alloy_rlp::encode(genesis)),
+            ),
+        )
+        .expect("write fixture snapshot head");
+        runtime.graceful_shutdown();
+        drop(db);
+        drop(runtime);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        StorageV2Fixture {
+            datadir,
+            snapshot_head,
+            boot: ResolvedRollupBoot {
+                chain_spec,
+                chain_id,
+                genesis_block: 0,
+                sequencer_inbox: arb_reth_l1::SEQUENCER_INBOX_MAINNET,
+                bridge: arb_reth_l1::BRIDGE_MAINNET,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::{
         Arc,
@@ -241,8 +427,6 @@ mod tests {
     };
 
     use super::*;
-    use alloy_primitives::{U256, address};
-    use arb_revm::arbos_init::ArbosInitConfig;
     use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
     use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments};
     use reth_node_types::NodeTypesWithDBAdapter;
@@ -251,47 +435,9 @@ mod tests {
         providers::{RocksDBProvider, StaticFileProvider},
     };
 
-    use crate::L1SyncCompletion;
+    use crate::{L1SyncCompletion, finite::test_support::testnode_chain_spec};
     use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
     use reth_tasks::Runtime;
-
-    /// Test-only producer injection keeps the production entrypoint hardwired to `run_l1_sync`.
-    async fn run_stopped_finite_with_producer<P, F>(
-        reth: StoppedFiniteRethLaunch,
-        boot: ResolvedRollupBoot,
-        finite: StoppedFiniteConfig,
-        producer: P,
-    ) -> eyre::Result<HeaderObservation>
-    where
-        P: FnOnce(tokio::sync::mpsc::Sender<BroadcastFeedMessage>) -> F,
-        F: std::future::Future<Output = Result<L1SyncCompletion, L1SyncError>>,
-    {
-        finite.validate(&boot, &reth)?;
-        let StoppedFiniteRethLaunch { mut builder, .. } = reth;
-        builder.config_mut().rpc.disable_auth_server = true;
-        let tuning = ArbEngineTuning::from_tree_config(builder.config().tree_config());
-        let data_dir = builder.config().datadir();
-        let executor = builder.task_executor().clone();
-        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(4096);
-        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
-        drop(feed_tx);
-        let node_builder = builder.node(ArbNode);
-        let launcher = ArbLauncher {
-            ctx: LaunchContext::new(executor, data_dir),
-            chain_id: boot.chain_id,
-            genesis_block: boot.genesis_block,
-            tuning,
-            mode: ArbLaunchMode::Finite {
-                frontier: finite.frontier,
-            },
-            feed_messages: feed_rx,
-            l1_messages: l1_rx,
-            feed_latency: None,
-            tx_log_stream: None,
-        };
-        let mut handle = node_builder.launch_with(launcher).await?;
-        handle.finish_finite_l1_execution(producer(l1_tx)).await
-    }
 
     fn boot() -> ResolvedRollupBoot {
         ResolvedRollupBoot {
@@ -361,7 +507,7 @@ mod tests {
             reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
                 datadir.clone(),
             );
-        let chain_spec = testnode_chain_spec();
+        let chain_spec = test_support::testnode_chain_spec();
         let config = NodeConfig::test()
             .with_chain(chain_spec.clone())
             .with_datadir_args(reth_node_core::args::DatadirArgs {
@@ -386,9 +532,7 @@ mod tests {
         )
         .expect("open testnode database");
 
-        let fixture: BroadcastFeedMessage =
-            serde_json::from_str(include_str!("../tests/fixtures/deposit_message_only.json"))
-                .expect("valid launcher deposit fixture");
+        let fixture: BroadcastFeedMessage = test_support::valid_deposit_message();
         // Seed a non-genesis durable checkpoint through the same finite launcher lifecycle. No
         // serving endpoint is configured; the launched engine executes this fixture block.
         let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1);
@@ -472,7 +616,7 @@ mod tests {
         // A snapshot boot may use a nonzero imported-genesis floor. This foreign database has a
         // non-genesis checkpoint at 2, but its header at the selected boot floor (1) belongs to
         // the seeded chain, not the resolved boot. Validation must reject it before launch.
-        let mismatched_chain_spec = testnode_chain_spec_with_genesis(1);
+        let mismatched_chain_spec = test_support::testnode_chain_spec_with_genesis(412346, 1);
         let mismatched_config = NodeConfig::test()
             .with_chain(mismatched_chain_spec.clone())
             .with_datadir_args(reth_node_core::args::DatadirArgs {
@@ -1074,26 +1218,6 @@ mod tests {
                 .expect("read reopened genesis frontier"),
             0
         );
-    }
-
-    fn testnode_chain_spec() -> Arc<ChainSpec> {
-        testnode_chain_spec_with_genesis(0)
-    }
-
-    fn testnode_chain_spec_with_genesis(genesis_block_number: u64) -> Arc<ChainSpec> {
-        let init = ArbosInitConfig {
-            initial_arbos_version: 40,
-            initial_chain_owner: address!("5E1497dD1f08C87b2d8FE23e9AAB6c1De833D927"),
-            chain_id: U256::from(412346u64),
-            genesis_block_number,
-            initial_l1_base_fee: U256::from(167u64),
-            serialized_chain_config: include_bytes!(
-                "../tests/fixtures/testnode_l2_chain_config.json"
-            )
-            .to_vec(),
-            debug_precompiles: true,
-        };
-        Arc::new(crate::arb_chain_spec(&init).expect("build testnode chain spec"))
     }
 
     fn launch() -> StoppedFiniteRethLaunch {

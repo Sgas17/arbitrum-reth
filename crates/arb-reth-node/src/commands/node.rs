@@ -29,14 +29,15 @@ use std::{
 use crate::feed;
 use crate::launcher::ArbLauncher;
 use crate::metrics::FeedLatencyTracker;
+use crate::mev_tx_logs::MevTxLogIpc;
 use crate::trusted_l2::{
     Comparison, HeaderObservation, POLL_INTERVAL, TrustedL2Monitor, first_unchecked_height,
+    refuse_ordinary_startup,
 };
 use crate::{
     ARB_ONE_CHAIN_ID, ArbNode, L1ResumeLog, arb_chain_spec, arbos_init_from_chain_config_json,
     arbos_init_from_parsed,
 };
-use crate::mev_tx_logs::MevTxLogIpc;
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use arb_reth_l1::{DelayedInboxReader, SequencerInboxReader};
@@ -49,6 +50,7 @@ use reth_cli_commands::{launcher::FnLauncher, node::NodeCommand};
 use reth_cli_runner::CliContext;
 use reth_db::{DatabaseEnv, mdbx::SyncMode};
 use reth_node_builder::{LaunchContext, NodeBuilder, WithLaunchContext};
+use reth_node_core::args::DatadirArgs;
 use reth_provider::{BlockNumReader, HeaderProvider};
 use reth_tracing::tracing::info;
 
@@ -331,11 +333,13 @@ fn durable_header_at<P>(provider: &P, number: u64) -> eyre::Result<Option<Header
 where
     P: HeaderProvider<Header = alloy_consensus::Header>,
 {
-    Ok(provider.sealed_header(number)?.map(|header| HeaderObservation {
-        number,
-        hash: header.hash(),
-        state_root: header.state_root,
-    }))
+    Ok(provider
+        .sealed_header(number)?
+        .map(|header| HeaderObservation {
+            number,
+            hash: header.hash(),
+            state_root: header.state_root,
+        }))
 }
 
 fn durable_header<P>(provider: &P) -> eyre::Result<Option<HeaderObservation>>
@@ -571,11 +575,41 @@ async fn resolve_bootstrap(
 }
 
 /// Launch the native Reth node command with Arbitrum's derived chain state.
+/// Resolve exactly the data directory that Reth will use for a chain.
+///
+/// Keeping this separate makes the pre-execution incident gate cover both an explicit
+/// `--datadir` and Reth's chain-specific default without opening or creating storage.
+fn resolved_data_dir(datadir: DatadirArgs, chain: reth_chainspec::Chain) -> PathBuf {
+    datadir.resolve_datadir(chain).data_dir().to_path_buf()
+}
+
+fn validate_prebootstrap_datadir(
+    command: &NodeCommand<ArbChainSpecParser, ArbNodeArgs>,
+) -> eyre::Result<()> {
+    if !command.datadir.datadir.is_some()
+        && command.ext.l1_rpc.is_some()
+        && command.ext.chain_info.is_none()
+        && command.ext.genesis_json.is_none()
+        && command.ext.snapshot_head.is_none()
+        && command.ext.chain_config.is_none()
+    {
+        return Err(eyre::eyre!(
+            "L1-derived genesis bootstrap requires explicit --datadir so active-incident lockout can be checked before network access"
+        ));
+    }
+    Ok(())
+}
+
 pub async fn run(
     ctx: CliContext,
     mut command: NodeCommand<ArbChainSpecParser, ArbNodeArgs>,
 ) -> eyre::Result<()> {
     validate_standalone_components(&command)?;
+    validate_prebootstrap_datadir(&command)?;
+    refuse_ordinary_startup(&resolved_data_dir(
+        command.datadir.clone(),
+        command.chain.chain(),
+    ))?;
 
     if command.ext.no_fsync {
         match command.db.sync_mode {
@@ -598,6 +632,13 @@ pub async fn run(
     )
     .await?;
     command.chain = bootstrap.chain_spec.clone();
+    // Bootstrap sources (notably snapshots and Orbit chain files) can replace the placeholder
+    // chain. Resolve and gate the resulting chain path again before Reth can open storage; the
+    // launch-time gate remains defense in depth against any later configuration divergence.
+    refuse_ordinary_startup(&resolved_data_dir(
+        command.datadir.clone(),
+        command.chain.chain(),
+    ))?;
 
     command
         .execute(
@@ -661,11 +702,16 @@ async fn launch(
     args: ArbNodeArgs,
     bootstrap: NodeBootstrap,
 ) -> eyre::Result<()> {
+    let data_dir = builder.config().datadir();
+    refuse_ordinary_startup(data_dir.data_dir())?;
+
     let task_executor = builder.task_executor().clone();
     let feed_sources =
         feed::expand_feed_sources(&args.feed_urls, args.feed_connections, &args.feed_sources)?;
     if args.no_l1_derive && feed_sources.is_empty() {
-        return Err(eyre::eyre!("--no-l1-derive requires at least one --feed-url"));
+        return Err(eyre::eyre!(
+            "--no-l1-derive requires at least one --feed-url"
+        ));
     }
     let mev_tx_log_ipc = args
         .mev_tx_log_ipc
@@ -680,11 +726,10 @@ async fn launch(
         ..
     } = bootstrap;
 
-    let data_dir = builder.config().datadir();
     let trusted_l2_monitor = match args.canonical_l2_rpc.as_deref() {
-        Some(rpc_url) => Some(
-            TrustedL2Monitor::start(data_dir.data_dir(), rpc_url, effective_chain_id).await?,
-        ),
+        Some(rpc_url) => {
+            Some(TrustedL2Monitor::start(data_dir.data_dir(), rpc_url, effective_chain_id).await?)
+        }
         None => None,
     };
 
@@ -739,7 +784,8 @@ async fn launch(
         info!(target: "arb-reth::mev", path = %path.display(), "MEV transaction-log IPC listening");
     }
 
-    let (trusted_l2_fatal_tx, trusted_l2_fatal_rx) = tokio::sync::oneshot::channel::<eyre::Report>();
+    let (trusted_l2_fatal_tx, trusted_l2_fatal_rx) =
+        tokio::sync::oneshot::channel::<eyre::Report>();
     if let Some(monitor) = trusted_l2_monitor {
         let provider = handle.provider.clone();
         task_executor.spawn_with_graceful_shutdown_signal(|mut shutdown| async move {
@@ -886,7 +932,8 @@ async fn launch(
             .unwrap_or(feed_genesis_block)
             .saturating_sub(feed_genesis_block)
             + 1;
-        let resume_sequence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(feed_start_seq));
+        let resume_sequence =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(feed_start_seq));
         let (ingress_tx, ingress_rx) = feed::ingress_channel();
         task_executor.spawn_task(feed::coordinate(
             ingress_rx,
@@ -1095,7 +1142,9 @@ mod tests {
     use alloy_consensus::Header;
     use alloy_primitives::{B64, B256};
     use clap::{Parser, Subcommand};
+    use reth_cli_runner::CliRunner;
     use reth_provider::test_utils::MockEthProvider;
+    use tempfile::tempdir;
 
     const ROBINHOOD_CHAIN_INFO: &[u8] =
         include_bytes!("../../tests/fixtures/robinhood-chain-info.json");
@@ -1132,14 +1181,20 @@ mod tests {
 
         let from_header = genesis_delayed_messages_read(&spec, init.genesis_block_number);
         assert_eq!(from_header, Some(1));
-        assert_eq!(resolve_genesis_delayed_cursor(None, from_header).unwrap(), 1);
+        assert_eq!(
+            resolve_genesis_delayed_cursor(None, from_header).unwrap(),
+            1
+        );
         assert_eq!(
             resolve_genesis_delayed_cursor(Some(0), from_header)
                 .expect_err("a conflicting cursor must not derive a different chain")
                 .to_string(),
             "--l1-start-delayed is 0, but the L2 genesis header requires 1"
         );
-        assert_eq!(resolve_genesis_delayed_cursor(Some(1), from_header).unwrap(), 1);
+        assert_eq!(
+            resolve_genesis_delayed_cursor(Some(1), from_header).unwrap(),
+            1
+        );
         assert_eq!(
             genesis_delayed_messages_read(&spec, init.genesis_block_number + 1),
             None,
@@ -1208,6 +1263,94 @@ mod tests {
     }
 
     #[test]
+    fn resolved_datadir_gate_blocks_malformed_marker_without_storage_creation() {
+        let datadir = tempdir().unwrap();
+        let resolved = resolved_data_dir(
+            DatadirArgs {
+                datadir: datadir.path().to_path_buf().into(),
+                ..Default::default()
+            },
+            MAINNET.chain(),
+        );
+        assert_eq!(resolved, datadir.path());
+        let marker = resolved.join("arb-trusted-l2/active.json");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(marker, b"malformed incident marker").unwrap();
+
+        assert!(refuse_ordinary_startup(&resolved).is_err());
+        assert!(!resolved.join("db").exists());
+    }
+
+    #[test]
+    fn l1_derived_bootstrap_requires_datadir_before_network_access() {
+        let TestCommand::Node(without_datadir) =
+            TestCli::try_parse_from(["arb-reth", "node", "--l1-rpc", "http://127.0.0.1:1"])
+                .unwrap()
+                .command;
+        assert!(
+            validate_prebootstrap_datadir(&without_datadir)
+                .unwrap_err()
+                .to_string()
+                .contains("requires explicit --datadir")
+        );
+
+        let datadir = tempdir().unwrap();
+        let TestCommand::Node(with_datadir) = TestCli::try_parse_from([
+            "arb-reth",
+            "node",
+            "--datadir",
+            datadir.path().to_str().unwrap(),
+            "--l1-rpc",
+            "http://127.0.0.1:1",
+        ])
+        .unwrap()
+        .command;
+        validate_prebootstrap_datadir(&with_datadir).unwrap();
+    }
+
+    #[test]
+    fn active_marker_blocks_ordinary_node_before_ipc_binding_without_monitor() {
+        let datadir = tempdir().unwrap();
+        let marker = datadir.path().join("arb-trusted-l2/active.json");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, b"malformed incident marker").unwrap();
+        let ipc = datadir.path().join("mev.sock");
+        let TestCommand::Node(command) = TestCli::try_parse_from([
+            "arb-reth",
+            "node",
+            "--datadir",
+            datadir.path().to_str().unwrap(),
+            "--mev-tx-log-ipc",
+            ipc.to_str().unwrap(),
+        ])
+        .unwrap()
+        .command;
+        assert!(
+            command.ext.canonical_l2_rpc.is_none(),
+            "monitor is disabled by default"
+        );
+
+        let error = CliRunner::try_default_runtime()
+            .unwrap()
+            .run_command_until_exit(|ctx| async move { run(ctx, *command).await })
+            .expect_err("an active marker must reject ordinary node launch");
+
+        assert!(
+            error
+                .to_string()
+                .contains("active trusted-L2 divergence incident")
+        );
+        assert!(
+            !ipc.exists(),
+            "IPC binding must not occur before the incident gate"
+        );
+        assert!(
+            !datadir.path().join("db").exists(),
+            "database must not be opened"
+        );
+    }
+
+    #[test]
     fn cli_accepts_repeated_feed_urls_and_parallel_connections() {
         let TestCommand::Node(command) = TestCli::try_parse_from([
             "arb-reth",
@@ -1224,10 +1367,7 @@ mod tests {
 
         assert_eq!(
             command.ext.feed_urls,
-            [
-                "wss://relay-a.example/feed",
-                "wss://relay-b.example/feed"
-            ]
+            ["wss://relay-a.example/feed", "wss://relay-b.example/feed"]
         );
         assert_eq!(command.ext.feed_connections, Some(3));
         assert!(command.ext.feed_sources.is_empty());

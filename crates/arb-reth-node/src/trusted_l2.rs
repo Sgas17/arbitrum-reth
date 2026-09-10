@@ -1,6 +1,8 @@
 //! Node-local trusted-L2 divergence protection.
 
 use std::{
+    error::Error,
+    fmt,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -9,7 +11,11 @@ use std::{
 
 use alloy_primitives::B256;
 use eyre::eyre;
-use jsonrpsee::{core::client::ClientT, http_client::{HttpClient, HttpClientBuilder}, rpc_params};
+use jsonrpsee::{
+    core::client::ClientT,
+    http_client::{HttpClient, HttpClientBuilder},
+    rpc_params,
+};
 use serde::{Deserialize, Serialize};
 
 const INCIDENT_DIR: &str = "arb-trusted-l2";
@@ -24,22 +30,123 @@ pub struct HeaderObservation {
     pub state_root: B256,
 }
 
-#[derive(Debug, Serialize)]
-struct Incident {
-    schema_version: u32,
-    effective_chain_id: u64,
-    l2_block_number: u64,
-    local_hash: B256,
-    canonical_hash: B256,
-    local_state_root: B256,
-    canonical_state_root: B256,
-    detected_at_unix_secs: u64,
+/// Schema-v1 trusted-L2 divergence record. Recovery accepts exactly this JSON shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Incident {
+    pub schema_version: u32,
+    pub effective_chain_id: u64,
+    pub l2_block_number: u64,
+    pub local_hash: B256,
+    pub canonical_hash: B256,
+    pub local_state_root: B256,
+    pub canonical_state_root: B256,
+    pub detected_at_unix_secs: u64,
+}
+
+/// Strictly load the active schema-v1 incident without changing its marker.
+pub fn load_active_incident(data_dir: &Path) -> eyre::Result<Incident> {
+    let path = active_incident_path(data_dir);
+    let bytes = fs::read(&path).map_err(|error| {
+        eyre!(
+            "read active trusted-L2 incident {}: {error}",
+            path.display()
+        )
+    })?;
+    let incident: Incident = serde_json::from_slice(&bytes).map_err(|error| {
+        eyre!(
+            "invalid active trusted-L2 incident {}: {error}",
+            path.display()
+        )
+    })?;
+    if incident.schema_version != SCHEMA_VERSION {
+        return Err(eyre!(
+            "unsupported active trusted-L2 incident schema version {}",
+            incident.schema_version
+        ));
+    }
+    Ok(incident)
 }
 
 pub struct TrustedL2Monitor {
     chain_id: u64,
     incident_path: PathBuf,
     client: HttpClient,
+}
+
+/// Canonical recovery authority failures are intentionally typed so policy can preserve a
+/// retryable journal phase for an outage and reserve terminal failure for verified integrity loss.
+#[derive(Debug)]
+pub enum RecoveryAuthorityError {
+    Unavailable(&'static str),
+    Malformed(&'static str),
+    Mismatch(String),
+}
+
+impl fmt::Display for RecoveryAuthorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(message) | Self::Malformed(message) => f.write_str(message),
+            Self::Mismatch(message) => f.write_str(message),
+        }
+    }
+}
+impl Error for RecoveryAuthorityError {}
+
+/// Canonical authority client used only by the stopped recovery command.
+pub struct CanonicalL2Client {
+    client: HttpClient,
+}
+
+impl CanonicalL2Client {
+    pub async fn connect(
+        rpc_url: &str,
+        expected_chain_id: u64,
+    ) -> Result<Self, RecoveryAuthorityError> {
+        let client = HttpClientBuilder::default()
+            .build(rpc_url)
+            .map_err(|_| RecoveryAuthorityError::Malformed("invalid --canonical-l2-rpc URL"))?;
+        let chain_id: String =
+            client
+                .request("eth_chainId", rpc_params![])
+                .await
+                .map_err(|_| {
+                    RecoveryAuthorityError::Unavailable("trusted L2 RPC chain-id request failed")
+                })?;
+        let actual = parse_quantity(&chain_id).map_err(|_| {
+            RecoveryAuthorityError::Malformed("trusted L2 RPC returned a malformed chain id")
+        })?;
+        if expected_chain_id != actual {
+            return Err(RecoveryAuthorityError::Mismatch(format!(
+                "trusted L2 RPC chain id {actual} does not match effective chain id {expected_chain_id}"
+            )));
+        }
+        Ok(Self { client })
+    }
+
+    pub async fn header(&self, number: u64) -> Result<HeaderObservation, RecoveryAuthorityError> {
+        let response: Option<RemoteHeader> = self
+            .client
+            .request(
+                "eth_getBlockByNumber",
+                rpc_params![format!("0x{number:x}"), false],
+            )
+            .await
+            .map_err(|error| match error {
+                jsonrpsee::core::client::Error::ParseError(_) => {
+                    RecoveryAuthorityError::Malformed("trusted L2 RPC returned a malformed block")
+                }
+                _ => RecoveryAuthorityError::Unavailable("trusted L2 RPC unavailable"),
+            })?;
+        response
+            .ok_or(RecoveryAuthorityError::Unavailable(
+                "trusted L2 RPC has no requested block",
+            ))?
+            .into_observation(number)
+            .map_err(|_| {
+                RecoveryAuthorityError::Malformed("trusted L2 RPC returned a malformed block")
+            })
+    }
 }
 
 /// First local height that must be compared after observing `tip`.
@@ -76,14 +183,25 @@ impl TrustedL2Monitor {
             .request("eth_chainId", rpc_params![])
             .await
             .map_err(|_| eyre!("trusted L2 RPC chain-id request failed"))?;
-        validate_chain_id(chain_id, parse_quantity(&remote_chain_id).map_err(|_| eyre!("trusted L2 RPC returned a malformed chain id"))?)?;
-        Ok(Self { chain_id, incident_path, client })
+        validate_chain_id(
+            chain_id,
+            parse_quantity(&remote_chain_id)
+                .map_err(|_| eyre!("trusted L2 RPC returned a malformed chain id"))?,
+        )?;
+        Ok(Self {
+            chain_id,
+            incident_path,
+            client,
+        })
     }
 
     pub async fn canonical_header(&self, number: u64) -> eyre::Result<Option<HeaderObservation>> {
         let response: Option<RemoteHeader> = self
             .client
-            .request("eth_getBlockByNumber", rpc_params![format!("0x{number:x}"), false])
+            .request(
+                "eth_getBlockByNumber",
+                rpc_params![format!("0x{number:x}"), false],
+            )
             .await
             .map_err(|_| eyre!("trusted L2 RPC unavailable"))?;
         response
@@ -155,8 +273,14 @@ impl RemoteHeader {
         }
         Ok(HeaderObservation {
             number,
-            hash: self.hash.parse().map_err(|_| eyre!("malformed remote block hash"))?,
-            state_root: self.state_root.parse().map_err(|_| eyre!("malformed remote state root"))?,
+            hash: self
+                .hash
+                .parse()
+                .map_err(|_| eyre!("malformed remote block hash"))?,
+            state_root: self
+                .state_root
+                .parse()
+                .map_err(|_| eyre!("malformed remote state root"))?,
         })
     }
 }
@@ -165,23 +289,41 @@ fn active_incident_path(data_dir: &Path) -> PathBuf {
     data_dir.join(INCIDENT_DIR).join(ACTIVE_INCIDENT)
 }
 
+/// Refuse ordinary node startup while any active incident marker exists.
+///
+/// This deliberately checks only existence: recovery owns strict parsing, while an ordinary node
+/// must remain stopped even if the marker is malformed.
+pub fn refuse_ordinary_startup(data_dir: &Path) -> eyre::Result<()> {
+    refuse_active_incident(&active_incident_path(data_dir))
+}
+
 fn refuse_active_incident(path: &Path) -> eyre::Result<()> {
     if path.exists() {
-        return Err(eyre!("active trusted-L2 divergence incident exists at {}", path.display()));
+        return Err(eyre!(
+            "active trusted-L2 divergence incident exists at {}",
+            path.display()
+        ));
     }
     Ok(())
 }
 
 fn validate_chain_id(expected: u64, actual: u64) -> eyre::Result<()> {
     if expected != actual {
-        return Err(eyre!("trusted L2 RPC chain id {actual} does not match effective chain id {expected}"));
+        return Err(eyre!(
+            "trusted L2 RPC chain id {actual} does not match effective chain id {expected}"
+        ));
     }
     Ok(())
 }
 
 fn parse_quantity(value: &str) -> eyre::Result<u64> {
-    u64::from_str_radix(value.strip_prefix("0x").ok_or_else(|| eyre!("quantity is not hexadecimal"))?, 16)
-        .map_err(Into::into)
+    u64::from_str_radix(
+        value
+            .strip_prefix("0x")
+            .ok_or_else(|| eyre!("quantity is not hexadecimal"))?,
+        16,
+    )
+    .map_err(Into::into)
 }
 
 /// Publish a no-clobber marker from a fully synced temporary file.
@@ -190,14 +332,23 @@ fn parse_quantity(value: &str) -> eyre::Result<u64> {
 /// concurrent or pre-existing active marker is never replaced. The directory is synced after both
 /// publishing and temporary-file cleanup.
 fn persist_incident(path: &Path, incident: &Incident) -> eyre::Result<bool> {
-    let directory = path.parent().ok_or_else(|| eyre!("incident path has no parent"))?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| eyre!("incident path has no parent"))?;
     fs::create_dir_all(directory)?;
     if path.exists() {
         return Ok(false);
     }
-    let temporary = directory.join(format!(".active-{}-{}.tmp", std::process::id(), unique_suffix()));
+    let temporary = directory.join(format!(
+        ".active-{}-{}.tmp",
+        std::process::id(),
+        unique_suffix()
+    ));
     let result = (|| -> eyre::Result<bool> {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
         file.write_all(&serde_json::to_vec(incident)?)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
@@ -217,7 +368,9 @@ fn persist_incident(path: &Path, incident: &Incident) -> eyre::Result<bool> {
 }
 
 fn unique_suffix() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_nanos())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
 }
 
 fn sync_directory(directory: &Path) -> eyre::Result<()> {
@@ -235,7 +388,11 @@ mod tests {
     }
 
     fn observation(hash: B256, state_root: B256) -> HeaderObservation {
-        HeaderObservation { number: 42, hash, state_root }
+        HeaderObservation {
+            number: 42,
+            hash,
+            state_root,
+        }
     }
 
     fn monitor(data_dir: &Path) -> TrustedL2Monitor {
@@ -247,7 +404,9 @@ mod tests {
         let data_dir = tempdir().unwrap();
         let header = observation(hash(1), hash(2));
         assert_eq!(
-            monitor(data_dir.path()).compare_and_record(header, header).unwrap(),
+            monitor(data_dir.path())
+                .compare_and_record(header, header)
+                .unwrap(),
             Comparison::Match
         );
         assert!(!active_incident_path(data_dir.path()).exists());
@@ -259,7 +418,9 @@ mod tests {
         let local = observation(hash(1), hash(2));
         let canonical = observation(hash(3), hash(2));
         assert_eq!(
-            monitor(data_dir.path()).compare_and_record(local, canonical).unwrap(),
+            monitor(data_dir.path())
+                .compare_and_record(local, canonical)
+                .unwrap(),
             Comparison::Mismatch
         );
     }
@@ -270,7 +431,9 @@ mod tests {
         let local = observation(hash(1), hash(2));
         let canonical = observation(hash(1), hash(3));
         assert_eq!(
-            monitor(data_dir.path()).compare_and_record(local, canonical).unwrap(),
+            monitor(data_dir.path())
+                .compare_and_record(local, canonical)
+                .unwrap(),
             Comparison::Mismatch
         );
     }
@@ -284,18 +447,33 @@ mod tests {
     fn monitor_cursor_walks_each_new_height_and_rechecks_replacements() {
         let previous = observation(hash(1), hash(2));
         assert_eq!(
-            first_unchecked_height(Some(previous), HeaderObservation { number: 45, ..previous })
-                .unwrap(),
+            first_unchecked_height(
+                Some(previous),
+                HeaderObservation {
+                    number: 45,
+                    ..previous
+                }
+            )
+            .unwrap(),
             Some(43)
         );
-        assert_eq!(first_unchecked_height(Some(previous), previous).unwrap(), None);
+        assert_eq!(
+            first_unchecked_height(Some(previous), previous).unwrap(),
+            None
+        );
         assert_eq!(
             first_unchecked_height(Some(previous), observation(hash(3), hash(2))).unwrap(),
             Some(42)
         );
         assert_eq!(
-            first_unchecked_height(Some(previous), HeaderObservation { number: 41, ..previous })
-                .unwrap(),
+            first_unchecked_height(
+                Some(previous),
+                HeaderObservation {
+                    number: 41,
+                    ..previous
+                }
+            )
+            .unwrap(),
             Some(41)
         );
     }
@@ -314,7 +492,10 @@ mod tests {
             canonical_state_root: hash(2),
             detected_at_unix_secs: 3,
         };
-        let second = Incident { l2_block_number: 9, ..first };
+        let second = Incident {
+            l2_block_number: 9,
+            ..first
+        };
         assert!(persist_incident(&path, &first).unwrap());
         let original = fs::read(&path).unwrap();
         assert!(!persist_incident(&path, &second).unwrap());

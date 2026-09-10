@@ -19,6 +19,7 @@ use arb_reth_node::commands::{
     dump_blocks::DumpBlocksArgs,
     genesis::{GenesisVerifyArgs, GenesisVerifyExportArgs},
     node::{ArbChainSpecParser, ArbNodeArgs},
+    recover::RecoverArgs,
     rewind::RewindArgs,
     snapshot::{
         SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs, SnapshotRepairHistoryArgs,
@@ -80,6 +81,8 @@ enum Command {
     Snapshot(SnapshotCmd),
     /// Genesis verification tools.
     Genesis(GenesisCmd),
+    /// Reconstruct a stopped trusted-L2 incident range without serving.
+    Recover(RecoverArgs),
     /// Unwind the database to an earlier L2 block.
     Rewind(RewindArgs),
     /// Dump block headers + tx hashes + receipt status.
@@ -224,6 +227,7 @@ fn main() -> eyre::Result<()> {
             GenesisSub::Verify(args) => commands::genesis::verify(args),
             GenesisSub::VerifyExport(args) => commands::genesis::verify_export(args),
         },
+        Command::Recover(args) => runner.block_on(commands::recover::run(args)),
         Command::Rewind(args) => commands::rewind::run(args),
         Command::DumpBlocks(args) => commands::dump_blocks::run(args),
     }
